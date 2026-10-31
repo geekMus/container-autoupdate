@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Shell 脚本必须是 LF：CRLF 会让 sh 在解析时把 \r 当成参数的一部分而报错
+*.sh text eol=lf
