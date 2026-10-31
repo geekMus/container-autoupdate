@@ -47,9 +47,10 @@ API="http://localhost/v1.47"
 LOCK_PREFIX="${LOCK_PREFIX:-/tmp/.container-autoupdate}" # 互斥锁前缀，实际文件名按更新目标派生
 STATE_ROOT="${STATE_ROOT:-/tmp/.container-autoupdate}"
 BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
+COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="0.1.0"
+VERSION="0.2.0"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -72,6 +73,168 @@ log()     { echo "[$(date '+%F %T')] $*"; }
 safe_key() { printf '%s' "$1" | sed 's|[^A-Za-z0-9_.-]|_|g'; }
 json_quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's|\\|\\\\|g; s|"|\\"|g')"; }
 
+# ==================== 破坏性变更登记表 =====================================
+# 为什么需要这张表：README 推荐的下载地址是 releases/latest/download/…，用户
+# 粘贴一次就长期生效。上游发新版会直接作用到用户机器上。如果新版引入了破坏性
+# 变更，脚本必须自己识别「你的调用方式还是旧写法」，并在输出里给出可执行的
+# 迁移说明——而不是静默忽略旧参数，或抛出一句看不懂的错误。
+#
+# 每行用 | 分隔，空行与 # 开头的行忽略：
+#     版本 | 类别 | 旧写法 | 新写法 | 说明
+#
+# 类别：
+#   flag      命令行参数被移除/改名 → 用户传了它就立即中止并给出新写法
+#   env       环境变量被移除/改名   → 该变量仍被设置就立即中止并给出新写法
+#   behavior  默认行为或语义变化    → 无法从输入判断，靠「跨版本提示」与
+#                                     --compat 声明来兜住
+#
+# 登记原则：只登记「会让用户已有的调用方式失效」的变更。
+# 新增参数、改日志措辞、改内部实现都不要登记，否则每次发版都在打扰用户。
+#
+# 示例（真的出现变更时照这个样子加一行，把版本号换成实际版本）：
+#   1.0.0|flag|--target|--compose / --container|1.0.0 起把 --target 拆成两个参数
+#   1.0.0|env|UPD_TARGET|UPD_COMPOSE / UPD_CONTAINER|1.0.0 起把 UPD_TARGET 拆成两个变量
+#   1.0.0|behavior|默认只保留 1 份回滚副本|--keep <份数>|1.0.0 起默认保留 2 份
+BREAKING_TABLE='
+'
+# ==================== 登记表结束 ===========================================
+
+# 版本比较：A > B 返回 0，否则返回 1。只比较前 3 段数字，缺的段按 0 处理。
+ver_gt() {
+  _a="$1"; _b="$2"; _i=1
+  while [ "$_i" -le 3 ]; do
+    _x=$(printf '%s' "$_a" | cut -d. -f"$_i"); _x=${_x:-0}
+    _y=$(printf '%s' "$_b" | cut -d. -f"$_i"); _y=${_y:-0}
+    case "$_x" in ''|*[!0-9]*) _x=0 ;; esac
+    case "$_y" in ''|*[!0-9]*) _y=0 ;; esac
+    [ "$_x" -gt "$_y" ] && return 0
+    [ "$_x" -lt "$_y" ] && return 1
+    _i=$(( _i + 1 ))
+  done
+  return 1
+}
+
+# A >= B
+ver_ge() { ver_gt "$2" "$1" && return 1; return 0; }
+
+# 取登记表里某一类别的行，输出「版本|旧写法|新写法|说明」
+compat_rows() {
+  printf '%s\n' "$BREAKING_TABLE" | while IFS='|' read -r _v _k _t _n _d; do
+    case "$_v" in ''|'#'*) continue ;; esac
+    [ "$_k" = "$1" ] || continue
+    printf '%s|%s|%s|%s\n' "$_v" "$_t" "$_n" "$_d"
+  done
+}
+
+# 用户传了一个已被移除的参数：立刻中止，给出新写法与迁移方式。
+# 返回 0 表示「这是登记过的旧参数，已经报错退出」；返回 1 表示不认识的参数。
+compat_removed_flag() {
+  _rows=$(compat_rows flag)
+  [ -n "$_rows" ] || return 1
+  while IFS='|' read -r _v _t _n _d; do
+    [ -n "$_v" ] || continue
+    [ "$_t" = "$1" ] || continue
+    log "ERR 这个参数已经不能用了：$1"
+    log "    从 v$_v 起改为：$_n"
+    log "    原因：$_d"
+    log "    迁移方式：把 $1 换成 $_n"
+    log "    或者把下载地址固定到旧版本（见 README「版本与升级」）"
+    log "    本次未做任何改动，退出码 3"
+    exit 3
+  done <<EOF
+$_rows
+EOF
+  return 1
+}
+
+# 已被移除的环境变量仍被设置：同样中止并给出新写法。
+compat_removed_env() {
+  _rows=$(compat_rows env)
+  [ -n "$_rows" ] || return 0
+  while IFS='|' read -r _v _t _n _d; do
+    [ -n "$_v" ] || continue
+    eval "_cur=\${$_t:-}"
+    [ -n "$_cur" ] || continue
+    log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
+    log "    从 v$_v 起改为：$_n"
+    log "    原因：$_d"
+    log "    迁移方式：删掉 $_t，改用 $_n"
+    log "    或者把下载地址固定到旧版本（见 README「版本与升级」）"
+    log "    本次未做任何改动，退出码 3"
+    exit 3
+  done <<EOF
+$_rows
+EOF
+  return 0
+}
+
+# --compat <版本>：用户声明「我只验证到这个版本」。
+# 若当前脚本含有比声明版本更新的 behavior 级破坏性变更，就硬停并说明原因。
+compat_gate() {
+  [ -n "${COMPAT_UNTIL:-}" ] || return 0
+  case "$COMPAT_UNTIL" in
+    ''|*[!0-9.]*)
+      log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
+      log "    本次未做任何改动，退出码 3"
+      exit 3 ;;
+  esac
+  if ver_gt "$COMPAT_UNTIL" "$VERSION"; then
+    log "ERR 声明的兼容版本($COMPAT_UNTIL)比当前脚本($VERSION)还新"
+    log "    这通常意味着你在降级。请确认下载地址里的版本号，或去掉 --compat"
+    log "    本次未做任何改动，退出码 3"
+    exit 3
+  fi
+  _rows=$(compat_rows behavior)
+  [ -n "$_rows" ] || return 0
+  while IFS='|' read -r _v _t _n _d; do
+    [ -n "$_v" ] || continue
+    ver_gt "$_v" "$COMPAT_UNTIL" || continue    # 变更版本 <= 声明版本：用户已验证过，放行
+    ver_ge "$VERSION" "$_v" || continue         # 当前脚本还没到该版本：不适用
+    log "ERR 版本不兼容：当前脚本 $VERSION 含有影响你的破坏性变更"
+    log "    从 v$_v 起：$_d"
+    log "    应对：$_n"
+    log "    你声明兼容到 $COMPAT_UNTIL（--compat）"
+    log "    处理方式：按上面的「应对」改配置；或把 --compat 提到 v$_v；或改用固定版本"
+    log "    本次未做任何改动，退出码 3"
+    exit 3
+  done <<EOF
+$_rows
+EOF
+  return 0
+}
+
+# 跨版本提示：记住每个更新目标上次跑过的版本，若本次版本更高且两者之间存在
+# behavior 级破坏性变更，主动在日志里说明（不中止，仅提示，每个版本提示一次）。
+compat_notice() {
+  _dir="$1"
+  [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
+  _lf="$_dir/lastver"
+  _prev=""
+  [ -f "$_lf" ] && _prev=$(cat "$_lf" 2>/dev/null)
+  case "$_prev" in ''|*[!0-9.]*) _prev="" ;; esac
+  if [ -n "$_prev" ] && ! ver_gt "$VERSION" "$_prev"; then
+    return 0                      # 同版本或更旧：不提示
+  fi
+  if [ -n "$_prev" ]; then
+    _rows=$(compat_rows behavior)
+    if [ -n "$_rows" ]; then
+      while IFS='|' read -r _v _t _n _d; do
+        [ -n "$_v" ] || continue
+        ver_gt "$_v" "$_prev" || continue
+        ver_ge "$VERSION" "$_v" || continue
+        log "WARN 你从 $VERSION 之前的版本(${_prev})升级上来，v$_v 引入了破坏性变更"
+        log "     变更：$_d"
+        log "     应对：$_n"
+        log "     本次仍会继续执行。若你依赖旧行为，请加 --compat $_prev 或改用固定版本"
+      done <<EOF
+$_rows
+EOF
+    fi
+  fi
+  printf '%s\n' "$VERSION" > "$_lf" 2>/dev/null || true
+  return 0
+}
+
 usage() {
   cat <<'USAGE'
 通用容器自动更新脚本
@@ -93,6 +256,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   --dry-run              只检查有没有新版本，不做任何改动
   --bad-ttl-days <天数>  失败版本钉住多少天后自动解除（默认 7）
   --state-dir <目录>     事务状态目录（默认 /tmp/.container-autoupdate）
+  --compat <版本>        声明只验证到某个版本；脚本若含更新的破坏性变更就中止
   -h, --help             显示本帮助
   -V, --version          显示版本
 
@@ -103,6 +267,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   DOCKER_HOST                   支持 unix:///path 与 tcp://host:port
   DRY_RUN=1                     同 --dry-run
   BAD_TTL_DAYS                  同 --bad-ttl-days
+  COMPAT_UNTIL                  同 --compat
   T_HARD / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
                                 各阶段超时（秒），一般不用改
 
@@ -110,6 +275,12 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   0  成功，或无需更新，或按规则跳过
   1  配置/环境错误，或本轮未能完成更新（容器保持原样）
   2  回滚本身失败，需要人工介入（现场保留在 --state-dir）
+  3  检测到破坏性变更，你的调用方式已失效（本次未做任何改动，日志里有迁移说明）
+
+关于版本与兼容：
+  脚本每次运行都会把版本号写进日志。从 v0.2.0 起，如果新版引入了会破坏你
+  已有调用方式的变更，脚本会主动识别并在输出里给出迁移方式，而不是静默忽略
+  旧写法。想彻底避免意外，把下载地址固定到某个 tag（见 README）。
 
 示例：
   # cron 每小时检查一次
@@ -136,10 +307,13 @@ parse_args() {
                       STATE_ROOT="$2"; shift 2 ;;
       --bad-ttl-days) [ "$#" -ge 2 ] || { echo "ERR --bad-ttl-days 缺少参数" >&2; exit 1; }
                       BAD_TTL_DAYS="$2"; shift 2 ;;
+      --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&2; exit 1; }
+                      COMPAT_UNTIL="$2"; shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       -V|--version)   echo "$VERSION"; exit 0 ;;
-      *)              echo "ERR 未知参数：$1（用 --help 查看用法）" >&2; exit 1 ;;
+      *)              compat_removed_flag "$1"
+                      echo "ERR 未知参数：$1（用 --help 查看用法）" >&2; exit 1 ;;
     esac
   done
 }
@@ -190,6 +364,26 @@ check_deps() {
 parse_args "$@"
 resolve_docker_endpoint
 mkdir -p "$STATE_ROOT"
+
+# 破坏性变更防线（顺序很重要）：
+#   1. 旧环境变量还在设 → 说明用户仍按旧文档调用，立刻中止并给出新写法
+#   2. --compat 声明的版本比脚本旧、且中间有 behavior 级变更 → 中止
+compat_removed_env
+compat_gate
+
+# 每个目标一个版本记录目录，用于「跨版本提示」。
+# 必须与事务目录（compose_update 的 $STATE_ROOT/compose-<名>、plain_update 的
+# $STATE_ROOT/plain-<名>）分开：事务目录在成功收尾时会被整目录 rm -rf，放在
+# 里面会导致 lastver 每轮都被删掉、跨版本提示永远不触发。
+compat_state_dir() {
+  if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
+    printf '%s/compat/compose-%s' "$STATE_ROOT" "$(safe_key "$COMPOSE_NAME")"
+  elif [ -z "$COMPOSE_NAME" ] && [ -n "$CONTAINER_NAME" ]; then
+    printf '%s/compat/plain-%s' "$STATE_ROOT" "$(safe_key "$CONTAINER_NAME")"
+  else
+    printf '%s/compat' "$STATE_ROOT"
+  fi
+}
 
 # 互斥锁按更新目标派生：不同目标各用一把锁（可并行），同一目标才串行。
 acquire_lock() {
@@ -1043,6 +1237,7 @@ if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
   case "$COMPOSE_NAME" in *[!A-Za-z0-9_.-]*) log "ERR Compose 名不合法"; exit 1 ;; esac
   check_deps
   acquire_lock
+  compat_notice "$(compat_state_dir)"
   resolve_compose || exit 1
   [ -n "$C_DIR" ] || {
     log "ERR 找不到 Compose 项目 $COMPOSE_NAME"
@@ -1053,6 +1248,7 @@ if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
 elif [ -z "$COMPOSE_NAME" ] && [ -n "$CONTAINER_NAME" ]; then
   check_deps
   acquire_lock
+  compat_notice "$(compat_state_dir)"
   api_negotiate || exit 1
   plain_update
 else

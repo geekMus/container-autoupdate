@@ -1,0 +1,58 @@
+name: CI
+
+# 非 main 分支与 PR 只做校验，不发版。
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 校验脚本
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 语法检查
+        run: |
+          set -eu
+          if ! sh -n container-autoupdate.sh; then
+            echo "::error::脚本语法检查失败（sh -n）"
+            exit 1
+          fi
+          echo "sh -n 通过"
+
+      - name: 行尾检查
+        run: |
+          set -eu
+          if grep -qU $'\r' container-autoupdate.sh; then
+            echo "::error::脚本含 CRLF 行尾，请转换为 LF"
+            exit 1
+          fi
+          echo "LF 检查通过"
+
+      - name: VERSION 字段检查
+        run: |
+          set -eu
+          V=$(grep -m1 '^VERSION=' container-autoupdate.sh | cut -d'"' -f2)
+          if [ -z "$V" ]; then
+            echo "::error::脚本里找不到 VERSION 字段"
+            exit 1
+          fi
+          echo "VERSION=$V"
+
+      - name: 帮助信息可用
+        run: |
+          set -eu
+          sh container-autoupdate.sh --help >/dev/null
+          sh container-autoupdate.sh --version
+
+      - name: shellcheck（仅提示，不阻断）
+        continue-on-error: true
+        run: shellcheck -S warning container-autoupdate.sh || true

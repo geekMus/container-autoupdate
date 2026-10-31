@@ -1,0 +1,112 @@
+name: Release
+
+# 发版规则：脚本里的 VERSION 字段是唯一版本来源。
+# 只要 main 分支上的 VERSION 变成一个新值，本工作流就自动打 tag 并发布 Release。
+# 其他分支不会执行发版（见下面的 if 与 branches 限制）。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - container-autoupdate.sh
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 打 tag 并发布 Release
+    runs-on: ubuntu-latest
+    # 只有 main 分支允许发版；workflow_dispatch 选到别的分支时直接跳过
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: 检出代码（含全部 tag）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验脚本
+        run: |
+          set -eu
+          test -f container-autoupdate.sh || { echo "::error::找不到 container-autoupdate.sh"; exit 1; }
+
+          # 1. 语法
+          if ! sh -n container-autoupdate.sh; then
+            echo "::error::脚本语法检查失败（sh -n）"
+            exit 1
+          fi
+          echo "语法检查通过"
+
+          # 2. 行尾必须是 LF：CRLF 会让 sh 把 \r 当成参数的一部分
+          if grep -qU $'\r' container-autoupdate.sh; then
+            echo "::error::脚本含 CRLF 行尾，请转换为 LF"
+            exit 1
+          fi
+          echo "行尾检查通过（LF）"
+
+          # 3. 必须可执行（便于直接下载运行）
+          if [ ! -x container-autoupdate.sh ]; then
+            echo "::warning::脚本没有可执行权限，下载后需要 chmod +x"
+          fi
+
+      - name: 读取 VERSION 字段
+        id: ver
+        run: |
+          set -eu
+          # 只取行首的 VERSION=，不会误抓 API_VERSION
+          V=$(grep -m1 '^VERSION=' container-autoupdate.sh | cut -d'"' -f2)
+          if [ -z "$V" ]; then
+            echo "::error::脚本里找不到 VERSION 字段"
+            exit 1
+          fi
+          # 形如 0.1.0 / 1.2.3 / 1.2.3.4
+          case "$V" in
+            [0-9]*.[0-9]*) ;;
+            *) echo "::error::VERSION 格式不合法：$V（应形如 1.2.3）"; exit 1 ;;
+          esac
+          case "$V" in
+            *[!0-9.]*) echo "::error::VERSION 只能包含数字和点：$V"; exit 1 ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "读取到 VERSION=$V"
+
+      - name: 打 tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG 已存在，跳过打 tag（VERSION 未变更）"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "refs/tags/$TAG"
+          echo "已创建并推送 tag $TAG"
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，跳过"
+            exit 0
+          fi
+          # 把脚本本身作为 Release 资产上传，
+          # 这样 releases/latest/download/container-autoupdate.sh 永远指向最新发布版
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            container-autoupdate.sh
+          echo "已发布 Release $TAG"

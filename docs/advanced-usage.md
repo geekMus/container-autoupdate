@@ -9,7 +9,7 @@
 ### 推荐：先下载到文件，再执行
 
 ```sh
-curl -fsSL https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 chmod +x /usr/local/bin/container-autoupdate.sh
 /usr/local/bin/container-autoupdate.sh --compose myapp
@@ -20,7 +20,7 @@ chmod +x /usr/local/bin/container-autoupdate.sh
 ### 次选：先落到临时文件，再执行（不污染磁盘）
 
 ```sh
-URL=https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh
+URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
 _t=$(mktemp)
 if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
   sh "$_t" --compose myapp
@@ -54,19 +54,71 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 > ```
 > 这样 `curl` 失败时整条命令返回非 0。
 
-## 2. 固定版本，别跟着 main 跑
+## 2. 版本：默认跟最新发布版，也可以锁死
 
-README 里所有示例都用 `/v0.1.0/` 这样的 **tag 路径**，不是 `/main/`。
+**默认用法**：`releases/latest/download/container-autoupdate.sh`
 
-原因：这是会自动改生产容器的脚本。用 `/main/` 意味着上游任何一次提交第二天就会跑在你的机器上。用 tag 路径，升级变成一次显式的版本号替换。
+这个地址**不含版本号，永远指向最新发布的 Release**。好处是你粘贴一次就不用再管了，作者发新版你下一轮就自动用上。
 
-升级时只改 URL 里的版本号即可：
+它和 `/main/` 不一样：`/main/` 指向分支最新提交，包含还没发布的中间状态（包括改文档的提交）；`releases/latest/` 只指向**已经通过校验并正式发布**的版本。
+
+**想锁死版本**：把 `latest/download` 换成具体 tag。
 
 ```sh
-URL=https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.1/container-autoupdate.sh
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v0.2.0/container-autoupdate.sh
 ```
 
-> 注意：**必须用短 tag 形式 `/v0.1.0/`**。某些加速服务（含自建的那套）对 `refs/tags/v0.1.0` 形式会超时。
+什么时候该锁死：你不想在无人值守的生产环境上突然换行为。锁死之后，升级变成一次显式的版本号替换。
+
+查看当前用的是哪个版本：
+
+```sh
+sh container-autoupdate.sh --version
+```
+
+> **发版机制**：仓库里的 `VERSION` 字段（脚本第 53 行附近，形如 `VERSION="0.2.0"`）是唯一版本来源。推到 `main` 时，GitHub Actions 会读它，若对应 tag 不存在就自动打 tag 并发布 Release，并把脚本作为 Release 资产上传。所以升级只需要改 `VERSION` 一个地方，README 和下载地址都不用动。
+
+> 注意：**`refs/tags/v0.2.0` 这种形式不要用**。某些加速服务（含自建的那套）对它超时。用 `/releases/download/v0.2.0/` 或短 tag 路径。
+
+### 用 latest 时，破坏性变更会怎么表现
+
+这是「用 latest 也安全」的机制说明。上游改坏了你的调用方式时，脚本分三类处理：
+
+| 变更类型 | 例子 | 脚本怎么办 |
+|---|---|---|
+| 参数被移除/改名 | `--target` 拆成 `--compose` / `--container` | **立刻中止**，退出码 `3`，日志写明「哪个参数不能用了、从哪个版本起改成什么、怎么改」 |
+| 环境变量被移除/改名 | `UPD_TARGET` 拆成 `UPD_COMPOSE` / `UPD_CONTAINER` | 同上 |
+| 默认行为/语义变化 | 回滚副本默认从 1 份变 2 份 | 无法从输入判断，用下面两个机制兜住 |
+
+后一类靠这两个机制：
+
+**① 跨版本提示。** 脚本会在 `--state-dir` 下记住每个目标上次跑过的版本（`compat/compose-<名>/lastver`、`compat/plain-<名>/lastver`）。当本次版本更高、且两者之间存在破坏性变更时，日志开头会多一段：
+
+```sh
+[2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.2.0)升级上来，v1.0.0 引入了破坏性变更
+[2026-11-01 03:52:03]      变更：默认保留 2 份回滚副本
+[2026-11-01 03:52:03]      应对：如只想保留 1 份，加 --keep 1
+[2026-11-01 03:52:03]      本次仍会继续执行。若你依赖旧行为，请加 --compat 0.2.0 或改用固定版本
+```
+
+它**不中止**（因为不确定你是否依赖旧行为），只提示。同一版本不会重复提示；降级也不会提示。
+
+**② `--compat <版本>`。** 你可以声明「我只验证到某个版本」。如果脚本版本更高、且中间有破坏性变更，它会硬停（退出码 `3`）而不是冒险执行：
+
+```sh
+container-autoupdate.sh --compose myapp --compat 0.2.0
+```
+
+适合的场景：你在生产上验证过 `0.2.0`，但某天 `latest` 跳到 `1.0.0`，你还没时间做回归——加上 `--compat 0.2.0` 就等于「只要碰到我没验证过的破坏性变更就别动我的容器」。等你验证完了，把数字改成新版本或直接去掉。
+
+`--compat` 的边界行为：
+
+- 值不合法（如 `abc`）→ 退出码 `3`
+- 值比脚本还新（例如脚本 `1.0.0` 但你写 `--compat 1.5.0`，通常是下载地址写错了）→ 退出码 `3`
+- 值等于或高于变更版本 → 放行
+- 没有任何登记在案的破坏性变更 → 直接放行，不打扰
+
+> 维护者视角：破坏性变更登记在脚本里的 `BREAKING_TABLE`。新增能力、改日志措辞、改内部实现都**不要**登记，否则每次发版都在打扰用户。
 
 ## 3. 国内网络：换镜像源
 
@@ -74,10 +126,11 @@ URL=https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container
 
 | 前缀 | 形式 | 备注 |
 |---|---|---|
-| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://raw.githubusercontent.com/...` | 自建，最快 |
-| `https://gh-proxy.com/` | `https://gh-proxy.com/https://raw.githubusercontent.com/...` | 公共 |
-| `https://ghproxy.net/` | `https://ghproxy.net/https://raw.githubusercontent.com/...` | 公共 |
-| `https://cdn.jsdelivr.net/` | `https://cdn.jsdelivr.net/gh/geekMus/container-autoupdate@v0.1.0/container-autoupdate.sh` | 路径格式不同，注意 `@` 版本号 |
+| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 自建，最快 |
+| `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
+| `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
+
+> `cdn.jsdelivr.net` **不要用于本仓库**：实测它返回的是缓存旧版本（`@main` 拿到过 `VERSION=6.0.0` 的历史内容）。jsdelivr 适合固定 tag 的静态文件，不适合「跟最新发布版」的场景。
 
 ## 4. 退出码
 
