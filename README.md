@@ -229,54 +229,59 @@ systemctl enable --now ct-update.timer
 
 ### DPanel 计划任务
 
-DPanel 的计划任务原生支持环境变量，三种方式都能用。**推荐第 1 种**（脚本落地成文件再调用），
-因为它不依赖每次执行时的网络：
+**推荐做法：任务里直接拉取线上固定 tag 执行。** 不用把脚本落地成文件，也不用粘脚本全文 ——
+任务里只写一条 `curl | sh`，脚本始终是 tag 指向的那个版本，仓库更新了只要改 tag 号即可。
 
-**1. 脚本落地 + 命令行参数（推荐）**
-
-把脚本放到宿主机 DPanel 数据目录（该目录挂载为容器内 `/dpanel`）：
+在 DPanel 任务脚本框里写：
 
 ```sh
-# 宿主机上执行
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
-  -o /root/dpanel/container-autoupdate.sh
+# Compose 项目
+curl -fsSL --max-time 60 \
+  https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
+  | sh -s -- --compose myapp
 ```
 
-然后在 DPanel 任务脚本框里只写一行：
-
 ```sh
-sh /dpanel/container-autoupdate.sh --compose myapp
+# 普通容器
+curl -fsSL --max-time 60 \
+  https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
+  | sh -s -- --container mycontainer
 ```
 
-或者用普通容器：
+第一次务必先加 `--dry-run` 跑一遍，确认日志里的目标和目录识别正确，再改回正式命令。
+
+> **为什么用固定 tag 而不是 `main`**：这是会自动改动生产容器的脚本。跟 `main` 意味着你仓库里的
+> 任何一次提交都会立刻作用到所有定时任务上。固定 tag 后，升级变成一个有意识的动作。
+
+#### 其他写法
+
+**环境变量方式**：在任务的 Environment 里加 `UPD_COMPOSE=myapp`（或 `UPD_CONTAINER=mycontainer`），
+脚本里就不带参数：
 
 ```sh
-sh /dpanel/container-autoupdate.sh --container mycontainer
-```
-
-**2. 环境变量面板**
-
-在任务的 Environment 里加一行 `UPD_COMPOSE=myapp`（或 `UPD_CONTAINER=mycontainer`），
-任务脚本框里写：
-
-```sh
-sh /dpanel/container-autoupdate.sh
+curl -fsSL --max-time 60 \
+  https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
+  | sh
 ```
 
 > 环境变量的值会被 DPanel 做一次 `os.Expand` 展开，**值里不要带 `$`**。
 
-**3. 脚本全文粘进任务**
+**脚本落地方式**：如果不想每次执行都联网下载，把脚本放到宿主机挂载目录（DPanel 的
+`/root/dpanel` 就是容器内的 `/dpanel`），任务里写 `sh /dpanel/container-autoupdate.sh --compose myapp`。
+这种方式不受网络影响，但需要自己维护脚本副本。
 
-把脚本全文粘进任务脚本框，在顶部配置区填 `COMPOSE_NAME="myapp"`。
-这种方式最自包含，但每次更新脚本都要重新粘贴，且任务配置里存一份副本。
+**脚本全文粘贴**：把脚本全文粘进任务脚本框，顶部配置区填 `COMPOSE_NAME="myapp"`。
+最自包含，但每次升级都要重新粘贴。
 
-> **两个必须注意的点：**
->
-> - **执行超时要设 ≥ 600 秒**。脚本自身硬上限 540 秒，留出余量才能保证它自己收尾而不是被外部 SIGKILL（被外部杀掉时日志会全部丢失）。
+#### 两个必须注意的点
+
+> - **执行超时要设 ≥ 600 秒**。脚本自身硬上限 540 秒，还要留出下载脚本的时间，余量够了才能保证它自己收尾而不是被外部 SIGKILL（被外部杀掉时日志会全部丢失）。
 > - **在 UI 里改过任务排期后，回来确认 `scriptRunTimeout` 还在**。DPanel 重写任务配置时会丢掉这个字段（`omitempty`，缺省为 0 即不限时），需要重新设置。
 
-**建议第一次先试运行**：把任务脚本临时改成 `sh /dpanel/container-autoupdate.sh --compose myapp --dry-run`，
-手动跑一次看日志确认目标识别正确，再改回正式命令并启用定时。
+#### 升级脚本版本
+
+仓库发了新 tag 后，把任务里的 tag 号改掉即可（比如 `v0.1.0` → `v0.2.0`）。
+不需要重新下载或粘贴任何东西。
 
 ---
 
