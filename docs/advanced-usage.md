@@ -130,6 +130,12 @@ container-autoupdate.sh --compose myapp --compat 0.2.0
 | `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
 | `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
 
+也可以用**直连**（不加前缀）：`https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh`。实测在部分网络下直连 Release 资产比 raw 文件更稳（raw 会 8 秒超时，Release 资产直连成功）。
+
+> **一定要带 `-L`**（或 `--location`）。`releases/latest/download/` 会先返回 302 跳到具体 tag 的地址，不带 `-L` 时 `curl -f` 会把它当失败（`curl: (22)`）。本文所有示例都带 `-L`。
+>
+> 加速源对 Release 资产**偶发** `403` / `522`（实测同一地址几分钟前 403、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。这也正是「先落临时文件再执行」值得用的原因：失败会变成可见的非 0 退出码。
+>
 > `cdn.jsdelivr.net` **不要用于本仓库**：实测它返回的是缓存旧版本（`@main` 拿到过 `VERSION=6.0.0` 的历史内容）。jsdelivr 适合固定 tag 的静态文件，不适合「跟最新发布版」的场景。
 
 ## 4. 退出码
@@ -139,8 +145,9 @@ container-autoupdate.sh --compose myapp --compat 0.2.0
 | `0` | 成功更新 / 无需更新 / 按规则安全跳过 | 不用管 |
 | `1` | 配置或环境错误，或本轮更新没完成（**容器保持原样**） | 看日志里的 `ERR`；容器没被改动，不需要救 |
 | `2` | **回滚本身失败了**，需要人工介入 | 立刻看日志里的 `CRITICAL`；现场保留在 `--state-dir`（默认 `/tmp/.container-autoupdate`） |
+| `3` | **检测到破坏性变更**，你的调用方式已失效（本次未做任何改动） | 按日志里的「迁移方式」改命令；或锁版本；或加 `--compat` |
 
-`2` 是唯一需要你动手的情况。脚本会保留现场（新容器、旧容器、tag 状态），不要急着重启机器或 `docker system prune`。
+`2` 是唯一需要你动手抢救的情况。脚本会保留现场（新容器、旧容器、tag 状态），不要急着重启机器或 `docker system prune`。
 
 ## 5. 定时器细节
 
