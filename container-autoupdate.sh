@@ -1,13 +1,13 @@
 #!/bin/sh
 # ===========================================================================
-# 通用容器自动更新 v6 —— 单轮逻辑，可放进任意定时器（cron / systemd timer /
+# 通用容器自动更新 v0.1.0 —— 单轮逻辑，可放进任意定时器（cron / systemd timer /
 # DPanel 计划任务 / CI）。脚本本身不含更新频率逻辑。
 #
 # 目标二选一：一个 Compose 项目名，或一个容器名。可以用命令行参数、
 # 环境变量或文件顶部配置区指定，三者等价，优先级：命令行 > 环境变量 > 配置区。
 # 镜像引用从 Compose 文件 / 容器本身自动发现，不需要手工填镜像地址。
 #
-# V6 安全原则：
+# 安全原则：
 #   · Compose：显式 -p 固定项目，保留 config/env 文件；不使用 --remove-orphans；
 #     up 失败后真正回滚，回滚失败绝不报成功。
 #   · 容器：不把运行态 NetworkSettings 整包回投；按声明式字段重建网络；
@@ -45,11 +45,11 @@ API_HOST="http://localhost"
 API_VERSION="1.47"
 API="http://localhost/v1.47"
 LOCK_PREFIX="${LOCK_PREFIX:-/tmp/.container-autoupdate}" # 互斥锁前缀，实际文件名按更新目标派生
-STATE_ROOT="${STATE_ROOT:-/tmp/.ct-v6}"
+STATE_ROOT="${STATE_ROOT:-/tmp/.container-autoupdate}"
 BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 
 START=$(date +%s)
-VERSION="6.0.0"
+VERSION="0.1.0"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -92,7 +92,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   --docker-sock <路径>   Docker socket 路径；默认读 DOCKER_HOST 或 /var/run/docker.sock
   --dry-run              只检查有没有新版本，不做任何改动
   --bad-ttl-days <天数>  失败版本钉住多少天后自动解除（默认 7）
-  --state-dir <目录>     事务状态目录（默认 /tmp/.ct-v6）
+  --state-dir <目录>     事务状态目录（默认 /tmp/.container-autoupdate）
   -h, --help             显示本帮助
   -V, --version          显示版本
 
@@ -115,8 +115,8 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   # cron 每小时检查一次
   0 * * * * /usr/local/bin/container-autoupdate.sh --compose myapp >> /var/log/ct-update.log 2>&1
 
-  # 直接跑远程脚本（建议固定 tag，避免上游改动直接影响你的生产）
-  curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/v6.0.0/container-autoupdate.sh \
+  # 直接跑远程脚本（固定 tag，避免上游改动直接影响你的生产）
+  curl -fsSL https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
     | sh -s -- --compose myapp
 USAGE
 }

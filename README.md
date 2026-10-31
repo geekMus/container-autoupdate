@@ -62,13 +62,13 @@ sed / awk / grep
 下载后加执行权限即可：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+curl -fsSL https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 chmod +x /usr/local/bin/container-autoupdate.sh
 ```
 
 > **建议固定 tag 而不是跟随 `main`**。这是会自动改动生产容器的脚本，让它的内容随上游分支漂移
-> 是没必要的风险。上面的链接用了 `v6.0.0`；`main` 分支是最新开发版。
+> 是没必要的风险。上面的链接用了 `v0.1.0`；`main` 分支是最新开发版。
 
 ### 中国大陆访问不了 raw.githubusercontent.com 时
 
@@ -76,23 +76,27 @@ chmod +x /usr/local/bin/container-autoupdate.sh
 DNS 却能正常解析）。用下面任一镜像源替换地址前缀即可，内容与 GitHub 完全一致：
 
 ```sh
-# gh-proxy.com（实测最快）
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+# 本项目的自建加速（推荐，稳定）
+curl -fsSL https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/refs/tags/v0.1.0/container-autoupdate.sh \
+  -o /usr/local/bin/container-autoupdate.sh
+
+# gh-proxy.com
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 
 # ghproxy.net
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 
 # jsDelivr（CDN，注意路径格式不同）
-curl -fsSL https://cdn.jsdelivr.net/gh/geekMus/container-autoupdate@v6.0.0/container-autoupdate.sh \
+curl -fsSL https://cdn.jsdelivr.net/gh/geekMus/container-autoupdate@v0.1.0/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 ```
 
 下载后建议核对一下确实是官方内容：
 
 ```sh
-sh /usr/local/bin/container-autoupdate.sh --version   # 应输出 6.0.0
+sh /usr/local/bin/container-autoupdate.sh --version   # 应输出 0.1.0
 ```
 
 ### 在容器里跑的情况
@@ -102,7 +106,7 @@ sh /usr/local/bin/container-autoupdate.sh --version   # 应输出 6.0.0
 
 ```sh
 # 宿主机上：DPanel 的 /root/dpanel 挂载为容器内的 /dpanel
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+curl -fsSL https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/refs/tags/v0.1.0/container-autoupdate.sh \
   -o /root/dpanel/container-autoupdate.sh
 ```
 
@@ -111,7 +115,7 @@ curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/contai
 也可以用 `curl | sh` 直接跑（脚本不读取自身路径，无需落地）：
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+curl -fsSL https://github.mus.pp.ua/https://raw.githubusercontent.com/geekMus/container-autoupdate/refs/tags/v0.1.0/container-autoupdate.sh \
   | sh -s -- --compose myapp --dry-run
 ```
 
@@ -136,7 +140,7 @@ container-autoupdate.sh --help                 显示帮助
 | `--container <名>` | 容器名 |
 | `--compose-dir <目录>` | Compose 项目目录；默认从容器 label 自动发现 |
 | `--docker-sock <路径>` | Docker socket；默认读 `DOCKER_HOST` 或 `/var/run/docker.sock` |
-| `--state-dir <目录>` | 事务状态目录，默认 `/tmp/.ct-v6` |
+| `--state-dir <目录>` | 事务状态目录，默认 `/tmp/.container-autoupdate` |
 | `--bad-ttl-days <天>` | 失败版本钉住多少天后自动解除，默认 7 |
 | `--dry-run` | 只检查有没有新版本，不做任何改动 |
 | `-h, --help` | 显示帮助 |
@@ -234,7 +238,7 @@ DPanel 的计划任务原生支持环境变量，三种方式都能用。**推�
 
 ```sh
 # 宿主机上执行
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v6.0.0/container-autoupdate.sh \
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
   -o /root/dpanel/container-autoupdate.sh
 ```
 
