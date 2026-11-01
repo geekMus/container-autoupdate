@@ -198,7 +198,7 @@ echo ""
 echo '```sh'
 echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
 echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
-echo "CT_VERSION=$VERSION /usr/local/bin/ct-bootstrap.sh --compose myapp   # 锁到本版"
+echo "/usr/local/bin/ct-bootstrap.sh --ct-version $VERSION --compose myapp   # 锁到本版"
 echo '```'
 echo ""
 echo "想直接跑主脚本（自己维护文件，不会自动升级）："

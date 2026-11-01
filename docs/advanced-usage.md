@@ -19,7 +19,7 @@ chmod +x /usr/local/bin/ct-bootstrap.sh
 
 | 情形 | 网络开销 |
 |---|---|
-| 设了 `CT_VERSION=<版本号>`，本地已有 | **零**（完全不联网） |
+| 设了 `--ct-version <版本号>`（或 `CT_VERSION`），本地已有 | **零**（完全不联网） |
 | 默认（跟 latest），本地同版本 | 一次 4KB Range 探测（约 1 秒），不下载 |
 | 默认，远端有新版本 | 探测 + 一次 64KB 下载，然后缓存 |
 | 探测失败但本地有缓存 | 零（用缓存，打 `WARN`） |
@@ -27,7 +27,7 @@ chmod +x /usr/local/bin/ct-bootstrap.sh
 
 好处有三个：下载失败会明确返回非 0；缓存命中时不必联网（镜像源抖动不影响脚本启动）；缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当脚本执行。
 
-全部配置项见 [参数文档](parameters.md#引导器ct-bootstrapsh的环境变量)。
+全部配置项见 [参数文档](parameters.md#引导器ct-bootstrapsh的参数与环境变量)。
 
 ### 备选：直接下载主脚本到文件，再执行（不缓存）
 
@@ -90,10 +90,10 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 
 它和 `/main/` 不一样：`/main/` 指向分支最新提交，包含还没发布的中间状态（包括改文档的提交）；`releases/latest/` 只指向**已经通过校验并正式发布**的版本。
 
-**想锁死版本**：给引导器设 `CT_VERSION`（不用改下载地址）：
+**想锁死版本**：给引导器加 `--ct-version`（不用改下载地址；也可用环境变量 `CT_VERSION`）：
 
 ```sh
-CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
+/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
 ```
 
 锁死后引导器**完全不联网取新版本**——本地有该版本就直接跑。这是生产环境最稳的形态。

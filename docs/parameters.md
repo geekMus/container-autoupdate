@@ -40,37 +40,52 @@ CONTAINER_NAME=""
 Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `docker-compose`），
 仅 compose 模式需要；容器模式不需要。
 
-## 引导器（ct-bootstrap.sh）的环境变量
+## 引导器（ct-bootstrap.sh）的参数与环境变量
 
 引导器是推荐的使用方式：它负责下载与缓存主脚本，你只维护一行命令。
 它自己也需要 `curl`（探测与下载）和 `sh`，其余依赖同主脚本。
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `1.2.3`，带不带 `v` 前缀都行）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设，版本号见 Releases 页面。 |
-| `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | 脚本缓存目录。容器内跑要挂载可写目录，或改到 `/tmp`。 |
-| `CT_CACHE_KEEP` | `3` | 保留几个历史版本文件，超出的删掉。设 `0` 表示不裁剪。 |
-| `CT_SOURCE` | `auto` | 下载源：`auto`（gh-proxy → 直连 → ghproxy.net）、`direct`、`gh-proxy`、`ghproxy`，或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |
-| `CT_T_NET` | `20` | 单次网络操作超时（秒）。探测和下载各自适用。 |
-| `CT_TRIES` | `2` | 每个源尝试几次。 |
-| `CT_FORCE` | `0` | 设 `1` 忽略缓存强制重新下载。 |
-| `CT_QUIET` | `0` | 设 `1` 不打印引导器自己的日志（主脚本日志照旧）。 |
+两种指定方式，优先级：**命令行 `--ct-*` > 环境变量 `CT_*`**。
+引导器选项必须写在主脚本参数前面；也可用 `--` 明确分隔。
+
+| 命令行 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `--ct-version <版本>` | `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `1.2.3`，带不带 `v` 前缀都行）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设，版本号见 Releases 页面。 |
+| `--ct-cache-dir <目录>` | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | 脚本缓存目录。容器内跑要挂载可写目录，或改到 `/tmp`。 |
+| `--ct-cache-keep <N>` | `CT_CACHE_KEEP` | `3` | 保留几个历史版本文件，超出的删掉。设 `0` 表示不裁剪。 |
+| `--ct-source <源>` | `CT_SOURCE` | `auto` | 下载源：`auto`（gh-proxy → 直连 → ghproxy.net）、`direct`、`gh-proxy`、`ghproxy`，或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |
+| `--ct-t-net <秒>` | `CT_T_NET` | `20` | 单次网络操作超时（秒）。探测和下载各自适用。 |
+| `--ct-tries <N>` | `CT_TRIES` | `2` | 每个源尝试几次。 |
+| `--ct-force` | `CT_FORCE=1` | 关 | 忽略缓存强制重新下载。 |
+| `--ct-quiet` | `CT_QUIET=1` | 关 | 不打印引导器自己的日志（主脚本日志照旧）。 |
+| `--ct-help` | — | — | 显示引导器帮助。 |
+
+```sh
+# 命令行（推荐写进 crontab / DPanel 脚本框）
+ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
+
+# 环境变量（兼容旧写法）
+CT_VERSION=1.2.3 ct-bootstrap.sh --compose myapp
+
+# 混用：命令行覆盖环境变量；-- 后全是主脚本参数
+CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compose myapp --dry-run
+```
 
 引导器行为一览：
 
 | 情形 | 结果 |
 |---|---|
-| `CT_VERSION` 已设 + 本地有该版本 | 直接执行，**零网络请求** |
-| `CT_VERSION` 已设 + 本地没有 | 下载该版本后执行（只试固定 tag，不会拿 latest） |
-| 未设 `CT_VERSION` + 探测到版本且本地已有 | 只发一次 4KB Range 请求，不下载 |
-| 未设 `CT_VERSION` + 探测到新版本 | 下载 64KB 并缓存，然后执行 |
+| 已设固定版本（`--ct-version` / `CT_VERSION`）+ 本地有该版本 | 直接执行，**零网络请求** |
+| 已设固定版本 + 本地没有 | 下载该版本后执行（只试固定 tag，不会拿 latest） |
+| 未设固定版本 + 探测到版本且本地已有 | 只发一次 4KB Range 请求，不下载 |
+| 未设固定版本 + 探测到新版本 | 下载 64KB 并缓存，然后执行 |
 | 探测失败 + 本地有可用缓存 | 用缓存执行，打 `WARN`（退出码取决于主脚本） |
 | 探测失败 + 本地无缓存 | `ERR`，退出码 `1`（**不会静默成功**） |
 | 缓存文件损坏 | 自动重新下载（校验：语法 + `VERSION` 字段 + 特征字符串） |
 
 > 为什么默认源是 `gh-proxy.com` 而不是直连：实测（2026-11-01）直连 `github.com`
 > 偶发 DNS 失败与 12 秒延迟，`gh-proxy.com` 稳定 1~2 秒；`ghproxy.net` 已连续超时不可用。
-> 想直连就设 `CT_SOURCE=direct`。
+> 想直连就设 `--ct-source direct` 或 `CT_SOURCE=direct`。
 
 
 ## 全部命令行参数

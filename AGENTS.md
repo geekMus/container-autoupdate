@@ -276,7 +276,7 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
   | 直连 `github.com` | 1s，但 3 次中 1 次 DNS 失败 | 不稳 |
   | `ghproxy.net` | **3/3 全部 15s 超时** | — |
 - **自建源 `github.mus.pp.ua` 不进默认列表。** 实测 8 次里 Range 成功 5 次、下载成功 4 次，平均 12~20s；根因是它把请求转给 GitHub **网页前端**（响应头 `content-type: text/html` + `set-cookie`），不是直转 Release 资产。它内容正确（sha256 与官方一致），使用者可用 `CT_SOURCE` 自行接入，但不该是默认。
-- **固定版本模式（`CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。
+- **固定版本模式（`--ct-version` / `CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。引导器自己的开关用 `--ct-*`（命令行优先于同名 `CT_*` 环境变量），其余参数原样透传给主脚本。
 - **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh` 和 `ct-bootstrap.sh` 两个资产；少传一个，`releases/latest/download/ct-bootstrap.sh` 就是 404。
 
 ---

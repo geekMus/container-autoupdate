@@ -1,32 +1,37 @@
 #!/bin/sh
-# ============================================================================
+# =============================================================================
 # container-autoupdate 引导器（bootstrap）
 #
 # 解决的问题：让定时任务不必「每轮都联网下载脚本」。
-#   固定版本（CT_VERSION=0.3.2）：本地有就直接跑，完全不联网。
-#   latest（默认）           ：先探测远端 tag；本地同版本则直接复用，不同才下载并缓存。
+#   固定版本（--ct-version / CT_VERSION）：本地有就直接跑，完全不联网。
+#   latest（默认）                       ：先探测远端 tag；本地同版本则直接复用，不同才下载并缓存。
 #
 # 用法（放进 DPanel 计划任务 / cron）：
 #   sh -c 'curl -fsSL <本文件地址> | sh -s -- --compose myapp'
 # 或者把本文件落地一次，之后定时任务直接跑本地文件（更快、更稳）：
 #   /usr/local/bin/ct-bootstrap.sh --compose myapp
+#   /usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
+#
+# 引导器自己的开关用 --ct-*（也可继续用 CT_* 环境变量；命令行优先）。
+# --ct-* 写在主脚本参数前面；或用 -- 明确分隔：
+#   ct-bootstrap.sh --ct-version 1.2.3 --ct-source direct -- --compose myapp --dry-run
 #
 # 设计取舍：
-#   - 探测用 HTTP HEAD 读 302 的 Location 里的 tag：只取响应头，几乎零流量。
+#   - 探测用 Range 读文件头里的 VERSION：只取前 4KB，几乎零流量。
 #     探测失败**不阻断**：本地有缓存就继续用，只打 WARN。
 #   - 下载必须落地到临时文件再执行。管道写法（curl | sh）会把下载失败吞成 rc=0。
 #   - 缓存按版本分文件，只保留最近 CACHE_KEEP 个。
 #   - 下载后要真正校验（语法 + 版本号 + 特征字符串），否则半截文件会被当脚本跑。
-# ============================================================================
+# =============================================================================
 
-BOOT_VERSION="1"
+BOOT_VERSION="2"
 
 REPO="geekMus/container-autoupdate"
 ASSET="container-autoupdate.sh"
 
-# ---- 可覆盖的配置 ----
+# ---- 可覆盖的配置（环境变量作默认；下面命令行可覆盖）----
 CACHE_DIR="${CT_CACHE_DIR:-/var/cache/container-autoupdate}"
-PIN_VERSION="${CT_VERSION:-}"     # 非空 = 固定版本模式（如 0.3.2 或 v0.3.2）
+PIN_VERSION="${CT_VERSION:-}"     # 非空 = 固定版本模式（如 1.2.3 或 v1.2.3）
 SOURCE="${CT_SOURCE:-auto}"       # auto | direct | gh-proxy | ghproxy | 自定义前缀
 CACHE_KEEP="${CT_CACHE_KEEP:-3}"  # 保留几个历史版本
 T_NET="${CT_T_NET:-20}"           # 单次网络超时（秒）
@@ -36,6 +41,31 @@ QUIET="${CT_QUIET:-0}"
 
 log() { [ "$QUIET" = "1" ] || echo "[ct-bootstrap] $*" >&2; }
 die() { echo "[ct-bootstrap] ERR $*" >&2; exit 1; }
+
+boot_usage() {
+  cat <<'BOOT_USAGE'
+用法: ct-bootstrap.sh [引导器选项...] [--] [主脚本参数...]
+
+引导器选项（命令行优先于同名 CT_* 环境变量）：
+  --ct-version <版本>     固定版本模式（如 1.2.3；带不带 v 都行）。本地有则零联网
+  --ct-cache-dir <目录>   缓存目录（默认 /var/cache/container-autoupdate）
+  --ct-cache-keep <N>     保留几个历史版本（默认 3；0 = 不裁剪）
+  --ct-source <源>        auto | direct | gh-proxy | ghproxy | 自定义前缀（默认 auto）
+  --ct-t-net <秒>         单次网络超时（默认 20）
+  --ct-tries <N>          每个源尝试次数（默认 2）
+  --ct-force              忽略缓存强制重新下载
+  --ct-quiet              不打印引导器日志（主脚本日志照旧）
+  --ct-help               显示本帮助
+
+主脚本参数原样透传（见 container-autoupdate.sh --help），例如：
+  --compose <项目名> | --container <容器名> | --dry-run | ...
+
+示例：
+  ct-bootstrap.sh --compose myapp
+  ct-bootstrap.sh --ct-version 1.2.3 --compose myapp --dry-run
+  CT_SOURCE=direct ct-bootstrap.sh --ct-version 1.2.3 -- --compose myapp
+BOOT_USAGE
+}
 
 # ---- 候选源基址（每行一个，按优先级）----
 # 实测（N1 dpanel 容器内，2026-11-01）：
@@ -97,7 +127,7 @@ verify_file() {
 #   - Range 0-4000 + 读文件里的 VERSION：代理上稳定 1~2 秒，且拿到的是**真实版本号**，
 #     比解析 URL 更可信。所以统一用 Range。
 #   - 完整下载只要 1 秒（64KB），所以探测的价值不在省时间，而在「本地同版本就不下载」。
-# 返回：把版本号（如 0.3.2，不含 v）打到 stdout；全部失败返回非 0。
+# 返回：把版本号（如 1.2.3，不含 v）打到 stdout；全部失败返回非 0。
 probe_latest_version() {
   for _pb in $(base_urls); do
     _pu=$(url_for "$_pb" "")
@@ -150,10 +180,47 @@ prune_cache() {
   done
 }
 
+# ---- 解析引导器自己的 --ct-*（写在主脚本参数前面，或用 -- 分隔）----
+# 命令行优先于 CT_* 环境变量；剥离后剩下的 $@ 原样透传给主脚本。
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ct-version)
+      [ "$#" -ge 2 ] || die "--ct-version 缺少参数"
+      PIN_VERSION="$2"; shift 2 ;;
+    --ct-cache-dir)
+      [ "$#" -ge 2 ] || die "--ct-cache-dir 缺少参数"
+      CACHE_DIR="$2"; shift 2 ;;
+    --ct-cache-keep)
+      [ "$#" -ge 2 ] || die "--ct-cache-keep 缺少参数"
+      CACHE_KEEP="$2"; shift 2 ;;
+    --ct-source)
+      [ "$#" -ge 2 ] || die "--ct-source 缺少参数"
+      SOURCE="$2"; shift 2 ;;
+    --ct-t-net)
+      [ "$#" -ge 2 ] || die "--ct-t-net 缺少参数"
+      T_NET="$2"; shift 2 ;;
+    --ct-tries)
+      [ "$#" -ge 2 ] || die "--ct-tries 缺少参数"
+      TRIES="$2"; shift 2 ;;
+    --ct-force)
+      FORCE_UPDATE=1; shift ;;
+    --ct-quiet)
+      QUIET=1; shift ;;
+    --ct-help)
+      boot_usage; exit 0 ;;
+    --)
+      shift; break ;;
+    --ct-*)
+      die "未知引导器参数：$1（用 --ct-help 查看用法）" ;;
+    *)
+      break ;;
+  esac
+done
+
 # ---- 主流程 ----
 mkdir -p "$CACHE_DIR" 2>/dev/null || die "无法创建缓存目录 $CACHE_DIR"
 
-# 目标版本：纯版本号（如 0.3.2），不含 v
+# 目标版本：纯版本号（如 1.2.3），不含 v
 TARGET_VER=""
 if [ -n "$PIN_VERSION" ]; then
   case "$PIN_VERSION" in v*) TARGET_VER="${PIN_VERSION#v}" ;; *) TARGET_VER="$PIN_VERSION" ;; esac
@@ -194,5 +261,5 @@ fi
 
 prune_cache
 
-# 参数原样透传
+# 参数原样透传（引导器 --ct-* 已在上面剥离）
 exec sh "$CACHE_FILE" "$@"

@@ -32,7 +32,7 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 >
 > **为什么不推荐 `curl ... | sh`**：管道写法在下载失败时会**静默成功**（任务日志看不出这轮没跑成）。引导器会把下载落到文件、校验通过才执行，失败时明确返回非 0。
 >
-> **生产环境建议锁版本**：给引导器设 `CT_VERSION=<版本号>`（版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
+> **生产环境建议锁版本**：给引导器加 `--ct-version <版本号>`（或设 `CT_VERSION`；版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
 
 ### cron
 
@@ -50,10 +50,10 @@ curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/
   -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh
 ```
 
-想锁版本，就在 crontab 里带上 `CT_VERSION`：
+想锁版本，在 crontab 里加 `--ct-version`（也可用环境变量 `CT_VERSION`）：
 
 ```sh
-0 4 * * * CT_VERSION=<版本号> /usr/local/bin/ct-bootstrap.sh --compose myapp >> /var/log/ct-update.log 2>&1
+0 4 * * * /usr/local/bin/ct-bootstrap.sh --ct-version <版本号> --compose myapp >> /var/log/ct-update.log 2>&1
 ```
 
 > 不想用引导器也行：直接把主脚本下载到本地，定时任务跑它即可（见[进阶用法](docs/advanced-usage.md)）。代价是脚本不会自己升级。
@@ -62,13 +62,13 @@ curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/
 
 | 模式 | 行为 | 网络开销 |
 |---|---|---|
-| 固定版本（`CT_VERSION=<版本号>`） | 本地有就直接跑 | **零**（完全不联网） |
+| 固定版本（`--ct-version <版本号>` / `CT_VERSION`） | 本地有就直接跑 | **零**（完全不联网） |
 | `latest`（默认），本地同版本 | 只探测远端版本号，不下载 | 一次 4KB Range 请求（约 1 秒） |
 | `latest`，远端更新 | 下载新版本并缓存，再执行 | 一次探测 + 一次完整下载（约 70KB） |
 | 探测失败但本地有缓存 | 用缓存继续跑，只打 `WARN` | 零 |
 | 探测失败且无缓存 | **明确报错退出**（不会静默成功） | 零 |
 
-缓存放在 `/var/cache/container-autoupdate`（可用 `CT_CACHE_DIR` 改），按版本分文件，只保留最近 3 个（`CT_CACHE_KEEP`）。缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当成脚本执行。
+缓存放在 `/var/cache/container-autoupdate`（可用 `--ct-cache-dir` / `CT_CACHE_DIR` 改），按版本分文件，只保留最近 3 个（`--ct-cache-keep` / `CT_CACHE_KEEP`）。缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当成脚本执行。引导器自己的开关一律用 `--ct-*` 前缀（也可用同名 `CT_*` 环境变量；命令行优先），其余参数原样交给主脚本。
 
 
 ## 常用命令
@@ -94,10 +94,11 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 
 发布新版本由仓库的 GitHub Actions 自动完成：只要脚本里的 `VERSION` 字段变成一个新值并推到 `main`，工作流就会自动打 tag 并发布 Release（详见 [进阶用法](docs/advanced-usage.md)）。
 
-想**锁定某个版本**（不让它跟着最新版走），给引导器设 `CT_VERSION`：
+想**锁定某个版本**（不让它跟着最新版走），给引导器加 `--ct-version`：
 
 ```sh
-CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
+/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
+# 旧写法仍可用：CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
 ```
 
 锁版本时引导器完全不联网，对生产环境最稳。tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)。
