@@ -254,6 +254,27 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
 - 帮助文本在 `cat <<'USAGE'`（带引号 heredoc）里，**变量不会展开**，不许在里面写 `$VERSION`。
 - 文档里承诺的行为必须与源码一致。特别是不许写「脚本每次运行都会把版本号写进日志」而 `log()` 并不打印版本号——要么改文档，要么改代码。
 
+### 8.5 引导器 `ct-bootstrap.sh` 的硬性约束
+
+引导器是**使用者实际运行的东西**，它的错误比主脚本的错误更致命（主脚本至少还会自己校验参数）。改动它必须守住下面几条：
+
+- **不许把「探测失败」当成「没有新版本」。** 探测失败时只能走两条路：回退到通过 `verify_file` 的本地缓存，或 `die`（非 0）。**绝不允许静默地「什么都不做然后 exit 0」**——使用者会以为更新成功。
+- **缓存文件必须四道校验后才能执行**：`sh -n` 语法 + `file_version` 能解析出 `VERSION` + 含特征串 `container-autoupdate` + 字节数 > 1000。
+  只做 `sh -n` 是不够的：`garbage` 这种一行垃圾也能通过 `sh -n`，然后被当成脚本执行（实测报 `line 1: garbage: not found`，rc=127）。
+- **`sed` 的捕获组必须写成 `\(...\)`**，不是 `(...)`。曾漏了反斜杠导致版本号恒为空，连带让上面的坏包校验全部失效。
+- **探测只用 Range 取前 4KB**（`curl -r 0-4000`），不要为此下载整个文件。`VERSION` 在文件第 53 行，4KB 足够。
+  - 不要用 `HEAD` 读 302 的 `Location`：直连要 12 秒，代理根本不返回 `Location`。
+  - 不要用 `api.github.com/releases/latest`：会限流（`API rate limit exceeded`）。
+- **默认源顺序是 `gh-proxy.com` → 直连 → `ghproxy.net`**，依据是实测：
+  | 源 | Range 探测 | 完整下载 |
+  |---|---|---|
+  | `gh-proxy.com` | 1~2s，3/3 成功 | 1s |
+  | 直连 `github.com` | 1s，但 3 次中 1 次 DNS 失败 | 不稳 |
+  | `ghproxy.net` | **3/3 全部 15s 超时** | — |
+- **自建源 `github.mus.pp.ua` 不进默认列表。** 实测 8 次里 Range 成功 5 次、下载成功 4 次，平均 12~20s；根因是它把请求转给 GitHub **网页前端**（响应头 `content-type: text/html` + `set-cookie`），不是直转 Release 资产。它内容正确（sha256 与官方一致），使用者可用 `CT_SOURCE` 自行接入，但不该是默认。
+- **固定版本模式（`CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。
+- **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh` 和 `ct-bootstrap.sh` 两个资产；少传一个，`releases/latest/download/ct-bootstrap.sh` 就是 404。
+
 ---
 
 ## 9. 提交与发版
@@ -317,14 +338,20 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | DPanel 任务丢了 `scriptRunTimeout` | UI 编辑时重写 setting JSON，`omitempty` 键被抹掉 | 每次 UI 编辑后回读确认 |
 | 表格塌成一行 | 多行被合并 | 每行独立 |
 | 发版后用户拿到旧代码 | 改了脚本没升 VERSION | 必升 VERSION，并做 §9.3 三方核对 |
+| 引导器把一行垃圾当成脚本执行 | 只用 `sh -n` 校验，垃圾也能过语法 | 四道校验：`sh -n` + 能解析 `VERSION` + 特征串 + 字节数 > 1000 |
+| 引导器版本号恒为空 | `sed` 捕获组写成 `(...)` 而非 `\(...\)` | 改回 `\(...\)` |
+| 引导器探测失败却 rc=0 | 把「探测失败」当成「没有新版本」 | 只能回退到合格缓存或 `die` |
+| 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | `gh-proxy.com` 优先；API 会限流 |
+| `releases/latest/download/ct-bootstrap.sh` 404 | Release 只传了主脚本 | 两个资产都要传 |
 
 ---
 
 ## 11. 提交前检查清单
 
 - [ ] `sh -n container-autoupdate.sh` 通过
+- [ ] `sh -n ct-bootstrap.sh` 通过
 - [ ] `sh -n scripts/gen-release-notes.sh` 通过
-- [ ] 两个 `.sh` 的 CR 计数为 0
+- [ ] 三个 `.sh` 的 CR 计数为 0
 - [ ] 改了脚本 → `VERSION` 已按 §7.3 升级
 - [ ] 若含破坏性变更 → 已登记 `BREAKING_TABLE`，且类别（`flag`/`env`/`behavior`）选对
 - [ ] `--help`、`--version`、无参数、`--bogus`、`--compat` 非法值 五个快速用例行为正确
@@ -332,4 +359,6 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 测试容器 / 镜像 / 状态目录已清理，生产已复原且 `healthy`
 - [ ] 文档里没有新增硬编码的当前版本号
 - [ ] 下载地址是 `releases/...`，带 `-L`，没用 jsdelivr
+- [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
+- [ ] 改了 `ct-bootstrap.sh` → 引导器 10 个场景（固定版本 / 命中缓存 / 有新版本 / 网络故障有缓存 / 无缓存 / 坏包 / 参数透传 / 缓存裁剪 / 强制更新）已复跑
 - [ ] 推送后做了 §9.3 的三方 sha1 核对

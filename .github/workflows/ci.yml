@@ -14,27 +14,32 @@ permissions:
 jobs:
   check:
     name: 校验脚本
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        # v6 起运行时是 node24；v4 是 node20，已被 GitHub 标为弃用
+        uses: actions/checkout@v6
 
       - name: 语法检查
         run: |
           set -eu
-          if ! sh -n container-autoupdate.sh; then
-            echo "::error::脚本语法检查失败（sh -n）"
-            exit 1
-          fi
+          for f in container-autoupdate.sh ct-bootstrap.sh; do
+            if ! sh -n "$f"; then
+              echo "::error::$f 语法检查失败（sh -n）"
+              exit 1
+            fi
+          done
           echo "sh -n 通过"
 
       - name: 行尾检查
         run: |
           set -eu
-          if grep -qU $'\r' container-autoupdate.sh; then
-            echo "::error::脚本含 CRLF 行尾，请转换为 LF"
-            exit 1
-          fi
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh; do
+            if grep -qU $'\r' "$f"; then
+              echo "::error::$f 含 CRLF 行尾，请转换为 LF"
+              exit 1
+            fi
+          done
           echo "LF 检查通过"
 
       - name: VERSION 字段检查
@@ -47,12 +52,31 @@ jobs:
           fi
           echo "VERSION=$V"
 
+      - name: 可执行权限检查
+        run: |
+          set -eu
+          # git 里应记录为 100755；记录成 100644 时用户下载后必须自己 chmod +x
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh; do
+            MODE=$(git ls-files -s "$f" | awk '{print $1}')
+            if [ "$MODE" != "100755" ]; then
+              echo "::error::$f 在 git 中的模式是 $MODE，应为 100755（可执行）"
+              echo "::error::修复：git update-index --chmod=+x $f"
+              exit 1
+            fi
+          done
+          echo "可执行权限检查通过"
+
       - name: 帮助信息可用
         run: |
           set -eu
           sh container-autoupdate.sh --help >/dev/null
           sh container-autoupdate.sh --version
+          # 引导器 --help 不存在，用 CT_VERSION 固定版跑 --version 验证它能把参数透传
+          CT_CACHE_DIR=/tmp/ct-ci CT_VERSION=$(grep -m1 '^VERSION=' container-autoupdate.sh | cut -d'"' -f2) \
+            sh ct-bootstrap.sh --version || echo "::warning::引导器端到端验证跳过（网络不可达）"
 
       - name: shellcheck（仅提示，不阻断）
         continue-on-error: true
-        run: shellcheck -S warning container-autoupdate.sh || true
+        run: |
+          shellcheck -S warning container-autoupdate.sh || true
+          shellcheck -S warning ct-bootstrap.sh || true

@@ -13,6 +13,7 @@ on:
     branches: [main]
     paths:
       - container-autoupdate.sh
+      - ct-bootstrap.sh
       - scripts/gen-release-notes.sh
       - .github/workflows/release.yml
   workflow_dispatch:
@@ -27,12 +28,15 @@ concurrency:
 jobs:
   release:
     name: 打 tag 并发布 Release
-    runs-on: ubuntu-latest
+    # 显式指定 24.04，不用 ubuntu-latest：后者会在 2026-10 迁移到 Ubuntu 26，
+    # 届时镜像与预装工具都会变，发版这种低频任务没必要跟着漂。
+    runs-on: ubuntu-24.04
     # 只有 main 分支允许发版；workflow_dispatch 选到别的分支时直接跳过
     if: github.ref == 'refs/heads/main'
     steps:
       - name: 检出代码（含全部 tag）
-        uses: actions/checkout@v4
+        # v6 起运行时是 node24；v4 是 node20，已被 GitHub 标为弃用
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -40,23 +44,28 @@ jobs:
         run: |
           set -eu
           test -f container-autoupdate.sh || { echo "::error::找不到 container-autoupdate.sh"; exit 1; }
+          test -f ct-bootstrap.sh || { echo "::error::找不到 ct-bootstrap.sh"; exit 1; }
 
-          if ! sh -n container-autoupdate.sh; then
-            echo "::error::脚本语法检查失败（sh -n）"
-            exit 1
-          fi
-          echo "语法检查通过"
-
-          # 行尾必须是 LF：CRLF 会让 sh 把 \r 当成参数的一部分
-          if grep -qU $'\r' container-autoupdate.sh; then
-            echo "::error::脚本含 CRLF 行尾，请转换为 LF"
-            exit 1
-          fi
-          echo "行尾检查通过（LF）"
-
-          if [ ! -x container-autoupdate.sh ]; then
-            echo "::warning::脚本没有可执行权限，下载后需要 chmod +x"
-          fi
+          for f in container-autoupdate.sh ct-bootstrap.sh; do
+            if ! sh -n "$f"; then
+              echo "::error::$f 语法检查失败（sh -n）"
+              exit 1
+            fi
+            # 行尾必须是 LF：CRLF 会让 sh 把 \r 当成参数的一部分
+            if grep -qU $'\r' "$f"; then
+              echo "::error::$f 含 CRLF 行尾，请转换为 LF"
+              exit 1
+            fi
+            # git 里记录的是 100755（可执行）还是 100644（不可执行）。
+            # 记录成 100644 时，用户下载后必须自己 chmod +x，否则直接执行会 Permission denied。
+            MODE=$(git ls-files -s "$f" | awk '{print $1}')
+            if [ "$MODE" != "100755" ]; then
+              echo "::error::$f 在 git 中的模式是 $MODE，应为 100755（可执行）"
+              echo "::error::修复：git update-index --chmod=+x $f"
+              exit 1
+            fi
+          done
+          echo "语法 / 行尾 / 可执行权限检查全部通过"
 
       - name: 读取 VERSION 字段
         id: ver
@@ -147,10 +156,11 @@ jobs:
         run: |
           set -eu
           TAG="v$VERSION"
-          # 把脚本本身作为 Release 资产上传，
-          # 这样 releases/latest/download/container-autoupdate.sh 永远指向最新发布版
+          # 把脚本本身和引导器都作为 Release 资产上传，
+          # 这样 releases/latest/download/{container-autoupdate.sh,ct-bootstrap.sh} 永远指向最新发布版
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file release-notes.md \
-            container-autoupdate.sh
+            container-autoupdate.sh \
+            ct-bootstrap.sh
           echo "已发布 Release $TAG"

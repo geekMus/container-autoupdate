@@ -4,23 +4,48 @@
 
 ## 1. 怎么把脚本弄到机器上
 
-三种方式，按可靠性从高到低。
+**生产环境推荐用引导器**（`ct-bootstrap.sh`）：它负责下载与缓存，你只维护一行命令。
 
-### 推荐：先下载到文件，再执行
+### 推荐：用引导器（自带缓存，不必每轮联网）
 
 ```sh
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
+curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+  -o /usr/local/bin/ct-bootstrap.sh
+chmod +x /usr/local/bin/ct-bootstrap.sh
+/usr/local/bin/ct-bootstrap.sh --compose myapp
+```
+
+引导器每次运行的行为：
+
+| 情形 | 网络开销 |
+|---|---|
+| 设了 `CT_VERSION=0.3.0`，本地已有 | **零**（完全不联网） |
+| 默认（跟 latest），本地同版本 | 一次 4KB Range 探测（约 1 秒），不下载 |
+| 默认，远端有新版本 | 探测 + 一次 64KB 下载，然后缓存 |
+| 探测失败但本地有缓存 | 零（用缓存，打 `WARN`） |
+| 探测失败且无缓存 | 零，但**明确报错退出**（不会静默成功） |
+
+好处有三个：下载失败会明确返回非 0；缓存命中时不必联网（镜像源抖动不影响脚本启动）；缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当脚本执行。
+
+全部配置项见 [参数文档](parameters.md#引导器ct-bootstrapsh的环境变量)。
+
+### 备选：直接下载主脚本到文件，再执行（不缓存）
+
+如果你不想用引导器，就直接跑主脚本。注意此时**脚本不会自己升级**，你得自己定期重下：
+
+```sh
+curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 chmod +x /usr/local/bin/container-autoupdate.sh
 /usr/local/bin/container-autoupdate.sh --compose myapp
 ```
 
-好处：下载失败会明确报错并返回非 0 退出码，定时任务能看出这轮没跑成。
+### 仅用于验证：落到临时文件再执行（不污染磁盘）
 
-### 次选：先落到临时文件，再执行（不污染磁盘）
+想快速验证网络与参数、又不留文件时用这个：
 
 ```sh
-URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+URL=https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
 _t=$(mktemp)
 if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
   sh "$_t" --compose myapp
@@ -30,18 +55,19 @@ fi
 rm -f "$_t"
 ```
 
-这是 DPanel 计划任务里最稳的写法：下载失败时 `exit 1` 会出现在任务日志里，而不是静默当成成功。
+下载失败时 `exit 1` 会出现在任务日志里，而不是静默当成成功。**但它每轮都要下载**，不建议用于生产。
 
-### 可以：直接管道执行
+### 不建议：直接管道执行
 
 ```sh
 curl -fsSL "$URL" | sh -s -- --compose myapp
 ```
 
-能跑，但有两个必须知道的限制：
+能跑，但有三个必须知道的限制：
 
-1. **下载失败会被吞掉。** `curl -f` 失败时管道仍然是「成功」的（`sh` 拿到空输入，什么都不执行，退出码 0）。定时任务看到的是「这轮正常结束」，而实际上什么都没做。如果只是偶尔抖动，下一轮会自愈；如果你需要「失败必须可见」，用上面两种写法。
-2. **不要在管道里做兜底。** `curl A || curl B | sh` 这种写法有两个坑：
+1. **下载失败会被吞掉。** `curl -f` 失败时管道仍然是「成功」的（`sh` 拿到空输入，什么都不执行，退出码 0）。定时任务看到的是「这轮正常结束」，而实际上什么都没做。
+2. **每轮都要联网下载**，镜像源抖动（403/522/`Recv failure`）就会让这一轮跑不起来。
+3. **不要在管道里做兜底。** `curl A || curl B | sh` 这种写法有两个坑：
    - A 成功时，它的输出被**丢弃**，实际执行的是 `curl B | sh` —— 你以为是 A 的版本，其实跑的是 B；
    - 两个都失败时，`sh` 拿到空输入，静默成功退出 0。
 
@@ -60,16 +86,22 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 
 ## 2. 版本：默认跟最新发布版，也可以锁死
 
-**默认用法**：`releases/latest/download/container-autoupdate.sh`
-
-这个地址**不含版本号，永远指向最新发布的 Release**。好处是你粘贴一次就不用再管了，作者发新版你下一轮就自动用上。
+**默认用法**：引导器的地址用 `releases/latest/download/ct-bootstrap.sh`，它每次运行会自己判断要不要更新主脚本。
 
 它和 `/main/` 不一样：`/main/` 指向分支最新提交，包含还没发布的中间状态（包括改文档的提交）；`releases/latest/` 只指向**已经通过校验并正式发布**的版本。
 
-**想锁死版本**：把 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）。
+**想锁死版本**：给引导器设 `CT_VERSION`（不用改下载地址）：
 
 ```sh
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
+CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
+```
+
+锁死后引导器**完全不联网取新版本**——本地有该版本就直接跑。这是生产环境最稳的形态。
+
+如果你不用引导器、直接跑主脚本，那就把地址里的 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）：
+
+```sh
+https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
 ```
 
 什么时候该锁死：你不想在无人值守的生产环境上突然换行为。锁死之后，升级变成一次显式的版本号替换。
@@ -126,19 +158,19 @@ container-autoupdate.sh --compose myapp --compat 0.9.0
 
 ## 3. 国内网络：换镜像源
 
-`raw.githubusercontent.com` 在国内经常连不上（实测多次 8 秒超时）。可用的替代前缀：
+`raw.githubusercontent.com` 在国内经常连不上（实测多次 8 秒超时）。引导器的默认源已经处理了这件事（`CT_SOURCE=auto` 会依次试 gh-proxy → 直连 → ghproxy.net）。手写地址时的替代前缀：
 
 | 前缀 | 形式 | 备注 |
 |---|---|---|
-| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 自建，最快 |
-| `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
-| `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh` | 公共 |
+| `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | **实测最稳**：Range 4KB 与完整下载都约 1 秒 |
+| `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | 公共（实测多次 15 秒超时，引导器只作为最后兜底） |
+| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | 自建（会偶发 403/522，实测不如 gh-proxy 稳） |
 
-也可以用**直连**（不加前缀）：`https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh`。实测在部分网络下直连 Release 资产比 raw 文件更稳（raw 会 8 秒超时，Release 资产直连成功）。
+也可以用**直连**（不加前缀）：`https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh`。直连 Release 资产比 raw 文件稳，但实测会偶发 DNS 失败（`curl: (6)`）和 12 秒延迟，所以引导器把它排在 gh-proxy 之后。
 
-> **一定要带 `-L`**（或 `--location`）。`releases/latest/download/` 会先返回 302 跳到具体 tag 的地址，不带 `-L` 时 `curl -f` 会把它当失败（`curl: (22)`）。本文所有示例都带 `-L`。
+> **一定要带 `-L`**（或 `--location`）。`releases/latest/download/` 会先返回 302 跳到具体 tag 的地址，不带 `-L` 时 `curl -f` 会把它当失败（`curl: (22)`）。
 >
-> 加速源对 Release 资产**偶发** `403` / `522`（实测同一地址几分钟前 403、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。这也正是「先落临时文件再执行」值得用的原因：失败会变成可见的非 0 退出码。
+> 加速源对 Release 资产**偶发** `403` / `522`（实测同一地址几分钟前 403、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。引导器对每个源默认试 2 次（`CT_TRIES`），并在探测失败时回退到本地缓存。
 >
 > `cdn.jsdelivr.net` **不要用于本仓库**：实测它返回的是缓存旧版本（`@main` 拿到过 `VERSION=6.0.0` 的历史内容）。jsdelivr 适合固定 tag 的静态文件，不适合「跟最新发布版」的场景。
 

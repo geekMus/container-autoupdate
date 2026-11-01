@@ -193,20 +193,23 @@ echo ""
 
 echo "### 下载"
 echo ""
+echo "**生产环境推荐用引导器**（自带缓存，不必每轮联网；锁版本时完全不联网）："
+echo ""
+echo '```sh'
+echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
+echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
+echo "CT_VERSION=$VERSION /usr/local/bin/ct-bootstrap.sh --compose myapp   # 锁到本版"
+echo '```'
+echo ""
+echo "想直接跑主脚本（自己维护文件，不会自动升级）："
+echo ""
 echo '```sh'
 echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/download/$TAG/container-autoupdate.sh \\"
 echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
 echo '```'
 echo ""
-echo "想跟随最新发布版（地址不含版本号，直接粘）："
-echo ""
-echo '```sh'
-echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \\"
-echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
-echo '```'
-echo ""
 echo "> \`-L\` 不能省：\`releases/latest/download/\` 会返回 302 跳转。"
-echo "> 国内网络可给上面任意地址加前缀 \`https://github.mus.pp.ua/\` 或 \`https://gh-proxy.com/\`。"
+echo "> 国内网络可用前缀 \`https://gh-proxy.com/\`（实测最稳）或 \`https://ghproxy.net/\`。"
 echo ""
 
 echo "| 项目 | 值 |"
