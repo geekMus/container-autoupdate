@@ -53,6 +53,10 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 > curl -fsSL "$URL" | sh -s -- --compose myapp
 > ```
 > 这样 `curl` 失败时整条命令返回非 0。
+>
+> **但它有一个副作用**：如果脚本在读完输入之前就退出了（`--version`、`--help`、参数错误这类秒退场景），`curl` 会拿到 `curl: (23) Failure writing output to destination`，整条管道于是返回 `23`——即使脚本本身是成功的。实测：`--version` 带 pipefail 返回 `23`，`--compose ... --dry-run` 跑到末尾返回 `0`。
+>
+> 所以 **pipefail 只适合固定参数、会跑完整个流程的场景**（比如写死在 cron 里的 `--compose myapp`）。要用 `--version`/`--help` 或参数可能出错时，改用上面的临时文件写法。
 
 ## 2. 版本：默认跟最新发布版，也可以锁死
 
@@ -62,10 +66,10 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 
 它和 `/main/` 不一样：`/main/` 指向分支最新提交，包含还没发布的中间状态（包括改文档的提交）；`releases/latest/` 只指向**已经通过校验并正式发布**的版本。
 
-**想锁死版本**：把 `latest/download` 换成具体 tag。
+**想锁死版本**：把 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）。
 
 ```sh
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v0.2.0/container-autoupdate.sh
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
 ```
 
 什么时候该锁死：你不想在无人值守的生产环境上突然换行为。锁死之后，升级变成一次显式的版本号替换。
@@ -76,9 +80,9 @@ https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/release
 sh container-autoupdate.sh --version
 ```
 
-> **发版机制**：仓库里的 `VERSION` 字段（脚本第 53 行附近，形如 `VERSION="0.2.0"`）是唯一版本来源。推到 `main` 时，GitHub Actions 会读它，若对应 tag 不存在就自动打 tag 并发布 Release，并把脚本作为 Release 资产上传。所以升级只需要改 `VERSION` 一个地方，README 和下载地址都不用动。
+> **发版机制**：仓库里的 `VERSION` 字段（脚本顶部 `VERSION` 字段，形如 `VERSION="1.2.3"`）是唯一版本来源。推到 `main` 时，GitHub Actions 会读它，若对应 tag 不存在就自动打 tag 并发布 Release，并把脚本作为 Release 资产上传。所以升级只需要改 `VERSION` 一个地方，README 和下载地址都不用动。
 
-> 注意：**`refs/tags/v0.2.0` 这种形式不要用**。某些加速服务（含自建的那套）对它超时。用 `/releases/download/v0.2.0/` 或短 tag 路径。
+> 注意：**`refs/tags/<tag>` 这种形式不要用**。某些加速服务（含自建的那套）对它超时。用 `/releases/download/<tag>/` 或短 tag 路径。
 
 ### 用 latest 时，破坏性变更会怎么表现
 
@@ -95,10 +99,10 @@ sh container-autoupdate.sh --version
 **① 跨版本提示。** 脚本会在 `--state-dir` 下记住每个目标上次跑过的版本（`compat/compose-<名>/lastver`、`compat/plain-<名>/lastver`）。当本次版本更高、且两者之间存在破坏性变更时，日志开头会多一段：
 
 ```sh
-[2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.2.0)升级上来，v1.0.0 引入了破坏性变更
+[2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.9.0)升级上来，v1.0.0 引入了破坏性变更
 [2026-11-01 03:52:03]      变更：默认保留 2 份回滚副本
 [2026-11-01 03:52:03]      应对：如只想保留 1 份，加 --keep 1
-[2026-11-01 03:52:03]      本次仍会继续执行。若你依赖旧行为，请加 --compat 0.2.0 或改用固定版本
+[2026-11-01 03:52:03]      本次仍会继续执行。若你依赖旧行为，请加 --compat 0.9.0 或改用固定版本
 ```
 
 它**不中止**（因为不确定你是否依赖旧行为），只提示。同一版本不会重复提示；降级也不会提示。
@@ -106,10 +110,10 @@ sh container-autoupdate.sh --version
 **② `--compat <版本>`。** 你可以声明「我只验证到某个版本」。如果脚本版本更高、且中间有破坏性变更，它会硬停（退出码 `3`）而不是冒险执行：
 
 ```sh
-container-autoupdate.sh --compose myapp --compat 0.2.0
+container-autoupdate.sh --compose myapp --compat 0.9.0
 ```
 
-适合的场景：你在生产上验证过 `0.2.0`，但某天 `latest` 跳到 `1.0.0`，你还没时间做回归——加上 `--compat 0.2.0` 就等于「只要碰到我没验证过的破坏性变更就别动我的容器」。等你验证完了，把数字改成新版本或直接去掉。
+适合的场景：你在生产上验证过 `0.9.0`，但某天 `latest` 跳到 `1.0.0`，你还没时间做回归——加上 `--compat 0.9.0` 就等于「只要碰到我没验证过的破坏性变更就别动我的容器」。等你验证完了，把数字改成新版本或直接去掉。
 
 `--compat` 的边界行为：
 

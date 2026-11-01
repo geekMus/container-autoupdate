@@ -51,12 +51,13 @@ curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupd
 ## 常用命令
 
 ```sh
-container-autoupdate.sh --compose myapp --dry-run    # 只看有没有新版本，不改动
+container-autoupdate.sh --compose myapp --dry-run    # 只看有没有新版本，不更新、不删镜像
 container-autoupdate.sh --compose myapp              # 正式更新 Compose 项目
 container-autoupdate.sh --container mycontainer      # 更新普通容器
 ```
 
 **第一次接入建议先跑 `--dry-run`**，确认日志里认到的目标和目录是对的，再去掉它。
+（演练只写状态目录和锁文件，不动容器、不动镜像标签、也不清理旧镜像。）
 
 ## 版本与升级
 
@@ -65,15 +66,15 @@ container-autoupdate.sh --container mycontainer      # 更新普通容器
 脚本自身的版本号在日志和 `--version` 里能看到：
 
 ```sh
-sh container-autoupdate.sh --version    # 例如 0.2.0
+sh container-autoupdate.sh --version    # 例如 1.2.3
 ```
 
 发布新版本由仓库的 GitHub Actions 自动完成：只要脚本里的 `VERSION` 字段变成一个新值并推到 `main`，工作流就会自动打 tag 并发布 Release（详见 [进阶用法](docs/advanced-usage.md)）。
 
-想**锁定某个版本**（不让它跟着最新版走），把地址里的 `latest/download` 换成具体 tag：
+想**锁定某个版本**（不让它跟着最新版走），把地址里的 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）：
 
 ```sh
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v0.2.0/container-autoupdate.sh
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh
 ```
 
 ### 用 latest 也安全
@@ -95,7 +96,7 @@ https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/release
 - **`--compat <版本>`**：你可以声明「我只验证到某个版本」。如果脚本比这个版本新、且中间有破坏性变更，它会硬停而不是冒险执行。
 
 ```sh
-container-autoupdate.sh --compose myapp --compat 0.2.0
+container-autoupdate.sh --compose myapp --compat 1.2.3
 ```
 
 ## 更多文档

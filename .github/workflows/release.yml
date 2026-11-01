@@ -3,12 +3,17 @@ name: Release
 # 发版规则：脚本里的 VERSION 字段是唯一版本来源。
 # 只要 main 分支上的 VERSION 变成一个新值，本工作流就自动打 tag 并发布 Release。
 # 其他分支不会执行发版（见下面的 if 与 branches 限制）。
+#
+# 发布说明由 scripts/gen-release-notes.sh 自动生成：
+#   定位句 + 本版破坏性变更 + 提交列表 + 下载命令 + sha256
+# 同一个内容也用作 annotated tag 的消息，所以 `git show vX.Y.Z` 能看到改了什么。
 
 on:
   push:
     branches: [main]
     paths:
       - container-autoupdate.sh
+      - scripts/gen-release-notes.sh
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -36,21 +41,19 @@ jobs:
           set -eu
           test -f container-autoupdate.sh || { echo "::error::找不到 container-autoupdate.sh"; exit 1; }
 
-          # 1. 语法
           if ! sh -n container-autoupdate.sh; then
             echo "::error::脚本语法检查失败（sh -n）"
             exit 1
           fi
           echo "语法检查通过"
 
-          # 2. 行尾必须是 LF：CRLF 会让 sh 把 \r 当成参数的一部分
+          # 行尾必须是 LF：CRLF 会让 sh 把 \r 当成参数的一部分
           if grep -qU $'\r' container-autoupdate.sh; then
             echo "::error::脚本含 CRLF 行尾，请转换为 LF"
             exit 1
           fi
           echo "行尾检查通过（LF）"
 
-          # 3. 必须可执行（便于直接下载运行）
           if [ ! -x container-autoupdate.sh ]; then
             echo "::warning::脚本没有可执行权限，下载后需要 chmod +x"
           fi
@@ -65,7 +68,6 @@ jobs:
             echo "::error::脚本里找不到 VERSION 字段"
             exit 1
           fi
-          # 形如 0.1.0 / 1.2.3 / 1.2.3.4
           case "$V" in
             [0-9]*.[0-9]*) ;;
             *) echo "::error::VERSION 格式不合法：$V（应形如 1.2.3）"; exit 1 ;;
@@ -76,37 +78,79 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "读取到 VERSION=$V"
 
-      - name: 打 tag
+      - name: 判断是否需要发版
+        id: check
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -eu
           TAG="v$VERSION"
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "tag $TAG 已存在，跳过打 tag（VERSION 未变更）"
-            exit 0
+            echo "tag $TAG 已存在，无需发版（VERSION 未变更）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 找上一个发布 tag
+        id: prev
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          TAG="v$VERSION"
+          # 按版本排序取「比当前版本小的最大者」，不用 tag 创建时间
+          # （避免手动补 tag 或乱序推送时取错）
+          PREV=""
+          for t in $(git tag -l 'v*' | sort -V); do
+            [ "$t" = "$TAG" ] && continue
+            tv="${t#v}"
+            [ "$tv" = "$VERSION" ] && continue
+            if [ "$(printf '%s\n%s\n' "$tv" "$VERSION" | sort -V | head -n1)" = "$tv" ]; then
+              PREV="$t"
+            fi
+          done
+          echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "上一个发布 tag: ${PREV:-（无，这是首个发布）}"
+
+      - name: 生成发布说明
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PREV_TAG: ${{ steps.prev.outputs.prev_tag }}
+        run: |
+          set -eu
+          sh scripts/gen-release-notes.sh > release-notes.md
+          echo "----- 生成的发布说明 -----"
+          cat release-notes.md
+
+      - name: 打 tag
+        if: steps.check.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          TAG="v$VERSION"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG"
+          # tag 消息复用发布说明，这样 `git show vX.Y.Z` 也能看到这版改了什么
+          git tag -a "$TAG" -F release-notes.md
           git push origin "refs/tags/$TAG"
-          echo "已创建并推送 tag $TAG"
+          echo "已创建并推送 tag $TAG（含发布说明）"
 
       - name: 发布 Release
+        if: steps.check.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -eu
           TAG="v$VERSION"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在，跳过"
-            exit 0
-          fi
           # 把脚本本身作为 Release 资产上传，
           # 这样 releases/latest/download/container-autoupdate.sh 永远指向最新发布版
           gh release create "$TAG" \
             --title "$TAG" \
-            --generate-notes \
+            --notes-file release-notes.md \
             container-autoupdate.sh
           echo "已发布 Release $TAG"

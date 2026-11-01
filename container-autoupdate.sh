@@ -1,7 +1,8 @@
 #!/bin/sh
 # ===========================================================================
-# 通用容器自动更新 v0.1.0 —— 单轮逻辑，可放进任意定时器（cron / systemd timer /
-# DPanel 计划任务 / CI）。脚本本身不含更新频率逻辑。
+# 通用容器自动更新 —— 单轮逻辑，可放进任意定时器（cron / systemd timer /
+# DPanel 计划任务 / CI）。脚本本身不含更新频率逻辑。当前版本见 VERSION 字段，
+# 用 --version 查看。
 #
 # 目标二选一：一个 Compose 项目名，或一个容器名。可以用命令行参数、
 # 环境变量或文件顶部配置区指定，三者等价，优先级：命令行 > 环境变量 > 配置区。
@@ -42,7 +43,6 @@ COMPOSE_DIR="${COMPOSE_DIR:-}"     # 显式指定 Compose 项目目录（--compo
 DOCKER_SOCK="${DOCKER_SOCK:-}"     # 显式指定 Docker socket；留空则用 DOCKER_HOST 或默认
 SOCK=""
 API_HOST="http://localhost"
-API_VERSION="1.47"
 API="http://localhost/v1.47"
 LOCK_PREFIX="${LOCK_PREFIX:-/tmp/.container-autoupdate}" # 互斥锁前缀，实际文件名按更新目标派生
 STATE_ROOT="${STATE_ROOT:-/tmp/.container-autoupdate}"
@@ -50,14 +50,14 @@ BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="0.2.0"
+VERSION="0.2.2"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
 T_PULL_MAX="${T_PULL_MAX:-300}"
 T_UP="${T_UP:-60}"
 T_HEALTH="${T_HEALTH:-120}"
-HEALTH_TRIES="${HEALTH_TRIES:-12}"
+HEALTH_TRIES="${HEALTH_TRIES:-0}"
 T_ROLLBACK="${T_ROLLBACK:-60}"
 PLAIN_BOOT="${PLAIN_BOOT:-30}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -171,9 +171,29 @@ EOF
 # --compat <版本>：用户声明「我只验证到这个版本」。
 # 若当前脚本含有比声明版本更新的 behavior 级破坏性变更，就硬停并说明原因。
 compat_gate() {
+  # 只有「显式给了 --compat 且给了非空值」才校验；--compat "" 是错误用法，不能静默放行。
+  if [ "${_SAW_COMPAT:-0}" = "1" ] && [ -z "${COMPAT_UNTIL:-}" ]; then
+    log "ERR --compat 的值不能为空（应形如 0.1.0）"
+    log "    本次未做任何改动，退出码 3"
+    exit 3
+  fi
   [ -n "${COMPAT_UNTIL:-}" ] || return 0
   case "$COMPAT_UNTIL" in
     ''|*[!0-9.]*)
+      log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
+      log "    本次未做任何改动，退出码 3"
+      exit 3 ;;
+  esac
+  # 形态必须严格是「数字.数字.数字」：`1..2`、`1.2.` 这类会被 ver_gt 当成 0，悄悄放行。
+  case "$COMPAT_UNTIL" in
+    [0-9]*.[0-9]*.[0-9]*)
+      case "$COMPAT_UNTIL" in
+        *..*|*..|.*|*.*.*.*)
+          log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
+          log "    本次未做任何改动，退出码 3"
+          exit 3 ;;
+      esac ;;
+    *)
       log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
       log "    本次未做任何改动，退出码 3"
       exit 3 ;;
@@ -263,42 +283,60 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
 环境变量：
   UPD_COMPOSE / UPD_CONTAINER   目标（同命令行）
   COMPOSE_DIR                   同 --compose-dir
+  COMPOSE_BASE                  Compose 项目目录的兜底根路径；留空则只用容器 label 发现
   DOCKER_SOCK                   同 --docker-sock
   DOCKER_HOST                   支持 unix:///path 与 tcp://host:port
+  STATE_ROOT                    同 --state-dir
+  LOCK_PREFIX                   互斥锁文件名前缀（默认 /tmp/.container-autoupdate）
   DRY_RUN=1                     同 --dry-run
   BAD_TTL_DAYS                  同 --bad-ttl-days
   COMPAT_UNTIL                  同 --compat
-  T_HARD / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
+  T_HARD / T_INSPECT / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
                                 各阶段超时（秒），一般不用改
+  HEALTH_TRIES                  健康门禁最多轮询几次；默认 0 = 只受 T_HEALTH 秒数约束
+  PLAIN_BOOT                    无 healthcheck 的容器启动后观察多少秒（默认 30）
 
 退出码：
   0  成功，或无需更新，或按规则跳过
   1  配置/环境错误，或本轮未能完成更新（容器保持原样）
   2  回滚本身失败，需要人工介入（现场保留在 --state-dir）
   3  检测到破坏性变更，你的调用方式已失效（本次未做任何改动，日志里有迁移说明）
+  130  被 Ctrl-C（SIGINT）中断
+  143  被 SIGTERM / SIGHUP 中断（定时器超时常见）
 
 关于版本与兼容：
-  脚本每次运行都会把版本号写进日志。从 v0.2.0 起，如果新版引入了会破坏你
-  已有调用方式的变更，脚本会主动识别并在输出里给出迁移方式，而不是静默忽略
-  旧写法。想彻底避免意外，把下载地址固定到某个 tag（见 README）。
+  脚本每次运行都会把版本号写进日志（首行 `container-autoupdate v<x.y.z> 启动`）。
+  如果新版引入了会破坏你已有调用方式的变更，脚本会主动识别并在输出里给出
+  迁移方式，而不是静默忽略旧写法。想彻底避免意外，把下载地址固定到某个 tag
+  （见 README「版本与升级」）。
 
 示例：
   # cron 每小时检查一次
   0 * * * * /usr/local/bin/container-autoupdate.sh --compose myapp >> /var/log/ct-update.log 2>&1
 
-  # 直接跑远程脚本（固定 tag，避免上游改动直接影响你的生产）
-  curl -fsSL https://raw.githubusercontent.com/geekMus/container-autoupdate/v0.1.0/container-autoupdate.sh \
+  # 直接跑远程脚本，跟随最新发布版（地址不含版本号，粘贴即用）
+  curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
     | sh -s -- --compose myapp
+
+  # 生产环境想锁死版本：把上面的 latest/download 换成带版本号的路径
+  # releases/download/v1.2.3/container-autoupdate.sh
+  # -L 不能省：latest/download 会返回 302 跳转。
 USAGE
 }
 
 parse_args() {
+  # 记录「命令行上显式给过哪个目标」。不能只靠最终变量值判断，
+  # 因为 --compose 与 --container 各自会清空对方，导致
+  # `--compose a --container b` 变成「后者胜出」而静默通过——
+  # 这与「两种目标必须且只能指定一个」的规则冲突，必须报错。
+  _SAW_COMPOSE=0
+  _SAW_CONTAINER=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --compose)      [ "$#" -ge 2 ] || { echo "ERR --compose 缺少参数" >&2; exit 1; }
-                      COMPOSE_NAME="$2"; CONTAINER_NAME=""; shift 2 ;;
+                      COMPOSE_NAME="$2"; CONTAINER_NAME=""; _SAW_COMPOSE=1; shift 2 ;;
       --container)    [ "$#" -ge 2 ] || { echo "ERR --container 缺少参数" >&2; exit 1; }
-                      CONTAINER_NAME="$2"; COMPOSE_NAME=""; shift 2 ;;
+                      CONTAINER_NAME="$2"; COMPOSE_NAME=""; _SAW_CONTAINER=1; shift 2 ;;
       --compose-dir)  [ "$#" -ge 2 ] || { echo "ERR --compose-dir 缺少参数" >&2; exit 1; }
                       COMPOSE_DIR="$2"; shift 2 ;;
       --docker-sock)  [ "$#" -ge 2 ] || { echo "ERR --docker-sock 缺少参数" >&2; exit 1; }
@@ -308,7 +346,7 @@ parse_args() {
       --bad-ttl-days) [ "$#" -ge 2 ] || { echo "ERR --bad-ttl-days 缺少参数" >&2; exit 1; }
                       BAD_TTL_DAYS="$2"; shift 2 ;;
       --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&2; exit 1; }
-                      COMPAT_UNTIL="$2"; shift 2 ;;
+                      COMPAT_UNTIL="$2"; _SAW_COMPAT=1; shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       -V|--version)   echo "$VERSION"; exit 0 ;;
@@ -316,6 +354,11 @@ parse_args() {
                       echo "ERR 未知参数：$1（用 --help 查看用法）" >&2; exit 1 ;;
     esac
   done
+  # 命令行上两个目标都显式给过 → 直接拒绝，不做「后者胜出」的静默覆盖
+  if [ "$_SAW_COMPOSE" = "1" ] && [ "$_SAW_CONTAINER" = "1" ]; then
+    echo "ERR 配置错误：--compose 与 --container 必须且只能给一个" >&2
+    exit 1
+  fi
 }
 
 # 解析 Docker 端点：unix socket 或 tcp，供 dcurl 统一调用。
@@ -364,6 +407,10 @@ check_deps() {
 parse_args "$@"
 resolve_docker_endpoint
 mkdir -p "$STATE_ROOT"
+
+# 每次真实运行都在日志里留一行版本号：排查历史问题时，能立刻看出那一轮
+# 跑的是哪一版脚本（升级过 latest 之后尤其重要）。
+log "container-autoupdate v$VERSION 启动"
 
 # 破坏性变更防线（顺序很重要）：
 #   1. 旧环境变量还在设 → 说明用户仍按旧文档调用，立刻中止并给出新写法
@@ -456,12 +503,42 @@ expire_bad() {
 }
 
 clean_orphans() {
+  # 只清理「同一个仓库、已无任何容器引用、且不带任何保留标签」的镜像。
+  # 两个坑：
+  #   1. `dangling=true` 与 `--filter reference=` 语义互斥，组合起来永远命中不了（见 AGENTS.md §3 NEVER）。
+  #   2. `:prev`（回滚点）、`:bad`（坏版本钉子）、`:rollback-pending`（更新中占位）
+  #      通常只有一个标签、也没有容器引用，但它们**必须保留**。
+  #      按「单标签即孤儿」判定会把回滚点删掉——真实踩过（生产 magpie 的 :prev 就这么没的）。
   _repo="$1"; _n=0
-  for _id in $(docker images -f dangling=true -q --filter "reference=$_repo" 2>/dev/null | sort -u); do
+  _refs=$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null \
+          | awk -v r="$_repo" '$2 ~ ("^" r ":") { print $1 }' | sort -u)
+  for _id in $_refs; do
+    # 仍有容器（含已停止）在用它：不动
     [ -n "$(docker ps -a -q --filter ancestor="$_id" 2>/dev/null)" ] && continue
+    _tags=$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null \
+            | awk -v i="$_id" '$1 == i { print $2 }' | sort -u)
+    # 带保留标签的一律不动（回滚点 / 坏版本钉子 / 更新占位）
+    _keep=0
+    for _t in $_tags; do
+      case "$_t" in
+        "${_repo}:prev"|"${_repo}:bad"|"${_repo}:rollback-pending") _keep=1 ;;
+      esac
+    done
+    [ "$_keep" = "1" ] && continue
+    # 还有别的 tag 指向它：说明不是孤儿，只是多标签，不动
+    _cnt=$(printf '%s\n' "$_tags" | grep -c . || true)
+    [ "$_cnt" -le 1 ] || continue
     docker rmi "$_id" >/dev/null 2>&1 && _n=$((_n + 1))
   done
   [ "$_n" -gt 0 ] && log "清理孤儿镜像 $_n 个（$_repo）"
+  return 0
+}
+
+# 收集本轮涉及的全部镜像仓库名（compose 多镜像项目时不能只清最后一个）。
+_all_repos() {
+  if [ -n "${C_MAP:-}" ] && [ -f "${C_MAP:-}" ]; then
+    awk -F'|' '{ print $3 }' "$C_MAP" 2>/dev/null | sort -u
+  fi
   return 0
 }
 
@@ -470,7 +547,6 @@ api_negotiate() {
   _v=$(dcurl -s --max-time 10 "$API_HOST/version" 2>/dev/null \
        | sed -n 's/.*"ApiVersion":"\([0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' | head -n1)
   [ -n "$_v" ] || _v="1.47"
-  API_VERSION="$_v"
   API="$API_HOST/v${_v}"
   _maj=${_v%%.*}; _min=${_v#*.}
   if [ "$_maj" -lt 2 ] && [ "$_min" -lt 47 ]; then
@@ -601,7 +677,7 @@ make_networks_json() {
     printf '%s%s:{"NetworkID":%s,"IPAMConfig":%s,"Links":%s,"Aliases":%s,"DriverOpts":%s,"GwPriority":%s' \
       "$_sep" "$(json_quote "$_net")" "${_nid:-null}" "${_ipam:-null}" "${_links:-null}" "$_aliases" "${_opts:-null}" "${_gw:-0}"
     if [ -n "$_mac" ] && ! is_auto_mac "$_mac" "$_ip"; then
-      printf ',"MacAddress":%s' "$_mac"
+      printf ',"MacAddress":%s' "$(json_quote "$_mac")"
     fi
     printf '}'
     _sep=","
@@ -723,7 +799,6 @@ S_NEWIMG=$P_NEWID
 S_IMG=$P_IMG
 S_REPO=$P_REPO
 S_STAGE=$P_STAGE
-S_ATTEMPTED=$P_ATTEMPTED
 S_STARTED=${P_STARTED:-0}
 EOF
 }
@@ -732,17 +807,18 @@ load_plain_state() {
   . "$P_STATE"
   P_NAME="$S_NAME"; P_OLDNAME="$S_OLDNAME"; P_OLDCID="$S_OLDCID"
   P_NEWCID="$S_NEWCID"; P_OLDID="$S_OLDIMG"; P_NEWID="$S_NEWIMG"
-  P_IMG="$S_IMG"; P_REPO="$S_REPO"; P_STAGE="$S_STAGE"; P_ATTEMPTED="$S_ATTEMPTED"
+  P_IMG="$S_IMG"; P_REPO="$S_REPO"; P_STAGE="$S_STAGE"
   P_STARTED="${S_STARTED:-0}"
 }
 
 plain_remove_state() {
   rm -f "$P_STATE"
   ACTIVE_KIND=""
-  # 成功收尾清掉整个事务目录；回滚成功也清（容器已复原，无需保留现场）。
-  # 只有回滚本身失败（EXIT_CODE=2）才保留目录供人工排查。
-  if [ "${P_KEEP_EVIDENCE:-0}" = "1" ] && [ "${EXIT_CODE:-0}" = "2" ]; then
-    :
+  # 回滚成功时也保留现场：容器虽已复原，create.json / 新旧规格 / pull.log
+  # 仍是「这一轮为什么失败」的唯一证据，删了就没法事后取证。
+  # 只有正常成功收尾（没有走回滚）才清整个事务目录。
+  if [ "${P_KEEP_EVIDENCE:-0}" = "1" ]; then
+    log "回滚现场已保留在 $P_DIR（排查完可手动删除）"
   else
     rm -rf "$P_DIR" 2>/dev/null || true
   fi
@@ -825,6 +901,9 @@ plain_recover_current() {
 plain_fail() {
   log "WARN 容器 $P_NAME 更新失败：$1"
   plain_recover_current || return 1
+  # 回滚成功不等于本轮成功：容器虽已复原，但这一轮确实没更新成。
+  # 退出码 1 = 「本轮未能完成更新（容器保持原样）」，监控才不会把它当成功。
+  [ "${EXIT_CODE:-0}" = "2" ] || EXIT_CODE=1
   return 0
 }
 
@@ -852,12 +931,12 @@ plain_update() {
   P_DIR="$STATE_ROOT/plain-$(safe_key "$P_NAME")"
   P_STATE="$P_DIR/state"
   mkdir -p "$P_DIR"
-  P_NEWCID=""; P_ATTEMPTED=0; P_STARTED=0
+  P_NEWCID=""; P_STARTED=0
   if [ -f "$P_STATE" ]; then
     load_plain_state
     log "发现上次未完成事务，先执行恢复"
     plain_recover_current || return
-    P_NEWCID=""; P_ATTEMPTED=0
+    P_NEWCID=""
   fi
   plain_preflight || { plain_discard; return; }
   P_OLDID=$(docker inspect -f '{{.Image}}' "$P_OLDCID")
@@ -870,16 +949,16 @@ plain_update() {
   log "MODE container 容器=$P_NAME 镜像=$P_IMG"
 
   P_REMOTE=$(remote_digest "$P_IMG")
-  [ -n "$P_REMOTE" ] || { log "ERR 无法获取远端 digest，本轮跳过"; plain_discard; return; }
+  [ -n "$P_REMOTE" ] || { log "ERR 无法获取远端 digest，本轮跳过"; EXIT_CODE=1; plain_discard; return; }
   is_pinned_bad "$P_REPO" "$P_REMOTE" && { log "SKIP 远端版本仍在 :bad 钉住期"; plain_discard; return; }
   is_current "$P_OLDID" "$P_REMOTE" && { log "OK $P_NAME 已是最新 $P_REMOTE"; plain_discard; return; }
   [ "$DRY_RUN" != "1" ] || { log "DRY 发现新版本 $P_REMOTE，不执行"; plain_discard; return; }
-  [ "$(left)" -gt $((T_UP + T_HEALTH + T_ROLLBACK + 15)) ] || { log "ERR 剩余时间预算不足，未改动"; plain_discard; return; }
+  [ "$(left)" -gt $((T_UP + T_HEALTH + T_ROLLBACK + 15)) ] || { log "ERR 剩余时间预算不足，未改动"; EXIT_CODE=1; plain_discard; return; }
 
   # 从暂存标签开始就建立事务；中断时也能还原被 pull 移动的 tag。
   P_OLDNAME="${P_NAME}__old_$(now)"
   P_NEWID=""
-  ACTIVE_KIND="plain"; P_ATTEMPTED=0; P_STARTED=0
+  ACTIVE_KIND="plain"; P_STARTED=0
   save_plain_state
   docker tag "$P_OLDID" "$P_STAGE" 2>/dev/null || { plain_fail "无法暂存旧镜像" || return; return; }
   if ! pull_stream "$P_REPO" "$P_TAG" "$P_DIR/pull.log"; then
@@ -900,7 +979,7 @@ plain_update() {
     fi
   fi
 
-  P_ATTEMPTED=0; P_STARTED=0
+  P_STARTED=0
   save_plain_state
   if ! timeout -s KILL "$T_UP" docker rename "$P_OLDCID" "$P_OLDNAME" >/dev/null 2>&1; then
     plain_fail "旧容器改名失败" || return
@@ -926,7 +1005,7 @@ plain_update() {
     printf '},'; sed 's/^{//' "$P_DIR/config.json"
   } > "$P_DIR/create.json"
 
-  P_ATTEMPTED=1; save_plain_state
+  save_plain_state
   _resp=$(dcurl -s --max-time "$T_UP" -X POST \
     -H 'Content-Type: application/json' --data-binary @"$P_DIR/create.json" \
     "$API/containers/create?name=$P_NAME" 2>&1)
@@ -947,21 +1026,30 @@ plain_update() {
   _hc=$(docker inspect -f '{{if .State.Health}}1{{else}}0{{end}}' "$P_NEWCID" 2>/dev/null)
   _r0=$(docker inspect -f '{{.RestartCount}}' "$P_NEWCID" 2>/dev/null)
   if [ "$_hc" = "1" ]; then
-    _i=0; _hr=""
-    while [ "$_i" -lt "$HEALTH_TRIES" ]; do
+    # 等待上限由 T_HEALTH 秒决定（用户可调大，用于应用启动慢的场景）。
+    # HEALTH_TRIES>0 时额外加一道「最多轮询几次」的硬上限；默认 0 表示不设，
+    # 避免出现「T_HEALTH 调大了但轮询次数先耗尽」的自相矛盾。
+    _hc_at=$(now); _i=0; _hr=""
+    while :; do
       _hr=$(docker inspect -f '{{.State.Health.Status}}' "$P_NEWCID" 2>/dev/null)
       [ "$_hr" = "healthy" ] && break
       case "$_hr" in unhealthy|exited|dead) break ;; esac
-      _i=$((_i + 1)); [ "$(left)" -le "$T_ROLLBACK" ] && { _hr="预算不足"; break; }
-      sleep 10
+      [ $(( $(now) - _hc_at )) -ge "$T_HEALTH" ] && { _hr="超过 ${T_HEALTH}s 未 healthy"; break; }
+      _i=$((_i + 1))
+      [ "$HEALTH_TRIES" -gt 0 ] && [ "$_i" -gt "$HEALTH_TRIES" ] && { _hr="轮询次数用尽"; break; }
+      [ "$(left)" -le "$T_ROLLBACK" ] && { _hr="预算不足"; break; }
+      sleep 5
     done
     [ "$_hr" = "healthy" ] || { plain_fail "健康门禁未通过（$_hr）" || return; return; }
   else
-    _i=0; _lim=$((PLAIN_BOOT / 2)); [ "$_lim" -ge 1 ] || _lim=1; _rn=true
-    while [ "$_i" -lt "$_lim" ]; do
+    # 无 healthcheck：按 PLAIN_BOOT 秒的墙钟观察窗，每 2 秒采样一次 Running。
+    _boot_at=$(now); _rn=true
+    while :; do
       _rn=$(docker inspect -f '{{.State.Running}}' "$P_NEWCID" 2>/dev/null)
       [ "$_rn" = "true" ] || break
-      _i=$((_i + 1)); [ "$_i" -lt "$_lim" ] && sleep 2
+      [ $(( $(now) - _boot_at )) -ge "$PLAIN_BOOT" ] && break
+      [ "$(left)" -le "$T_ROLLBACK" ] && break
+      sleep 2
     done
     _r1=$(docker inspect -f '{{.RestartCount}}' "$P_NEWCID" 2>/dev/null)
     [ "$_rn" = "true" ] || { plain_fail "新容器观察窗内退出" || return; return; }
@@ -971,7 +1059,11 @@ plain_update() {
   [ $? -eq 0 ] || { plain_fail "启动后规格复核失败：$_reason" || return; return; }
 
   # 成功：先保留当前旧容器为唯一回滚副本，再按 ID 清理上一份。
-  docker tag "$P_OLDID" "$P_PREV" 2>/dev/null && log "回滚点已更新为 $P_PREV"
+  if docker tag "$P_OLDID" "$P_PREV" 2>/dev/null; then
+    log "回滚点已更新为 $P_PREV"
+  else
+    log "WARN 回滚点标签 $P_PREV 打标失败；本轮更新已成功，但下次失败将无法回滚到这一版"
+  fi
   docker rmi "$P_STAGE" >/dev/null 2>&1 || true
   _rollback_file="$P_DIR/rollback.id"
   if [ -f "$_rollback_file" ]; then
@@ -1049,8 +1141,10 @@ local_imgid_for() {
 }
 
 compose_health() {
+  # 墙钟上限 T_HEALTH 秒（用户可调大，应对启动慢的应用）；
+  # HEALTH_TRIES>0 时额外加一道轮询次数硬上限，默认 0 表示不设。
   _up_at=$(now); _i=0
-  while [ "$_i" -lt "$HEALTH_TRIES" ]; do
+  while :; do
     _all=1
     for _c in $(proj_containers); do
       _s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$_c" 2>/dev/null)
@@ -1062,10 +1156,12 @@ compose_health() {
       esac
     done
     [ "$_all" = "1" ] && return 0
-    _i=$((_i + 1)); [ "$(left)" -le "$T_ROLLBACK" ] && { echo "健康等待预算不足"; return 1; }
-    sleep 10
+    [ $(( $(now) - _up_at )) -ge "$T_HEALTH" ] && { echo "超过 ${T_HEALTH}s 未全部 healthy"; return 1; }
+    _i=$((_i + 1))
+    [ "$HEALTH_TRIES" -gt 0 ] && [ "$_i" -gt "$HEALTH_TRIES" ] && { echo "健康门禁轮询次数用尽"; return 1; }
+    [ "$(left)" -le "$T_ROLLBACK" ] && { echo "健康等待预算不足"; return 1; }
+    sleep 5
   done
-  echo "健康门禁超时"; return 1
 }
 
 compose_stage_tags() {
@@ -1114,6 +1210,8 @@ compose_rollback() {
 compose_fail_after_up() {
   log "WARN Compose 更新失败：$1"
   compose_rollback || return 1
+  # 同 plain_fail：回滚成功仍属「本轮未能完成更新」。
+  [ "${EXIT_CODE:-0}" = "2" ] || EXIT_CODE=1
   return 0
 }
 
@@ -1155,7 +1253,7 @@ compose_update() {
     case "$IMG" in *@*) log "SKIP Compose 含 digest 固定镜像 $IMG，不自动更新整个项目"; compose_discard; return ;; esac
     set -- $(split_ref "$IMG"); REPO="$1"; TAG="$2"
     REMOTE=$(remote_digest "$IMG")
-    [ -n "$REMOTE" ] || { log "ERR 无法获取 $IMG 远端 digest，本轮跳过整个项目"; compose_discard; return; }
+    [ -n "$REMOTE" ] || { log "ERR 无法获取 $IMG 远端 digest，本轮跳过整个项目"; EXIT_CODE=1; compose_discard; return; }
     is_pinned_bad "$REPO" "$REMOTE" && { log "SKIP $IMG 为钉住坏版本；为避免重建时带上它，跳过整个项目"; compose_discard; return; }
     LOCID=$(local_imgid_for "$IMG")
     [ "$LOCID" != "MIXED" ] || { log "SKIP 项目内同一镜像 $IMG 的运行版本不一致，请先人工统一"; compose_discard; return; }
@@ -1169,7 +1267,7 @@ compose_update() {
   done
   [ -s "$C_MAP" ] || { log "OK 项目全部镜像已是最新（耗时 $(elapsed)s）"; compose_discard; return; }
   [ "$DRY_RUN" != "1" ] || { log "DRY 有 $(wc -l < "$C_MAP" | tr -d ' ') 个镜像待更新，不执行"; compose_discard; return; }
-  [ "$(left)" -gt $((T_UP + T_HEALTH + T_ROLLBACK + 15)) ] || { log "ERR 剩余预算不足，未改动"; compose_discard; return; }
+  [ "$(left)" -gt $((T_UP + T_HEALTH + T_ROLLBACK + 15)) ] || { log "ERR 剩余预算不足，未改动"; EXIT_CODE=1; compose_discard; return; }
 
   C_PHASE="preup"
   cat > "$C_STATE" <<EOF
@@ -1181,7 +1279,12 @@ C_MAP=$C_MAP
 C_PHASE=$C_PHASE
 EOF
   ACTIVE_KIND="compose"
-  compose_stage_tags || { log "ERR 旧镜像暂存失败，未改动"; compose_abort_before_up; return; }
+  if ! compose_stage_tags; then
+    log "ERR 旧镜像暂存失败，未改动"
+    compose_abort_before_up
+    EXIT_CODE=1
+    return
+  fi
   _fail=0
   while IFS='|' read -r _img _old _repo _tag; do
     if ! pull_stream "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log"; then
@@ -1195,7 +1298,12 @@ EOF
       fi
     fi
   done < "$C_MAP"
-  if [ "$_fail" = "1" ]; then compose_abort_before_up; log "ERR 拉取未完成，容器未切换"; return; fi
+  if [ "$_fail" = "1" ]; then
+    compose_abort_before_up
+    log "ERR 拉取未完成，容器未切换"
+    EXIT_CODE=1
+    return
+  fi
 
   C_PHASE="postup"
   cat > "$C_STATE" <<EOF
@@ -1221,7 +1329,11 @@ EOF
   if [ $? -ne 0 ]; then compose_fail_after_up "健康门禁：$_reason" || return; return; fi
 
   while IFS='|' read -r _img _old _repo _tag; do
-    docker tag "$_old" "$_repo:prev" 2>/dev/null && log "回滚点已更新为 $_repo:prev"
+    if docker tag "$_old" "$_repo:prev" 2>/dev/null; then
+      log "回滚点已更新为 $_repo:prev"
+    else
+      log "WARN 回滚点标签 $_repo:prev 打标失败；本轮更新已成功，但下次失败将无法回滚到这一版"
+    fi
     docker rmi "$_repo:rollback-pending" >/dev/null 2>&1 || true
   done < "$C_MAP"
   ACTIVE_KIND=""; rm -f "$C_STATE"
@@ -1259,8 +1371,13 @@ else
 fi
 
 if [ "$EXIT_CODE" -ne 2 ]; then
-  if [ -n "${P_REPO:-}" ]; then expire_bad "$P_REPO"; clean_orphans "$P_REPO"; fi
-  if [ -n "${REPO:-}" ]; then expire_bad "$REPO"; clean_orphans "$REPO"; fi
+  # --dry-run 承诺「不动任何东西」：连坏版本解除钉住和孤儿镜像清理都要跳过。
+  if [ "$DRY_RUN" != "1" ]; then
+    for _r in ${P_REPO:-} ${REPO:-} $(_all_repos); do
+      [ -n "$_r" ] || continue
+      expire_bad "$_r"; clean_orphans "$_r"
+    done
+  fi
 fi
 log "本轮结束，总耗时 $(elapsed)s"
 exit "$EXIT_CODE"
