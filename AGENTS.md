@@ -87,7 +87,7 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 
 ### MUST
 
-- **Compose 分支必须显式 `-p <项目名>`**，并保留原有的 `-f` / `--env-file`。
+- **Compose 参数必须通过环境变量传**（`COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES`），保留原有的项目名、config 文件、env 文件。不许拼成命令行字符串（见下方 NEVER 第 3 条）。
 - **不使用 `--remove-orphans`**：它会删掉不在当前 compose 文件里的容器，属于数据事故。
 - **`:prev` 只能在健康门禁通过之后才移动。** 更新期间用 `<repo>:rollback-pending` 占位。
 - **回滚必须用 `$OLD_IMGID`**，不许依赖 `:prev`（`:prev` 可能已被上一轮移动）。

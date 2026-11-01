@@ -26,12 +26,20 @@
 
    | 步骤 | 做什么 |
    |---|---|
-   | 校验脚本 | `sh -n` 语法检查、CRLF 行尾检查 |
-   | 读取 VERSION | 从脚本里读出 `VERSION="x.y.z"` |
-   | 打 tag | tag `vx.y.z` 不存在就创建并推送（annotated） |
-   | 发布 Release | Release 不存在就创建，并把脚本作为资产上传 |
+   | 检出代码 | `fetch-depth: 0`，要把历史 tag 也拉下来 |
+   | 校验脚本 | `sh -n` 语法检查、CRLF 行尾检查、git 里必须 `100755` 可执行 |
+   | 读取 VERSION | 从脚本里读出 `VERSION="x.y.z"`，校验只含数字和点 |
+   | 判断是否需要发版 | tag `vx.y.z` 已存在就整个跳过（幂等） |
+   | 找上一个发布 tag | 取「比当前版本小的最大者」，用 awk 比三段数字（不依赖 `sort -V`） |
+   | 生成发布说明 | `scripts/gen-release-notes.sh` → 定位句 + 本版破坏性变更 + 提交列表 + 下载命令 + sha256 |
+   | 打 tag | tag `vx.y.z` 不存在就创建（annotated，**消息就是发布说明**） |
+   | 发布 Release | 不存在就创建，用发布说明作正文，**同时上传两个资产**：`container-autoupdate.sh` 与 `ct-bootstrap.sh` |
 
-   完成后，`releases/latest/download/container-autoupdate.sh` 就指向新版本。
+   完成后，`releases/latest/download/container-autoupdate.sh` 和 `releases/latest/download/ct-bootstrap.sh` 都指向新版本。
+
+   > 两个资产都要传。少传一个，对应的 `releases/latest/download/...` 就是 404。
+
+   > 发布说明是自动生成的，不用人工写；`git show vx.y.z` 也能看到改了什么（tag 消息即发布说明）。
 
 ## 版本号规则
 

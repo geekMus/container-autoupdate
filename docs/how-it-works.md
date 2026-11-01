@@ -26,11 +26,15 @@
 本质就是「用 compose 重新部署一遍」：
 
 ```sh
-docker compose -p <项目名> -f <原config> [--env-file <原env>] up -d --force-recreate
+COMPOSE_PROJECT_NAME=<项目名> \
+COMPOSE_FILE=<原config> \
+COMPOSE_ENV_FILES=<原env> \
+docker compose up -d --force-recreate
 ```
 
 - **项目名、config 文件、env 文件都从运行中容器的 label 读出来**，所以和原来那份部署完全一致。
-- 显式带 `-p`，不靠当前目录猜项目名。
+- 这些参数走**环境变量**而不是 `-p` / `-f` / `--env-file` 命令行参数。原因：拼命令行字符串时，路径里一旦有空格，compose 会**打印 Usage 帮助却返回 `rc=0`**（静默出错，实测踩过）。环境变量传参没有这个问题，而且同样不靠当前目录猜项目名。
+- 多个 compose 文件时用 `COMPOSE_PATH_SEPARATOR=,` 显式声明分隔符，避免含冒号的路径被拆错。
 - **不使用 `--remove-orphans`**：它会把 compose 文件里没有、但仍在跑的同项目容器一起删掉。
 - 健康门禁检查**项目内所有容器**（有 healthcheck 的看 `healthy`，没有的看「启动后 30 秒仍在运行」）。
 - 回滚 = 把 tag 还原成更新前那版，再 `up` 一次；回滚后还要复查一遍确实跑在旧镜像上。
@@ -126,9 +130,10 @@ Compose 模式额外两条：
 手工回退：
 
 ```sh
-# Compose 模式
+# Compose 模式（进入项目目录，项目名可从 docker inspect 的 label 读到）
+cd /path/to/项目目录
 docker tag <镜像仓库>:prev <镜像仓库>:latest
-docker compose -p <项目名> up -d --force-recreate
+docker compose up -d --force-recreate
 
 # 容器模式
 docker rm -f <容器名>
