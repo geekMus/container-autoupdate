@@ -32,7 +32,7 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 >
 > **为什么不推荐 `curl ... | sh`**：管道写法在下载失败时会**静默成功**（任务日志看不出这轮没跑成）。引导器会把下载落到文件、校验通过才执行，失败时明确返回非 0。
 >
-> **生产环境建议锁版本**：给引导器设 `CT_VERSION=0.3.0`，它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
+> **生产环境建议锁版本**：给引导器设 `CT_VERSION=0.3.1`，它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
 
 ### cron
 
@@ -53,7 +53,7 @@ curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/
 想锁版本，就在 crontab 里带上 `CT_VERSION`：
 
 ```sh
-0 4 * * * CT_VERSION=0.3.0 /usr/local/bin/ct-bootstrap.sh --compose myapp >> /var/log/ct-update.log 2>&1
+0 4 * * * CT_VERSION=0.3.1 /usr/local/bin/ct-bootstrap.sh --compose myapp >> /var/log/ct-update.log 2>&1
 ```
 
 > 不想用引导器也行：直接把主脚本下载到本地，定时任务跑它即可（见[进阶用法](docs/advanced-usage.md)）。代价是脚本不会自己升级。
@@ -62,7 +62,7 @@ curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/
 
 | 模式 | 行为 | 网络开销 |
 |---|---|---|
-| 固定版本（`CT_VERSION=0.3.0`） | 本地有就直接跑 | **零**（完全不联网） |
+| 固定版本（`CT_VERSION=0.3.1`） | 本地有就直接跑 | **零**（完全不联网） |
 | `latest`（默认），本地同版本 | 只探测远端版本号，不下载 | 一次 4KB Range 请求（约 1 秒） |
 | `latest`，远端更新 | 下载新版本并缓存，再执行 | 一次探测 + 一次 64KB 下载 |
 | 探测失败但本地有缓存 | 用缓存继续跑，只打 `WARN` | 零 |

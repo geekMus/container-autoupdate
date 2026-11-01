@@ -108,6 +108,9 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 - 不许用 `docker rmi <tag>` 当成「删镜像」——它只摘标签。
 - 不许用 `--filter reference=` 找真 dangling 镜像——命中不了。
 - 不许按「只有一个标签、且无容器引用 = 孤儿」清理镜像。`<repo>:prev`、`<repo>:bad`、`<repo>:rollback-pending` 通常正好符合这个特征，但它们**必须保留**。清理逻辑必须显式排除这三个保留标签——否则会静默删掉回滚点（真实踩过：生产 magpie 的 `:prev` 就这么没了）。
+- 不许把 compose 参数拼成一个字符串再 `docker compose $args ...`。路径含空格时 compose **会打印 Usage 帮助却返回 rc=0**（静默出错，实测）。一律用 `COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES` 环境变量传递（见 §3 MUST）。
+- 不许在 `check_deps` 里漏掉 `docker buildx`。`remote_digest()` 靠它读 manifest；缺它时 digest 恒为空，脚本每轮都报「无法获取远端 digest」而不更新——那个错误信息会把排查引向网络，与真实原因无关。
+- 不许依赖 `sort -V`（GNU 扩展）。busybox/Alpine 没有它，换 runner 或换宿主会静默取错版本。版本比较用 awk 拆三段数字。
 
 ### 必须跳过的形态（并说明原因，不许硬上）
 

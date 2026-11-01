@@ -109,16 +109,30 @@ jobs:
         run: |
           set -eu
           TAG="v$VERSION"
-          # 按版本排序取「比当前版本小的最大者」，不用 tag 创建时间
-          # （避免手动补 tag 或乱序推送时取错）
+          # 取「比当前版本小的最大者」，不用 tag 创建时间（避免手动补 tag 或乱序推送时取错）。
+          # 不用 `sort -V`：它是 GNU 扩展，busybox/Alpine 上不存在，换 runner 就会静默取错。
+          # 这里用 awk 把版本拆成三段数字比较，纯 POSIX。
           PREV=""
-          for t in $(git tag -l 'v*' | sort -V); do
+          for t in $(git tag -l 'v*'); do
             [ "$t" = "$TAG" ] && continue
             tv="${t#v}"
             [ "$tv" = "$VERSION" ] && continue
-            if [ "$(printf '%s\n%s\n' "$tv" "$VERSION" | sort -V | head -n1)" = "$tv" ]; then
-              PREV="$t"
-            fi
+            # tv < VERSION 且 tv > PREV 时更新 PREV
+            _r=$(awk -v a="$tv" -v b="$VERSION" -v c="${PREV#v}" '
+              function k(s,   n,i,arr,v) {
+                n = split(s, arr, ".")
+                v = 0
+                for (i = 1; i <= 3; i++) v = v * 1000 + (arr[i] == "" ? 0 : arr[i] + 0)
+                return v
+              }
+              BEGIN {
+                ka = k(a); kb = k(b)
+                if (ka >= kb) { print "no"; exit }
+                if (c == "") { print "yes"; exit }
+                kc = k(c)
+                print (ka > kc ? "yes" : "no")
+              }')
+            [ "$_r" = "yes" ] && PREV="$t"
           done
           echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
           echo "上一个发布 tag: ${PREV:-（无，这是首个发布）}"

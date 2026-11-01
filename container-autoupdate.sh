@@ -50,7 +50,7 @@ BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="0.3.0"
+VERSION="0.3.1"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -402,6 +402,15 @@ check_deps() {
     echo "    请确认 Docker 正在运行，且当前用户有权限访问 socket" >&2
     exit 1
   fi
+  # buildx 是「查远端 digest」的唯一手段（remote_digest 用它读 manifest）。
+  # 缺它时 digest 会恒为空，脚本每轮都报「无法获取远端 digest」而不更新——
+  # 那个错误信息会把人引向网络问题，所以必须在动手之前就把原因说清楚。
+  if ! docker buildx version >/dev/null 2>&1; then
+    echo "ERR 缺少 docker buildx 插件（查询远端 digest 依赖它）" >&2
+    echo "    Debian/Ubuntu：apt install docker-buildx-plugin" >&2
+    echo "    其他发行版：https://github.com/docker/buildx/releases 下载后放进 \$HOME/.docker/cli-plugins/" >&2
+    exit 1
+  fi
 }
 
 parse_args "$@"
@@ -557,8 +566,11 @@ api_negotiate() {
 }
 
 # ---------- 拉取：只管理本轮 PID ----------
+# $4 可选：本次拉取的绝对截止时刻。compose 多镜像项目要按剩余镜像数分摊全局预算，
+# 否则第一个镜像能把整份预算吃光，后面的镜像一上来就「达到拉取上限」——
+# 那是必然失败，不是偶发。
 pull_stream() {
-  _repo="$1"; _tag="$2"; _log="$3"
+  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"
   PULL_DIGEST=""; PULL_MSG=""
   _enc=$(printf '%s' "$_repo" | sed 's|/|%2F|g')
   : > "$_log"
@@ -569,6 +581,9 @@ pull_stream() {
   _cap=$(( $(now) + T_PULL_MAX ))
   _hard=$(( START + T_HARD - (T_UP + T_HEALTH + T_ROLLBACK + 15) ))
   [ "$_hard" -lt "$_cap" ] && _cap=$_hard
+  if [ -n "$_dl" ]; then
+    case "$_dl" in ''|*[!0-9]*) ;; *) [ "$_dl" -lt "$_cap" ] && _cap=$_dl ;; esac
+  fi
   while kill -0 "$_pid" 2>/dev/null; do
     sleep 5
     _t=$(now); _sz=$(wc -c < "$_log" 2>/dev/null | tr -d ' ')
@@ -780,9 +795,19 @@ plain_preflight() {
     _ip=$(net_value "$P_OLDCID" "$_net" IPAddress)
     [ "$_mac" = "<no value>" ] && _mac=""
     [ "$_ip" = "<no value>" ] && _ip=""
-    if [ -n "$_mac" ] && [ -z "$_ip" ] && [ "$_driver" = "bridge" ]; then
-      log "SKIP 网络 $_net 有 MAC 但无 IPv4，无法可靠区分自动/显式 MAC"
-      return 1
+    # 只有「显式指定且无法自动重算」的 MAC 才需要保留；Docker 自动生成的 MAC
+    # 由「网段基址 02:42 + IPv4 四段」推导得出，重建时让它自己再生成即可。
+    # 旧代码用「有 MAC 但无 IPv4 且 bridge → 跳过」间接判据：IPv4 因容器暂停、
+    # IPAM 变更等原因缺失时会误判成「无法区分」，把本可安全重建的容器挡在门外。
+    # 现在直接问 is_auto_mac：它就是「这个 MAC 是不是自动生成的」的权威判据。
+    if [ -n "$_mac" ] && ! is_auto_mac "$_mac" "$_ip"; then
+      # 显式 MAC 必须能原样带回（make_networks_json 会写进 MacAddress），
+      # 但前提是能确认它不是自动生成的；无 IPv4 时 is_auto_mac 返回 1（保守视为显式），
+      # 此时若驱动是 bridge 则无法判断，仍需人工确认。
+      if [ -z "$_ip" ] && [ "$_driver" = "bridge" ]; then
+        log "SKIP 网络 $_net 有 MAC 但无 IPv4，无法可靠区分自动/显式 MAC"
+        return 1
+      fi
     fi
   done
   return 0
@@ -1090,15 +1115,30 @@ plain_update() {
 # ===========================================================================
 C_DIR=""; C_CFILES=""; C_ENVFILE=""; C_MAP=""; C_STATE=""; C_PHASE=""
 
-compose_args() {
-  _args="-p $COMPOSE_NAME"
+# 用环境变量表达 -p / -f / --env-file，**不要**拼成一个字符串再交给 shell 分词。
+# 拼字符串（`docker compose $args ...`）会让路径里的空格、$、反引号、*、? 被二次解析：
+# 实测含空格的 compose 路径下，`docker compose -p x -f /tmp/ca space dir/docker-compose.yaml config`
+# 会打印 usage 帮助却**返回 rc=0**——静默出错，比直接失败更危险。
+# 这三个变量由 Compose 自己解析，路径含空格也能正确工作（已实测）。
+compose_env() {
+  COMPOSE_PROJECT_NAME="$COMPOSE_NAME"
+  export COMPOSE_PROJECT_NAME
   if [ -n "$C_CFILES" ]; then
-    for _f in $(printf '%s' "$C_CFILES" | tr ',' ' '); do _args="$_args -f $_f"; done
+    # label 里的多文件本来就是逗号分隔；显式指定分隔符，
+    # 避免默认的冒号把含冒号的路径（Windows 挂载、URL）拆错。
+    COMPOSE_PATH_SEPARATOR=","
+    export COMPOSE_PATH_SEPARATOR
+    COMPOSE_FILE="$C_CFILES"
+    export COMPOSE_FILE
   fi
-  [ -n "$C_ENVFILE" ] && _args="$_args --env-file $C_ENVFILE"
-  printf '%s' "$_args"
+  # 注意：COMPOSE_FILE / COMPOSE_ENV_FILES 设成空串会被 Compose 判为非法（rc=1），
+  # 所以只在非空时才 export；不设时 Compose 会自己找当前目录的 compose.yaml（DPanel 的布局）。
+  if [ -n "$C_ENVFILE" ]; then
+    COMPOSE_ENV_FILES="$C_ENVFILE"
+    export COMPOSE_ENV_FILES
+  fi
+  return 0
 }
-
 resolve_compose() {
   C_DIR=""; C_CFILES=""; C_ENVFILE=""
   if [ -n "$COMPOSE_DIR" ]; then
@@ -1114,7 +1154,8 @@ resolve_compose() {
   if [ -z "$C_DIR" ] && [ -n "$COMPOSE_BASE" ]; then C_DIR="$COMPOSE_BASE/$COMPOSE_NAME"; fi
   # 找不到目录不算错误，交给调用方给出「请用 --compose-dir」的提示。
   [ -n "$C_DIR" ] && [ -d "$C_DIR" ] || { C_DIR=""; return 0; }
-  case "$C_DIR$C_CFILES$C_ENVFILE" in *[[:space:]]*) log "ERR Compose 路径含空白字符，当前安全解析不支持"; C_DIR=""; return 1 ;; esac
+  # 路径含空格不再拒绝：compose 参数改由环境变量传递（见 compose_env），
+  # 实测含空格的目录与文件名都能正确解析。
   return 0
 }
 
@@ -1123,7 +1164,7 @@ proj_containers() {
 }
 
 proj_images() {
-  (cd "$C_DIR" && docker compose $(compose_args) config --images 2>/dev/null) | awk '!seen[$0]++'
+  (cd "$C_DIR" && compose_env && docker compose config --images 2>/dev/null) | awk '!seen[$0]++'
 }
 
 local_imgid_for() {
@@ -1192,7 +1233,7 @@ compose_rollback() {
   log "开始回滚 Compose 项目 $COMPOSE_NAME"
   # 回滚失败时清 ACTIVE_KIND 防 EXIT trap 重复回滚；状态文件保留供下一轮继续。
   compose_restore_tags 1 || { log "CRITICAL 回滚 tag 还原失败"; ACTIVE_KIND=""; EXIT_CODE=2; return 1; }
-  (cd "$C_DIR" && timeout -s KILL "$T_ROLLBACK" docker compose $(compose_args) up -d --force-recreate) || {
+  (cd "$C_DIR" && compose_env && timeout -s KILL "$T_ROLLBACK" docker compose up -d --force-recreate) || {
     log "CRITICAL 回滚 compose up 失败或超时，事务状态已保留"; ACTIVE_KIND=""; EXIT_CODE=2; return 1;
   }
   while IFS='|' read -r _img _old _repo _tag; do
@@ -1286,8 +1327,21 @@ EOF
     return
   fi
   _fail=0
+  # 按剩余镜像数分摊拉取预算。关键：预算池必须在**每轮重新计算**——
+  # 若只在循环外算一次，靠后的镜像会因为分母变小而拿到更大份额（150s→300s），
+  # 前一个镜像耗掉的时间根本没被扣掉，等于没有分摊。
+  _n_img=$(wc -l < "$C_MAP" | tr -d ' ')
+  case "$_n_img" in ''|*[!0-9]*|0) _n_img=1 ;; esac
+  _idx=0
   while IFS='|' read -r _img _old _repo _tag; do
-    if ! pull_stream "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log"; then
+    _idx=$((_idx + 1))
+    _rest=$((_n_img - _idx + 1))
+    _pool=$(( START + T_HARD - (T_UP + T_HEALTH + T_ROLLBACK + 15) - $(now) ))
+    [ "$_pool" -gt 0 ] || _pool=1
+    _share=$((_pool / _rest))
+    [ "$_share" -lt 20 ] && _share=20        # 别把尾巴切得太碎，留一个可用下限
+    _dl=$(( $(now) + _share ))
+    if ! pull_stream "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log" "$_dl"; then
       log "ERR 拉取失败 $_img：$PULL_MSG"; _fail=1; break
     fi
     if [ -n "$PULL_DIGEST" ]; then
@@ -1314,7 +1368,7 @@ C_ENVFILE=$C_ENVFILE
 C_MAP=$C_MAP
 C_PHASE=$C_PHASE
 EOF
-  (cd "$C_DIR" && timeout -s KILL "$T_UP" docker compose $(compose_args) up -d --force-recreate) || {
+  (cd "$C_DIR" && compose_env && timeout -s KILL "$T_UP" docker compose up -d --force-recreate) || {
     compose_fail_after_up "compose up 失败或超时，可能已有部分服务被重建" || return
     return
   }

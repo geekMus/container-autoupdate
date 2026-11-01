@@ -31,6 +31,7 @@ CONTAINER_NAME=""
 | 命令 | 用途 | 常见缺失场景 |
 |---|---|---|
 | `docker` | 一切操作的前提 | — |
+| `docker buildx` | **查远端 digest 的唯一手段**（`docker buildx imagetools inspect`） | 精简安装的 Docker、只装了 `docker.io` 包的系统。缺它时脚本在动手前就报错——否则每轮都会误报「无法获取远端 digest」，把人引向网络问题 |
 | `curl` | 拉取镜像走 Docker Engine API 流（判断进度停滞）、查远端 digest | 极简镜像 |
 | `flock` | 按目标隔离的互斥锁，防止两轮任务互相踩 | **Alpine 默认有；Debian slim 可能没有**（`util-linux` 包） |
 | `timeout` | 每个外部调用都有超时，防止整轮被外部定时器 SIGKILL | busybox 有；某些精简镜像无 |
@@ -46,7 +47,7 @@ Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `doc
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `0.3.0` 或 `v0.3.0`）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设。 |
+| `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `0.3.1` 或 `v0.3.1`）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设。 |
 | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | 脚本缓存目录。容器内跑要挂载可写目录，或改到 `/tmp`。 |
 | `CT_CACHE_KEEP` | `3` | 保留几个历史版本文件，超出的删掉。设 `0` 表示不裁剪。 |
 | `CT_SOURCE` | `auto` | 下载源：`auto`（gh-proxy → 直连 → ghproxy.net）、`direct`、`gh-proxy`、`ghproxy`，或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |
