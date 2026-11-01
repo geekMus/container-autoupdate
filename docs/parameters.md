@@ -47,7 +47,7 @@ Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `doc
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `0.3.1` 或 `v0.3.1`）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设。 |
+| `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `0.3.2` 或 `v0.3.2`）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设。 |
 | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | 脚本缓存目录。容器内跑要挂载可写目录，或改到 `/tmp`。 |
 | `CT_CACHE_KEEP` | `3` | 保留几个历史版本文件，超出的删掉。设 `0` 表示不裁剪。 |
 | `CT_SOURCE` | `auto` | 下载源：`auto`（gh-proxy → 直连 → ghproxy.net）、`direct`、`gh-proxy`、`ghproxy`，或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |

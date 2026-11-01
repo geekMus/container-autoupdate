@@ -50,7 +50,7 @@ BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="0.3.1"
+VERSION="0.3.2"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -512,15 +512,35 @@ expire_bad() {
 }
 
 clean_orphans() {
-  # 只清理「同一个仓库、已无任何容器引用、且不带任何保留标签」的镜像。
-  # 两个坑：
-  #   1. `dangling=true` 与 `--filter reference=` 语义互斥，组合起来永远命中不了（见 AGENTS.md §3 NEVER）。
+  # 清理「属于本仓库、已无任何容器引用、且不带保留标签、也不再被任何 tag 指着」的镜像。
+  #
+  # 三个坑（都真实踩过）：
+  #   1. `dangling=true` 与 `--filter reference=` 语义互斥，组合起来永远命中不了（AGENTS.md §3 NEVER）。
   #   2. `:prev`（回滚点）、`:bad`（坏版本钉子）、`:rollback-pending`（更新中占位）
   #      通常只有一个标签、也没有容器引用，但它们**必须保留**。
-  #      按「单标签即孤儿」判定会把回滚点删掉——真实踩过（生产 magpie 的 :prev 就这么没的）。
+  #      按「单标签即孤儿」判定会把回滚点删掉——生产 magpie 的 :prev 就这么没的。
+  #   3. **N-2 会变成 <none>:<none>**：每次更新把 :prev 往前搬一格，更早那版就失去最后一个
+  #      标签、变成 dangling。它仍然带着 RepoDigests（形如 `repo@sha256:...`），但
+  #      `docker images --format '{{.Repository}}:{{.Tag}}'` 只会给出 `<none>:<none>`，
+  #      所以「按 repo:tag 前缀匹配」永远看不到它 → 每成功更新一次就白留一个完整镜像。
+  #      正因如此，这里必须**先用 RepoDigests 认领归属**，再退回标签前缀匹配。
   _repo="$1"; _n=0
-  _refs=$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null \
-          | awk -v r="$_repo" '$2 ~ ("^" r ":") { print $1 }' | sort -u)
+  [ -n "$_repo" ] || return 0
+
+  # ① 按 RepoDigests 认领：涵盖已变 <none> 的 N-2 以及仍有标签的镜像
+  _refs=$(docker images -a --format '{{.ID}}' 2>/dev/null | sort -u | while read -r _i; do
+    [ -n "$_i" ] || continue
+    _rd=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$_i" 2>/dev/null)
+    case "$_rd" in
+      *"${_repo}@"*) echo "$_i" ;;
+    esac
+  done)
+  # ② 兜底：还没有 RepoDigests 记录的本地构建/导入镜像，只能靠标签前缀
+  _refs=$(printf '%s\n%s\n' "$_refs" \
+          "$(docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null \
+             | awk -v r="$_repo" '$2 ~ ("^" r ":") { print $1 }')" \
+          | awk 'NF' | sort -u)
+
   for _id in $_refs; do
     # 仍有容器（含已停止）在用它：不动
     [ -n "$(docker ps -a -q --filter ancestor="$_id" 2>/dev/null)" ] && continue
@@ -534,7 +554,7 @@ clean_orphans() {
       esac
     done
     [ "$_keep" = "1" ] && continue
-    # 还有别的 tag 指向它：说明不是孤儿，只是多标签，不动
+    # 还有别的 tag 指着它：说明不是孤儿，只是多标签，不动
     _cnt=$(printf '%s\n' "$_tags" | grep -c . || true)
     [ "$_cnt" -le 1 ] || continue
     docker rmi "$_id" >/dev/null 2>&1 && _n=$((_n + 1))

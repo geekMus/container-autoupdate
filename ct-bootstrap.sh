@@ -3,7 +3,7 @@
 # container-autoupdate 引导器（bootstrap）
 #
 # 解决的问题：让定时任务不必「每轮都联网下载脚本」。
-#   固定版本（CT_VERSION=0.3.1）：本地有就直接跑，完全不联网。
+#   固定版本（CT_VERSION=0.3.2）：本地有就直接跑，完全不联网。
 #   latest（默认）           ：先探测远端 tag；本地同版本则直接复用，不同才下载并缓存。
 #
 # 用法（放进 DPanel 计划任务 / cron）：
@@ -26,7 +26,7 @@ ASSET="container-autoupdate.sh"
 
 # ---- 可覆盖的配置 ----
 CACHE_DIR="${CT_CACHE_DIR:-/var/cache/container-autoupdate}"
-PIN_VERSION="${CT_VERSION:-}"     # 非空 = 固定版本模式（如 0.3.1 或 v0.3.1）
+PIN_VERSION="${CT_VERSION:-}"     # 非空 = 固定版本模式（如 0.3.2 或 v0.3.2）
 SOURCE="${CT_SOURCE:-auto}"       # auto | direct | gh-proxy | ghproxy | 自定义前缀
 CACHE_KEEP="${CT_CACHE_KEEP:-3}"  # 保留几个历史版本
 T_NET="${CT_T_NET:-20}"           # 单次网络超时（秒）
@@ -97,7 +97,7 @@ verify_file() {
 #   - Range 0-4000 + 读文件里的 VERSION：代理上稳定 1~2 秒，且拿到的是**真实版本号**，
 #     比解析 URL 更可信。所以统一用 Range。
 #   - 完整下载只要 1 秒（64KB），所以探测的价值不在省时间，而在「本地同版本就不下载」。
-# 返回：把版本号（如 0.3.1，不含 v）打到 stdout；全部失败返回非 0。
+# 返回：把版本号（如 0.3.2，不含 v）打到 stdout；全部失败返回非 0。
 probe_latest_version() {
   for _pb in $(base_urls); do
     _pu=$(url_for "$_pb" "")
@@ -153,7 +153,7 @@ prune_cache() {
 # ---- 主流程 ----
 mkdir -p "$CACHE_DIR" 2>/dev/null || die "无法创建缓存目录 $CACHE_DIR"
 
-# 目标版本：纯版本号（如 0.3.1），不含 v
+# 目标版本：纯版本号（如 0.3.2），不含 v
 TARGET_VER=""
 if [ -n "$PIN_VERSION" ]; then
   case "$PIN_VERSION" in v*) TARGET_VER="${PIN_VERSION#v}" ;; *) TARGET_VER="$PIN_VERSION" ;; esac
