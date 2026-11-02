@@ -67,10 +67,15 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 container-autoupdate.sh --compose myapp --dry-run    # 只看有没有新版本，不更新、不删镜像
 container-autoupdate.sh --compose myapp              # 正式更新 Compose 项目
 container-autoupdate.sh --container mycontainer      # 更新普通容器
+container-autoupdate.sh --compose myapp --pull-retries 2   # 拉取失败多试一次（默认 1 次）
 ```
 
 **第一次接入建议先跑 `--dry-run`**，确认日志里认到的目标和目录是对的，再去掉它。
 （演练只写状态目录，不动容器、不动镜像标签、也不清理旧镜像。）
+
+拉取失败（网络抖动、镜像源瞬时 5xx）默认**重试 1 次**，两次之间等 10 秒；
+`--pull-retries <次数>` 可以改次数，`0` = 不重试。
+但**拉取卡死**（60 秒没有任何新字节）和**镜像源明确报错**（镜像不存在、鉴权失败）不重试 —— 重试也不会成功。
 
 ## 版本与升级
 

@@ -101,6 +101,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `--docker-sock <路径>` | `DOCKER_HOST` 或 `/var/run/docker.sock` | Docker socket **不在默认位置**时。rootless Docker（`/run/user/1000/docker.sock`）、Docker 在另一台机器、socket 挂载在非常规路径 |
 | `--state-dir <目录>` | `/tmp/.container-autoupdate` | `/tmp` 重启会被清空、而你希望中断后跨重启也能恢复；或 `/tmp` 空间紧张；或想让多个用户的任务互不干扰 |
 | `--bad-ttl-days <天>` | `7` | 坏版本钉住期。某个新版本反复起不来、你想更快重试就调小（如 `1`），想更保守就调大 |
+| `--pull-retries <次>` | `1` | 拉取失败后重试几次。`0` = 不重试（老行为）；网络不稳、上游经常瞬时 5xx 时可以调到 `2`~`3`。**拉取卡死（60 秒无字节）不重试**，直接放弃这一轮 |
 | `--compat <版本>` | 关 | **声明「我只验证到某个版本」**。脚本若比它新、且中间有破坏性变更，就硬停而不是冒险执行（退出码 `3`）。升级脚本后行为变了、你想先稳住现状时用它 |
 | `--dry-run` | 关 | 只检查不改动：不动容器、不动镜像标签、不清理旧镜像（仅写状态目录）。**首次接入**、排查「为什么没更新」、确认某容器会被怎么处理 |
 | `-h` / `--help` | — | 显示帮助 |
@@ -117,6 +118,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `DOCKER_HOST` | — | 已设这个标准变量的话脚本直接用它，支持 `unix:///path` 与 `tcp://host:port` |
 | `DRY_RUN=1` | `--dry-run` | 同上 |
 | `BAD_TTL_DAYS` | `--bad-ttl-days` | 同上 |
+| `PULL_RETRIES` | `--pull-retries` | 同上 |
 | `COMPAT_UNTIL` | `--compat` | 同上 |
 | `STATE_ROOT` | `--state-dir` | 同上 |
 
@@ -148,6 +150,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | 应用启动很慢（>120 秒才 healthy） | `T_HEALTH=300`（必要时 `T_HARD=600`），DPanel 计划任务的「执行超时」同步加到 700+ |
 | 镜像仓库经常卡住不返回 | `T_STALL=120`（别调太小，健康拉取也可能长时间静默） |
 | 同一个新版本反复失败，想快点重试 | `--bad-ttl-days 1` |
+| 拉取经常因为网络抖动失败 | `--pull-retries 2`（默认就是 1；`0` = 不重试） |
 | 脚本升到新版、但你想先稳住现有行为 | `--compat <你验证过的版本>`，例如 `--compat 1.2.3` |
 
 ## 退出码

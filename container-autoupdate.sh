@@ -49,9 +49,10 @@ API="http://localhost/v1.47"
 STATE_ROOT="${STATE_ROOT:-/tmp/.container-autoupdate}"
 BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
+PULL_RETRIES="${PULL_RETRIES:-1}"  # 拉取失败后的重试次数（0 = 不重试）
 
 START=$(date +%s)
-VERSION="1.0.0"
+VERSION="1.1.0"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -66,6 +67,7 @@ EXIT_CODE=0
 ACTIVE_KIND=""
 PULL_DIGEST=""
 PULL_MSG=""
+PULL_KIND=""      # 拉取失败的分类：ok / transient / permanent / stall / cap
 
 now()     { date +%s; }
 elapsed() { echo $(( $(now) - START )); }
@@ -295,6 +297,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   --docker-sock <路径>   Docker socket 路径；默认读 DOCKER_HOST 或 /var/run/docker.sock
   --dry-run              只检查有没有新版本，不做任何改动
   --bad-ttl-days <天数>  失败版本钉住多少天后自动解除（默认 7）
+  --pull-retries <次数>   拉取失败后重试几次（默认 1；0 = 不重试）
   --state-dir <目录>     事务状态目录（默认 /tmp/.container-autoupdate）
   --compat <版本>        声明只验证到某个版本；脚本若含更新的破坏性变更就中止
   -h, --help             显示本帮助
@@ -309,6 +312,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   STATE_ROOT                    同 --state-dir
   DRY_RUN=1                     同 --dry-run
   BAD_TTL_DAYS                  同 --bad-ttl-days
+  PULL_RETRIES                  同 --pull-retries
   COMPAT_UNTIL                  同 --compat
   T_HARD / T_INSPECT / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
                                 各阶段超时（秒），一般不用改
@@ -368,6 +372,8 @@ parse_args() {
                       STATE_ROOT="$2"; shift 2 ;;
       --bad-ttl-days) [ "$#" -ge 2 ] || { echo "ERR --bad-ttl-days 缺少参数" >&2; exit 1; }
                       BAD_TTL_DAYS="$2"; shift 2 ;;
+      --pull-retries) [ "$#" -ge 2 ] || { echo "ERR --pull-retries 缺少参数" >&2; exit 1; }
+                      PULL_RETRIES="$2"; shift 2 ;;
       --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&2; exit 1; }
                       COMPAT_UNTIL="$2"; _SAW_COMPAT=1; shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
@@ -382,6 +388,10 @@ parse_args() {
     echo "ERR 配置错误：--compose 与 --container 必须且只能给一个" >&2
     exit 1
   fi
+  # 重试次数必须是非负整数。给错值要立刻报错，不能悄悄当成 0 或 1。
+  case "$PULL_RETRIES" in
+    ''|*[!0-9]*) echo "ERR --pull-retries 必须是非负整数（当前值=$PULL_RETRIES）" >&2; exit 1 ;;
+  esac
 }
 
 # 解析 Docker 端点：unix socket 或 tcp，供 dcurl 统一调用。
@@ -599,7 +609,7 @@ api_negotiate() {
 # 那是必然失败，不是偶发。
 pull_stream() {
   _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"
-  PULL_DIGEST=""; PULL_MSG=""
+  PULL_DIGEST=""; PULL_MSG=""; PULL_KIND=""
   _enc=$(printf '%s' "$_repo" | sed 's|/|%2F|g')
   : > "$_log"
   _seen=0; _seen_at=$(now)
@@ -631,22 +641,124 @@ pull_stream() {
     if [ "$_idle" -ge "$T_STALL" ]; then
       kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
       PULL_MSG="进度停滞 ${_idle}s（共收 ${_seen} 字节后无新增）"
+      PULL_KIND="stall"
       return 1
     fi
     if [ "$_t" -ge "$_cap" ]; then
       kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
       PULL_MSG="达到拉取上限（共收 ${_seen} 字节）"
+      PULL_KIND="cap"
       return 1
     fi
   done
   wait "$_pid" 2>/dev/null
   _rc=$?
-  if [ "$_rc" -ne 0 ]; then PULL_MSG="拉取流退出 rc=$_rc"; return 1; fi
+  # 先看拉取流自己报告了什么，再看 curl 的退出码。
+  # 顺序不能反：镜像源明确说「manifest unknown」时，curl 很可能同时以非 0 退出，
+  # 如果先看退出码，就会把它当成瞬时故障去重试 —— 而重试一万次也一样。
   _err=$(sed -n 's/.*"error":"\([^"]*\)".*/\1/p' "$_log" | head -n1)
-  if [ -n "$_err" ]; then PULL_MSG="镜像源返回错误：$_err"; return 1; fi
+  if [ -n "$_err" ]; then
+    PULL_MSG="镜像源返回错误：$_err"
+    # 「error」字段有两种含义，必须分开看：
+    #   永久性（镜像不存在、仓库名错、鉴权失败）→ 重试一万次也一样，不重试；
+    #   瞬时性（429 限流、5xx、上游抖动）        → 重试一次通常就成了。
+    # 靠关键字区分：这些措辞出现时基本不会是瞬时的。
+    case "$_err" in
+      *not\ found*|*notfound*|*"not found"*|*"manifest unknown"*|*"no such"*|\
+      *unauthorized*|*denied*|*"authentication required"*|*"access denied"*|\
+      *"repository does not exist"*|*"does not exist"*|*unknown\ blob*|*unknown\ manifest*)
+        PULL_KIND="permanent"
+        ;;
+      *)
+        PULL_KIND="transient"
+        ;;
+    esac
+    return 1
+  fi
+  if [ "$_rc" -ne 0 ]; then PULL_MSG="拉取流退出 rc=$_rc"; PULL_KIND="transient"; return 1; fi
   PULL_DIGEST=$(sed -n 's/.*"status":"Digest: \(sha256:[0-9a-f]\{64\}\)".*/\1/p' "$_log" | tail -n1)
+  if [ -z "$PULL_DIGEST" ]; then
+    PULL_MSG="拉取流结束但没有报告 digest（共收 ${_seen} 字节）"
+    PULL_KIND="transient"
+    return 1
+  fi
   PULL_MSG="已完成（共收 ${_seen} 字节）"
+  PULL_KIND="ok"
   return 0
+}
+
+# 拉取失败后重试。
+# 参数：$1=repo $2=tag $3=日志文件 $4=首次尝试的绝对截止时刻（可空）
+#       $5=重试时的绝对截止时刻（可空，缺省按全局剩余预算算）
+# 返回值与 PULL_DIGEST / PULL_MSG 的语义与 pull_stream 一致。
+#
+# 为什么要重试：实测拉取失败绝大多数是「网络抖动 / 镜像源瞬时 5xx / 拉取流中途断开」
+# 这类**瞬时**故障，重试一次通常就成了。原实现失败即放弃这一轮，
+# 等下一次计划任务（可能一小时后）才有机会，用户体感是「更新总是失败」。
+#
+# 但不能无脑重试：
+#   1. 时间预算不够就不重试 —— 重试必须有预算，否则计划任务会被拖到超时被杀，
+#      下一轮又接着超时。留给健康门禁和回滚的部分必须先扣掉。
+#   2. 明确是「重试也没用」的错误不重试 —— 镜像不存在、仓库名错、鉴权失败，
+#      重试只是白等。这类错误在拉取流里以 "error" 字段返回。
+#   3. 拉取卡死不重试 —— 卡死不是瞬时故障，重试大概率还是卡死。
+#   4. 两次尝试之间要等一下 —— 立刻重试往往还是同样的失败（源还在限流）。
+#   5. 重试要有自己的时间份额 —— 首次尝试的截止时刻是「这个镜像分到的份额」，
+#      第一次拉取很可能已经把它用光了；直接拿同一时刻做第二次尝试会秒失败。
+pull_with_retry() {
+  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"; _retry_dl="${5:-}"
+  # 全局硬截止：留给 T_UP / T_HEALTH / T_ROLLBACK 的部分不能被拉取吃掉。
+  _hard_dl=$(( START + T_HARD - (T_UP + T_HEALTH + T_ROLLBACK + 15) ))
+  [ -n "$_retry_dl" ] || _retry_dl="$_hard_dl"
+  _try=0
+  _max_try=$(( PULL_RETRIES + 1 ))
+  while :; do
+    _try=$((_try + 1))
+    if [ "$_try" -gt 1 ]; then _dl="$_retry_dl"; fi
+    if pull_stream "$_repo" "$_tag" "$_log" "$_dl"; then
+      [ "$_try" -gt 1 ] && log "   拉取第 $_try 次尝试成功"
+      return 0
+    fi
+    _why="$PULL_MSG"
+    _kind="$PULL_KIND"
+    # 永久性错误不重试：重试也不会成功，只是白等。
+    case "$_kind" in
+      permanent)
+        log "ERR 拉取失败 $_repo:$_tag：$_why"
+        log "   这是镜像源明确返回的错误（镜像/仓库不存在、鉴权失败之类），重试没有意义，本轮放弃"
+        PULL_MSG="$_why"
+        return 1 ;;
+      stall)
+        # 卡死不是瞬时故障：重试大概率还是卡死，把预算耗光不如留给下一轮。
+        log "ERR 拉取失败 $_repo:$_tag：$_why"
+        log "   拉取卡死重试也没意义，本轮放弃"
+        PULL_MSG="$_why"
+        return 1 ;;
+    esac
+    if [ "$_try" -ge "$_max_try" ]; then
+      log "ERR 拉取失败 $_repo:$_tag：$_why（已尝试 $_try 次）"
+      PULL_MSG="$_why"
+      return 1
+    fi
+    # 预算不够就别重试了：把剩下的时间留给健康门禁和回滚，比再赌一次拉取重要。
+    _need=$(( T_UP + T_HEALTH + T_ROLLBACK + 15 ))
+    if [ "$(left)" -le "$_need" ]; then
+      log "ERR 拉取失败 $_repo:$_tag：$_why"
+      log "   剩余预算 $(left)s 不足以再做一次拉取（需要 $_need s），本轮放弃"
+      PULL_MSG="$_why"
+      return 1
+    fi
+    # 这次尝试至少得留 20 秒，否则拉流刚起就到期，等于白等。
+    if [ $(( _retry_dl - $(now) )) -lt 20 ]; then
+      log "ERR 拉取失败 $_repo:$_tag：$_why"
+      log "   剩余预算不足以再做一次有意义的拉取，本轮放弃"
+      PULL_MSG="$_why"
+      return 1
+    fi
+    log "WARN 拉取失败 $_repo:$_tag：$_why"
+    log "   将在 10 秒后重试（第 $((_try + 1))/${_max_try} 次尝试）"
+    sleep 10
+  done
 }
 
 # ===========================================================================
@@ -1024,7 +1136,7 @@ plain_update() {
   ACTIVE_KIND="plain"; P_STARTED=0
   save_plain_state
   docker tag "$P_OLDID" "$P_STAGE" 2>/dev/null || { plain_fail "无法暂存旧镜像" || return; return; }
-  if ! pull_stream "$P_REPO" "$P_TAG" "$P_DIR/pull.log"; then
+  if ! pull_with_retry "$P_REPO" "$P_TAG" "$P_DIR/pull.log"; then
     plain_fail "拉取失败：$PULL_MSG" || return
     return
   fi
@@ -1381,7 +1493,13 @@ EOF
     _share=$((_pool / _rest))
     [ "$_share" -lt 20 ] && _share=20        # 别把尾巴切得太碎，留一个可用下限
     _dl=$(( $(now) + _share ))
-    if ! pull_stream "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log" "$_dl"; then
+    # 重试的截止时刻要单独算：重试不能把后面镜像的份额吃掉。
+    # 后面还剩 (_rest-1) 个镜像，每个先给它留 20 秒保底。
+    _reserve=$(( (_rest - 1) * 20 ))
+    _retry_pool=$(( _pool - _share - _reserve ))
+    [ "$_retry_pool" -lt 20 ] && _retry_pool=20
+    _retry_dl=$(( $(now) + _retry_pool ))
+    if ! pull_with_retry "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log" "$_dl" "$_retry_dl"; then
       log "ERR 拉取失败 $_img：$PULL_MSG"; _fail=1; break
     fi
     if [ -n "$PULL_DIGEST" ]; then
