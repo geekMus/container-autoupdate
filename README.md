@@ -120,6 +120,23 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 2. 如果你的启动命令里还留着 `LOCK_PREFIX=...`，删掉它。留着的话脚本会按破坏性变更处理，
    直接中止并给出提示（退出码 `3`），不会静默忽略。
 
+### 排查残留进程和旧锁文件
+
+旧版本反复打出「SKIP 同一更新目标（xxx）的另一个任务仍在执行」时，说明有上一轮没退干净的进程还占着锁。
+仓库里带了一个**只读**排查脚本：它只把问题列出来（旧锁文件、占着锁的进程、残留的拉取进程、残留的事务目录），
+不改任何东西、不杀任何进程，末尾给出可复制的清理命令，由你确认后自己执行。
+
+```sh
+curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+  -o /tmp/ct-stale-lock-check.sh
+sh /tmp/ct-stale-lock-check.sh
+```
+
+> 要在**跑更新的那个环境里**跑它（用 DPanel 的话就是 dpanel 容器内部），因为它要看的是那台机器的 `/proc`：
+> `docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh`。
+>
+> 详细的清理步骤见 [进阶用法](docs/advanced-usage.md#7-排查残留进程与旧锁文件)。
+
 ### 用 latest 也安全
 
 上游发新版会直接作用到你机器上。如果新版改坏了你的调用方式（比如某个参数被改名或移除），脚本不会静默忽略，而是**立刻停下**、退出码 `3`，并在日志里写清三件事：哪个写法不能用了、从哪个版本起改成了什么、以及怎么改。

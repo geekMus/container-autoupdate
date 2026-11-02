@@ -242,7 +242,62 @@ Do **not** run two rounds for the **same target** at the same time (the script n
 
 If you want several copies of the script to be completely independent (each with its own state directory), give them different `--state-dir` values.
 
-## 7. Common questions
+## 7. Investigating leftover processes and old lock files
+
+Older versions (the ones that used a mutex lock) sometimes keep printing:
+
+```text
+[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
+
+→ SKIP: another task for the same update target (compose-myapp) is still running; skipping this round
+```
+
+and **every round looks identical and nothing is ever updated**. The reason is not that some other task is really running, but that **a child process from a previous round did not exit cleanly**
+and kept holding the lock on behalf of the main script (see [How it works and safety boundaries](how-it-works.en.md)).
+
+The repository ships a **read-only** investigation script `scripts/ct-stale-lock-check.sh`: it changes nothing and kills nothing,
+it only lists the following and ends with copy-pasteable cleanup commands:
+
+1. the old lock files (current versions do not use a lock any more, they are just leftover garbage);
+2. who is holding those lock files open (PID / PPID / fd / command line);
+3. leftover image pull processes;
+4. the leftover transaction directories in the state directory, marking which ones may be deleted and which ones must be kept.
+
+### How to use it
+
+```sh
+curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+  -o /tmp/ct-stale-lock-check.sh
+sh /tmp/ct-stale-lock-check.sh
+```
+
+**Run it in the environment that runs the updates**: the script inspects that machine's `/proc`. With DPanel that means inside the container:
+
+```sh
+docker cp /tmp/ct-stale-lock-check.sh dpanel:/tmp/ct-stale-lock-check.sh
+docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh
+```
+
+Optional environment variables: `CT_LOCK_PREFIX` (lock file prefix, default `/tmp/.container-autoupdate`),
+`CT_STATE_ROOT` (state directory, default `/tmp/.container-autoupdate`).
+
+### After you look at the result
+
+| What you see | May it be deleted | Notes |
+|---|---|---|
+| Old `.lock` files | **yes** | Current versions do not use a lock any more, they are just garbage. Deleting them affects nothing. |
+| Processes holding a lock | **check first, then kill** | Look at the command line first: `cat /proc/<PID>/cmdline` (NUL separated). Only kill it once you are sure it is a leftover that did not exit cleanly. |
+| Leftover pull processes (`images/create`) | **yes, kill them** | The pull should have ended long ago; a process that is still alive is a leftover. |
+| The `compat/` directory | **may be left alone** | It only records "the version each target last ran with"; deleting it only means you get the notice once more on the next upgrade. |
+| Transaction directories (`compose-*` / `plain-*`) | **read the logs before deleting** | They mean that round ran into trouble. The `pull.log` / `create.json` inside are the only evidence of *why* it failed. |
+
+### The real fix
+
+Cleaning up is only a patch. **The actual fix is to upgrade to a version that no longer uses a mutex lock** — a new version has no lock, so there is no "held by a leftover process" situation in the first place.
+After upgrading, confirm two things: only one DPanel scheduled task per target, and no leftover `LOCK_PREFIX=...` in the start command
+(if there is one, the script treats it as a breaking change, aborts and exits with code `3`).
+
+## 8. Common questions
 
 **Q: The log says `已是最新`, but upstream clearly published a new version.**
 A: The message means "already up to date". The script compares the **remote digest** with **the image the container is actually running**. This happens when upstream published a release but the tag content did not change (rare), or when you use a fixed digest reference. Use `--dry-run` first to see which remote digest it recognises.

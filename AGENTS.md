@@ -391,7 +391,8 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] `sh -n container-autoupdate.sh` 通过
 - [ ] `sh -n ct-bootstrap.sh` 通过
 - [ ] `sh -n scripts/gen-release-notes.sh` 通过
-- [ ] 三个 `.sh` 的 CR 计数为 0
+- [ ] `sh -n scripts/ct-stale-lock-check.sh` 通过
+- [ ] 四个 `.sh` 的 CR 计数为 0
 - [ ] 改了脚本 → `VERSION` 已按 §7.3 升级
 - [ ] 若含破坏性变更 → 已登记 `BREAKING_TABLE`，且类别（`flag`/`env`/`behavior`）选对
 - [ ] `--help`、`--version`、无参数、`--bogus`、`--compat` 非法值 五个快速用例行为正确
@@ -399,7 +400,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 测试容器 / 镜像 / 状态目录已清理，生产已复原且 `healthy`
 - [ ] 文档里没有新增硬编码的当前版本号
 - [ ] 下载地址是 `releases/...`，带 `-L`，没用 jsdelivr
-- [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
+- [ ] 四个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
 - [ ] 改了 `ct-bootstrap.sh` → 引导器 10 个场景（固定版本 / 命中缓存 / 有新版本 / 网络故障有缓存 / 无缓存 / 坏包 / 参数透传 / 缓存裁剪 / 强制更新）已复跑
 - [ ] 推送后做了 §9.3 的三方 sha1 核对
 - [ ] 改了用户文档 → 对应英文副本已同步（§8.6）

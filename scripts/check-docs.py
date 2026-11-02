@@ -121,6 +121,18 @@ def check_links(root, path, expect_en):
             err("%s 里的链接锚点对不上：%s（%s 里没有对应标题）" % (path, target, target_path))
 
 
+def count_columns(row):
+    """数一行的表格列数。
+
+    转义的竖线 `\\|`（常见于代码块里的 `tr '\\0' ' '`）不算列分隔符，
+    否则会把一列误判成两列。
+    """
+    body = row.strip()
+    body = body[1:] if body.startswith("|") else body
+    body = body[:-1] if body.endswith("|") and not body.endswith("\\|") else body
+    return len(re.split(r"(?<!\\)\|", body))
+
+
 def check_tables(root, path):
     full = os.path.join(root, path)
     incode = False
@@ -140,7 +152,7 @@ def check_tables(root, path):
             # 塌行检测：`| a | ... || b | ...` 会让表格塌掉（AGENTS.md §8）
             if re.search(r"\|\|\s*\S", s) and not re.match(r"^\|[\s\-:|]+\|$", s):
                 err("%s:%d 表格疑似塌成一行：%s" % (path, no, s[:80]))
-            cols = len(s.strip("|").split("|"))
+            cols = count_columns(s)
             if ncol == 0:
                 ncol = cols
             elif cols != ncol:

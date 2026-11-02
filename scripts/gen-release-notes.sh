@@ -211,6 +211,14 @@ echo ""
 echo "> \`-L\` 不能省：\`releases/latest/download/\` 会返回 302 跳转。"
 echo "> 国内网络可用前缀 \`https://gh-proxy.com/\`（实测最稳）或 \`https://ghproxy.net/\`。"
 echo ""
+echo "排查残留进程和旧锁文件（只读脚本，不改任何东西）："
+echo ""
+echo '```sh'
+echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \\"
+echo "  -o /tmp/ct-stale-lock-check.sh"
+echo "sh /tmp/ct-stale-lock-check.sh"
+echo '```'
+echo ""
 
 echo "| 项目 | 值 |"
 echo "|---|---|"

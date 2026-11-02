@@ -123,6 +123,23 @@ After upgrading, confirm two things:
 2. If `LOCK_PREFIX=...` is still left in your start command, remove it. If it stays, the script treats it as a breaking change,
    aborts immediately and tells you so (exit code `3`) instead of silently ignoring it.
 
+### Investigating leftover processes and old lock files
+
+If an old version keeps printing `SKIP 同一更新目标（xxx）的另一个任务仍在执行`, it means a process from a previous round that did not exit cleanly is still holding the lock.
+The repository ships a **read-only** investigation script: it only lists the problems (old lock files, processes holding the locks, leftover pull processes, leftover transaction directories),
+changes nothing and kills nothing, and ends with copy-pasteable cleanup commands for you to run after confirming.
+
+```sh
+curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+  -o /tmp/ct-stale-lock-check.sh
+sh /tmp/ct-stale-lock-check.sh
+```
+
+> Run it **in the environment that runs the updates** (with DPanel that means inside the dpanel container), because it inspects that machine's `/proc`:
+> `docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh`.
+>
+> See [Advanced usage](docs/advanced-usage.en.md#7-investigating-leftover-processes-and-old-lock-files) for the full cleanup walkthrough.
+
 ### Using latest is also safe
 
 A new upstream release lands on your machine directly. If the new version breaks your invocation (for example a flag was renamed or removed), the script does not silently ignore it — it **stops immediately**, exits with code `3`, and writes three things into the log: which spelling no longer works, what it became starting from which version, and how to fix it.

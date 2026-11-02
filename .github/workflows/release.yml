@@ -15,6 +15,7 @@ on:
       - container-autoupdate.sh
       - ct-bootstrap.sh
       - scripts/gen-release-notes.sh
+      - scripts/ct-stale-lock-check.sh
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -45,8 +46,9 @@ jobs:
           set -eu
           test -f container-autoupdate.sh || { echo "::error::找不到 container-autoupdate.sh"; exit 1; }
           test -f ct-bootstrap.sh || { echo "::error::找不到 ct-bootstrap.sh"; exit 1; }
+          test -f scripts/ct-stale-lock-check.sh || { echo "::error::找不到 scripts/ct-stale-lock-check.sh"; exit 1; }
 
-          for f in container-autoupdate.sh ct-bootstrap.sh; do
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             if ! sh -n "$f"; then
               echo "::error::$f 语法检查失败（sh -n）"
               exit 1
@@ -170,11 +172,12 @@ jobs:
         run: |
           set -eu
           TAG="v$VERSION"
-          # 把脚本本身和引导器都作为 Release 资产上传，
-          # 这样 releases/latest/download/{container-autoupdate.sh,ct-bootstrap.sh} 永远指向最新发布版
+          # 把脚本本身、引导器和排查脚本都作为 Release 资产上传，
+          # 这样 releases/latest/download/{container-autoupdate.sh,ct-bootstrap.sh,ct-stale-lock-check.sh} 永远指向最新发布版
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file release-notes.md \
             container-autoupdate.sh \
-            ct-bootstrap.sh
+            ct-bootstrap.sh \
+            scripts/ct-stale-lock-check.sh
           echo "已发布 Release $TAG"

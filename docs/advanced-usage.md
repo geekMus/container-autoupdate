@@ -234,7 +234,60 @@ wait
 
 如果想让多份脚本副本完全独立（各自的状态目录），给它们不同的 `--state-dir`。
 
-## 7. 常见问题
+## 7. 排查残留进程与旧锁文件
+
+旧版本（用互斥锁的那些）有时会反复打出：
+
+```sh
+[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
+```
+
+而且**每一轮一模一样、什么都没更新**。原因不是真的有别的任务在跑，而是**上一轮有个子进程没退干净**，
+它替主脚本一直占着锁（详见 [工作方式与安全边界](how-it-works.md)）。
+
+仓库里带了一个**只读**排查脚本 `scripts/ct-stale-lock-check.sh`：它不改任何东西、不杀任何进程，
+只把下面这些列出来，最后给出可复制的清理命令：
+
+1. 旧的锁文件（当前版本已不使用锁，它们只是残留垃圾）；
+2. 谁正开着这些锁文件（PID / PPID / fd / 命令行）；
+3. 残留的镜像拉取进程；
+4. 状态目录里残留的事务目录，并标注哪些能删、哪些要留。
+
+### 怎么用
+
+```sh
+curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+  -o /tmp/ct-stale-lock-check.sh
+sh /tmp/ct-stale-lock-check.sh
+```
+
+**要在跑更新的那个环境里跑**：脚本看的是那台机器的 `/proc`。用 DPanel 的话就是容器内部：
+
+```sh
+docker cp /tmp/ct-stale-lock-check.sh dpanel:/tmp/ct-stale-lock-check.sh
+docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh
+```
+
+可选环境变量：`CT_LOCK_PREFIX`（锁文件前缀，默认 `/tmp/.container-autoupdate`）、
+`CT_STATE_ROOT`（状态目录，默认 `/tmp/.container-autoupdate`）。
+
+### 看到结果之后
+
+| 看到的东西 | 能不能删 | 说明 |
+|---|---|---|
+| 旧的 `.lock` 文件 | **可以删** | 当前版本不再使用锁，留着只是垃圾。删掉不影响任何功能。 |
+| 占着锁的进程 | **先确认再杀** | 先看它的命令行：`cat /proc/<PID>/cmdline`（NUL 分隔）。确认是没退干净的残留再 `kill <PID>`。 |
+| 残留的拉取进程（`images/create`） | **可以杀** | 拉取早就该结束了，活着的那个是残留，杀掉即可。 |
+| `compat/` 目录 | **可以不删** | 只是「每个目标上次跑过的版本」的记录，删掉只会在下次升级时多提示一次。 |
+| 事务目录（`compose-*` / `plain-*`） | **先看日志再删** | 说明那一轮出过问题。里面的 `pull.log` / `create.json` 是「为什么失败」的唯一证据。 |
+
+### 真正的解法
+
+清垃圾只是治标。**根治是升级到不再使用互斥锁的版本**——新版本没有锁，也就不存在「被残留进程占住」这回事。
+升级后确认两件事：同一个目标只挂一个 DPanel 计划任务；启动命令里没有残留的 `LOCK_PREFIX=...`
+（有的话脚本会按破坏性变更中止，退出码 `3`）。
+
+## 8. 常见问题
 
 **Q：日志说「已是最新」，但明明上游发版了。**
 A：脚本比对的是**远端 digest** 与**容器实际运行的镜像**。上游发了版但 tag 内容没变（很少见）、或者你用的是固定 digest 引用，都会这样。先用 `--dry-run` 看它认到的远端 digest 是什么。

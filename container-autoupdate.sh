@@ -52,7 +52,7 @@ COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到�
 PULL_RETRIES="${PULL_RETRIES:-1}"  # 拉取失败后的重试次数（0 = 不重试）
 
 START=$(date +%s)
-VERSION="1.1.0"
+VERSION="1.1.1"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"

@@ -23,7 +23,7 @@ jobs:
       - name: 语法检查
         run: |
           set -eu
-          for f in container-autoupdate.sh ct-bootstrap.sh; do
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             if ! sh -n "$f"; then
               echo "::error::$f 语法检查失败（sh -n）"
               exit 1
@@ -34,7 +34,7 @@ jobs:
       - name: 行尾检查
         run: |
           set -eu
-          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh; do
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             if grep -qU $'\r' "$f"; then
               echo "::error::$f 含 CRLF 行尾，请转换为 LF"
               exit 1
@@ -56,7 +56,7 @@ jobs:
         run: |
           set -eu
           # git 里应记录为 100755；记录成 100644 时用户下载后必须自己 chmod +x
-          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh; do
+          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             MODE=$(git ls-files -s "$f" | awk '{print $1}')
             if [ "$MODE" != "100755" ]; then
               echo "::error::$f 在 git 中的模式是 $MODE，应为 100755（可执行）"
