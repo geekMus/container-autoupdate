@@ -1,5 +1,7 @@
 # 全部参数与环境变量
 
+> 语言：[中文](parameters.md) | [English](parameters.en.md)
+
 > 脚本是给 **DPanel 计划任务**用的：跑一轮就结束，频率与并发交给 DPanel。
 > 同一目标只挂一个计划任务即可（脚本内部不再加互斥锁）。
 > 手动运行也允许，那只是单次运行；不建议再套 cron / systemd timer。

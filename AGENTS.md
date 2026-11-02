@@ -281,6 +281,40 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
 - **固定版本模式（`--ct-version` / `CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。引导器自己的开关用 `--ct-*`（命令行优先于同名 `CT_*` 环境变量），其余参数原样透传给主脚本。
 - **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh` 和 `ct-bootstrap.sh` 两个资产；少传一个，`releases/latest/download/ct-bootstrap.sh` 就是 404。
 
+### 8.6 用户文档必须中英文同步
+
+用户文档有**两个版本**：中文（默认）与英文副本。
+
+| 中文（默认） | 英文副本 |
+|---|---|
+| `README.md` | `README.en.md` |
+| `docs/how-it-works.md` | `docs/how-it-works.en.md` |
+| `docs/parameters.md` | `docs/parameters.en.md` |
+| `docs/advanced-usage.md` | `docs/advanced-usage.en.md` |
+| `docs/releasing.md` | `docs/releasing.en.md` |
+
+MUST
+
+- **改了一份就必须同步另一份**，包括内容改动与新增章节。中文是默认入口，英文是副本，两者内容必须一致。
+- **每份文档的 H1 正下方放语言切换条**，链接到本文件与另一语言版本：
+  中文版 `> 语言：[中文](README.md) | [English](README.en.md)`；
+  英文版 `> Language: [English](README.en.md) | [中文](README.md)`。
+- **英文文档里的本地链接必须指向英文文件**，锚点要按英文标题重算（GitHub 规则：小写、空格→连字符、去掉反引号/括号/点）。链接指向的文件不存在、锚点对不上标题 ⇒ 文档坏掉。
+- **代码标识符不翻译**：参数名、环境变量名、文件名、tag、镜像名、`BREAKING_TABLE`、`VERSION` 等一律原样，用反引号包起来。
+- **脚本真实输出的中文日志原样保留**，在代码块末尾补 `→` 开头的英文对照行；不要逐行夹杂英文。
+- **术语必须一致**（同一概念在所有英文文档里用同一个词）：DPanel 计划任务 → DPanel scheduled task；引导器 → bootstrapper；互斥锁 → mutex lock；健康门禁 → health gate；回滚点 → rollback point；演练 → dry run；退出码 → exit code；破坏性变更 → breaking change；迁移方式 → migration path；跨版本提示 → cross-version notice。
+- **英文文档里不许残留中文**，除了：脚本日志原文、代码标识符、切换条里的「中文」二字。
+  - 脚本日志原文在英文文档里也**要用反引号包起来**（正文中引用日志文本时），免得被当成未翻译的中文残留。
+- **一致性由 `scripts/check-docs.py` 把关**（CI 的「文档检查」步骤会跑它）：语言切换条、本地链接与锚点、表格结构、CRLF、中英标题数量与层级。
+  - 改了用户文档 → 本地先跑 `python3 scripts/check-docs.py .`，必须 0 问题再提交。
+  - 脚本的检查是**底线**，不是全部：它查不出「翻译得不准」「术语不一致」，那部分靠人工。
+
+NEVER
+
+- **不许翻译 `AGENTS.md`**（维护者内部规则，保持中文）。
+- **不许翻译脚本里的注释**（`container-autoupdate.sh` / `ct-bootstrap.sh` 的注释一律中文，本次只做文档）。
+- **不许只在英文版里加新内容**——中文版缺了内容 = 面向中文用户的文档残缺。
+
 ---
 
 ## 9. 提交与发版
@@ -368,3 +402,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
 - [ ] 改了 `ct-bootstrap.sh` → 引导器 10 个场景（固定版本 / 命中缓存 / 有新版本 / 网络故障有缓存 / 无缓存 / 坏包 / 参数透传 / 缓存裁剪 / 强制更新）已复跑
 - [ ] 推送后做了 §9.3 的三方 sha1 核对
+- [ ] 改了用户文档 → 对应英文副本已同步（§8.6）
+- [ ] 每份用户文档的 H1 正下方有语言切换条，中英互指
+- [ ] 英文文档里的本地链接指向英文文件，且锚点与英文标题对得上（逐条核对过）
+- [ ] 英文文档里除脚本日志原文/代码标识符/「中文」二字外没有残留中文

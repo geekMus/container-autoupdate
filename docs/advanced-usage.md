@@ -1,5 +1,7 @@
 # 进阶用法
 
+> 语言：[中文](advanced-usage.md) | [English](advanced-usage.en.md)
+
 > 基础用法看 [README](../README.md)。这里讲的是**下载方式、退出码、计划任务细节，以及几个容易踩的坑**。
 >
 > 脚本是给 **DPanel 计划任务**用的：跑一轮就结束，频率与并发交给 DPanel。

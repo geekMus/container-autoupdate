@@ -1,5 +1,7 @@
 # 发版流程（维护者用）
 
+> 语言：[中文](releasing.md) | [English](releasing.en.md)
+
 > 给使用者的说明看 [README](../README.md)。这里只讲**怎么发一个新版本**。
 
 ## 一句话

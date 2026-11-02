@@ -1,5 +1,7 @@
 # container-autoupdate
 
+> 语言：[中文](README.md) | [English](README.en.md)
+
 **DPanel 定时任务**用的容器自动更新脚本，单文件。
 
 跑一次 = 检查一次：有新版本就更新并验证，没有就立刻退出。**脚本不含调度**，频率、启停、并发全交给 DPanel 的「计划任务」。

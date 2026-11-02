@@ -75,6 +75,14 @@ jobs:
           CT_CACHE_DIR=/tmp/ct-ci CT_VERSION=$(grep -m1 '^VERSION=' container-autoupdate.sh | cut -d'"' -f2) \
             sh ct-bootstrap.sh --version || echo "::warning::引导器端到端验证跳过（网络不可达）"
 
+      - name: 文档检查
+        run: |
+          set -eu
+          # 中英文双版本文档必须同步：语言切换条、本地链接与锚点、表格结构、CRLF。
+          if [ -f scripts/check-docs.py ]; then
+            python3 scripts/check-docs.py .
+          fi
+
       - name: shellcheck（仅提示，不阻断）
         continue-on-error: true
         run: |
