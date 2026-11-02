@@ -1,6 +1,10 @@
 # 进阶用法
 
-> 基础用法看 [README](../README.md)。这里讲的是**下载方式、退出码、定时器细节，以及几个容易踩的坑**。
+> 基础用法看 [README](../README.md)。这里讲的是**下载方式、退出码、计划任务细节，以及几个容易踩的坑**。
+>
+> 脚本是给 **DPanel 计划任务**用的：跑一轮就结束，频率与并发交给 DPanel。
+> 同一目标只挂一个计划任务即可（脚本内部没有互斥锁）。手动跑是单次运行，
+> 不建议再套 cron / systemd timer。
 
 ## 1. 怎么把脚本弄到机器上
 
@@ -82,7 +86,7 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 >
 > **但它有一个副作用**：如果脚本在读完输入之前就退出了（`--version`、`--help`、参数错误这类秒退场景），`curl` 会拿到 `curl: (23) Failure writing output to destination`，整条管道于是返回 `23`——即使脚本本身是成功的。实测：`--version` 带 pipefail 返回 `23`，`--compose ... --dry-run` 跑到末尾返回 `0`。
 >
-> 所以 **pipefail 只适合固定参数、会跑完整个流程的场景**（比如写死在 cron 里的 `--compose myapp`）。要用 `--version`/`--help` 或参数可能出错时，改用上面的临时文件写法。
+> 所以 **pipefail 只适合固定参数、会跑完整个流程的场景**（比如写死在 DPanel 计划任务里的 `--compose myapp`）。要用 `--version`/`--help` 或参数可能出错时，改用上面的临时文件写法。
 
 ## 2. 版本：默认跟最新发布版，也可以锁死
 
@@ -134,10 +138,15 @@ sh container-autoupdate.sh --version
 [2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.9.0)升级上来，v1.0.0 引入了破坏性变更
 [2026-11-01 03:52:03]      变更：默认保留 2 份回滚副本
 [2026-11-01 03:52:03]      应对：如只想保留 1 份，加 --keep 1
-[2026-11-01 03:52:03]      本次仍会继续执行。若你依赖旧行为，请加 --compat 0.9.0 或改用固定版本
+[2026-11-01 03:52:03]      本次仍会继续执行。两条路选一条：
+[2026-11-01 03:52:03]        1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat 1.0.0）
+[2026-11-01 03:52:03]        2) 想继续用旧行为，把下载地址固定到 v0.9.0 那个 tag
 ```
 
 它**不中止**（因为不确定你是否依赖旧行为），只提示。同一版本不会重复提示；降级也不会提示。
+
+> 注意别照着提示去加 `--compat 0.9.0`：那个值会让下面的 `--compat` 机制**硬停**（退出码 `3`），
+> 等于每次跑都停。想要「先停住」应该写 `--compat 1.0.0`（= 当前脚本版本）。
 
 **② `--compat <版本>`。** 你可以声明「我只验证到某个版本」。如果脚本版本更高、且中间有破坏性变更，它会硬停（退出码 `3`）而不是冒险执行：
 
@@ -185,50 +194,33 @@ container-autoupdate.sh --compose myapp --compat 0.9.0
 
 `2` 是唯一需要你动手抢救的情况。脚本会保留现场（新容器、旧容器、tag 状态），不要急着重启机器或 `docker system prune`。
 
-## 5. 定时器细节
+## 5. 计划任务细节
 
-### DPanel 计划任务
+### DPanel 计划任务（推荐）
 
 - 脚本框里可以直接写多行 shell，`curl | sh` 也可以。
 - **执行超时设 ≥ 600 秒**。脚本自身硬上限是 540 秒（`T_HARD`），留出余量。
 - DPanel 在 UI 里编辑任务时，**会把你手填的「执行超时」和「EntryShell」两个字段丢掉**（这是 DPanel 的已知行为）。改完排期后回来确认一下超时还在。
 - 想给脚本传环境变量，用任务面板的 Environment 项（DPanel 原生支持，执行时会和 Docker 环境合并）。
-- 多个任务可以并存，各自填不同的目标。**同一目标不要同时挂两个任务**（会互相抢锁，第二个会 `SKIP`，不危险但浪费一轮）。
+- 多个任务可以并存，各自填不同的目标。**同一目标只挂一个计划任务**（脚本内部没有互斥锁，两个任务同时跑会互相踩）。
 
-### cron
+### 手动跑一轮
 
 ```sh
-0 4 * * * /usr/local/bin/container-autoupdate.sh --compose myapp >> /var/log/ct-update.log 2>&1
+container-autoupdate.sh --compose myapp
 ```
 
-- cron 的 `PATH` 很窄，脚本会自己找 `docker`，但如果 docker 装在非常规位置，先确认 `which docker`。
-- 要错开多个目标，直接写不同时间点即可；**同一目标不要写两条**。
-- 日志建议追加到文件而不是丢给 `MAILTO`，出问题好回溯。
+跑完就结束，适合「现在查一下有没有新版」。
 
-### systemd timer
+### 关于 cron / systemd timer
 
-```ini
-# /etc/systemd/system/ct-update.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/container-autoupdate.sh --compose myapp
-```
+**不推荐**用 cron 或 systemd timer 定时跑这个脚本：脚本内部不再加互斥锁，同一目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务。
 
-```ini
-# /etc/systemd/system/ct-update.timer
-[Timer]
-OnCalendar=daily
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-`Persistent=true` 的好处：机器关机错过了时间点，开机后会补跑一次。
+（如果你确实要用 cron，请自行保证同一目标同一时刻只有一个实例在跑，例如在 crontab 表达式里错开时间点。）
 
 ## 6. 同一台机器管多个目标
 
-脚本按**更新目标**加互斥锁（不是全局锁），所以不同目标可以并行：
+不同目标互不影响，可以同时跑：
 
 ```sh
 container-autoupdate.sh --compose app1 &
@@ -236,9 +228,9 @@ container-autoupdate.sh --compose app2 &
 wait
 ```
 
-同一目标的两个进程会串行：后到的那个打印 `SKIP 同一更新目标…的另一个任务仍在执行` 并退出 0。
+**同一目标**不要同时跑两个（脚本不再加锁挡你），否则两轮会互相踩。等前一轮结束再跑下一轮。
 
-如果想让多份脚本副本完全独立（各自的状态目录和锁），给它们不同的 `--state-dir` 和 `LOCK_PREFIX`。
+如果想让多份脚本副本完全独立（各自的状态目录），给它们不同的 `--state-dir`。
 
 ## 7. 常见问题
 

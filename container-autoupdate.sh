@@ -1,8 +1,9 @@
 #!/bin/sh
 # ===========================================================================
-# 通用容器自动更新 —— 单轮逻辑，可放进任意定时器（cron / systemd timer /
-# DPanel 计划任务 / CI）。脚本本身不含更新频率逻辑。当前版本见 VERSION 字段，
-# 用 --version 查看。
+# DPanel 定时任务自动更新脚本 —— 一轮更新逻辑，交给 DPanel 的「计划任务」
+# 按固定周期触发。脚本本身不含更新频率逻辑：频率、启停、并发全归 DPanel 管。
+# 手动运行也允许，但那是「跑一轮就结束」的单次更新，不建议再套 cron / systemd timer。
+# 当前版本见 VERSION 字段，用 --version 查看。
 #
 # 目标二选一：一个 Compose 项目名，或一个容器名。可以用命令行参数、
 # 环境变量或文件顶部配置区指定，三者等价，优先级：命令行 > 环境变量 > 配置区。
@@ -16,7 +17,8 @@
 #     创建后、启动前先做完整规格校验；按容器 ID 操作，失败可恢复。
 #   · AutoRemove、container:* 网络及其依赖、VolumesFrom、非常规挂载/网络、
 #     Compose 管理的容器等不能安全处理的形态，跳过并说明原因。
-#   · 拉取只 kill 本轮 curl PID；互斥锁按「更新目标」隔离（不同目标可并行，同一目标串行）；
+#   · 拉取只 kill 本轮 curl PID（curl 自带 --max-time，不会活得比脚本久）；
+#     并发由 DPanel 计划任务保证（同一目标不要同时挂两个计划任务）；
 #     坏版本按钉住时间计算 TTL。
 #
 # 注意：容器回滚只能恢复容器与镜像，不能撤销新程序已经做过的数据迁移。
@@ -44,13 +46,12 @@ DOCKER_SOCK="${DOCKER_SOCK:-}"     # 显式指定 Docker socket；留空则用 D
 SOCK=""
 API_HOST="http://localhost"
 API="http://localhost/v1.47"
-LOCK_PREFIX="${LOCK_PREFIX:-/tmp/.container-autoupdate}" # 互斥锁前缀，实际文件名按更新目标派生
 STATE_ROOT="${STATE_ROOT:-/tmp/.container-autoupdate}"
 BAD_TTL_DAYS="${BAD_TTL_DAYS:-7}"
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="0.4.0"
+VERSION="1.0.0"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -96,6 +97,8 @@ json_quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's|\\|\\\\|g; s|"|\\"|g')
 #   1.0.0|env|UPD_TARGET|UPD_COMPOSE / UPD_CONTAINER|1.0.0 起把 UPD_TARGET 拆成两个变量
 #   1.0.0|behavior|默认只保留 1 份回滚副本|--keep <份数>|1.0.0 起默认保留 2 份
 BREAKING_TABLE='
+1.0.0|env|LOCK_PREFIX|删除这个环境变量|1.0.0 起脚本不再使用互斥锁，并发由 DPanel 计划任务保证
+1.0.0|behavior|同一更新目标由脚本内的互斥锁串行|同一目标只挂一个 DPanel 计划任务|1.0.0 起移除脚本内的互斥锁：v0.4.0 的锁会被残留的子进程长期占住，导致之后每一轮都跳过
 '
 # ==================== 登记表结束 ===========================================
 
@@ -155,10 +158,19 @@ compat_removed_env() {
     [ -n "$_v" ] || continue
     eval "_cur=\${$_t:-}"
     [ -n "$_cur" ] || continue
-    log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
-    log "    从 v$_v 起改为：$_n"
-    log "    原因：$_d"
-    log "    迁移方式：删掉 $_t，改用 $_n"
+    # 「删除这个环境变量」是一个特殊的新写法：表示没有替代写法。
+    # 这时不要打印「改为 X / 改用 X」那种绕口的句子。
+    if [ "$_n" = "删除这个环境变量" ]; then
+      log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
+      log "    从 v$_v 起：$_t 已移除"
+      log "    原因：$_d"
+      log "    迁移方式：删掉 $_t 即可，不需要任何替代设置"
+    else
+      log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
+      log "    从 v$_v 起改为：$_n"
+      log "    原因：$_d"
+      log "    迁移方式：删掉 $_t，改用 $_n"
+    fi
     log "    或者把下载地址固定到旧版本（见 README「版本与升级」）"
     log "    本次未做任何改动，退出码 3"
     exit 3
@@ -245,7 +257,12 @@ compat_notice() {
         log "WARN 你从 $VERSION 之前的版本(${_prev})升级上来，v$_v 引入了破坏性变更"
         log "     变更：$_d"
         log "     应对：$_n"
-        log "     本次仍会继续执行。若你依赖旧行为，请加 --compat $_prev 或改用固定版本"
+        # 注意：不能建议「加 --compat $_prev」——那会让 compat_gate 判定
+        # 「存在比声明版本更新的破坏性变更」而硬停 rc=3，等于把用户锁死在
+        # 升级后的第一轮。正确做法只有两条：接受新行为，或把下载地址固定回旧版。
+        log "     本次仍会继续执行。两条路选一条："
+        log "       1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat $VERSION）"
+        log "       2) 想继续用旧行为，把下载地址固定到 v$_prev 那个 tag"
       done <<EOF
 $_rows
 EOF
@@ -257,7 +274,10 @@ EOF
 
 usage() {
   cat <<'USAGE'
-通用容器自动更新脚本
+DPanel 定时任务自动更新脚本
+
+跑一轮更新就结束，触发频率交给 DPanel 的「计划任务」配置。
+同一目标只挂一个计划任务即可（脚本内部不再加锁，并发由 DPanel 保证）。
 
 用法：
   container-autoupdate.sh --compose <项目名>     更新一个 Compose 项目
@@ -287,7 +307,6 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   DOCKER_SOCK                   同 --docker-sock
   DOCKER_HOST                   支持 unix:///path 与 tcp://host:port
   STATE_ROOT                    同 --state-dir
-  LOCK_PREFIX                   互斥锁文件名前缀（默认 /tmp/.container-autoupdate）
   DRY_RUN=1                     同 --dry-run
   BAD_TTL_DAYS                  同 --bad-ttl-days
   COMPAT_UNTIL                  同 --compat
@@ -302,7 +321,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   2  回滚本身失败，需要人工介入（现场保留在 --state-dir）
   3  检测到破坏性变更，你的调用方式已失效（本次未做任何改动，日志里有迁移说明）
   130  被 Ctrl-C（SIGINT）中断
-  143  被 SIGTERM / SIGHUP 中断（定时器超时常见）
+  143  被 SIGTERM / SIGHUP 中断（计划任务执行超时常见）
 
 关于版本与兼容：
   脚本每次运行都会把版本号写进日志（首行 `container-autoupdate v<x.y.z> 启动`）。
@@ -311,8 +330,12 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   （见 README「版本与升级」）。
 
 示例：
-  # cron 每小时检查一次
-  0 * * * * /usr/local/bin/container-autoupdate.sh --compose myapp >> /var/log/ct-update.log 2>&1
+  # DPanel 计划任务里跑（推荐）：把下面这条命令填进计划任务的「命令」，
+  # 由 DPanel 按你设定的周期触发。
+  container-autoupdate.sh --compose myapp
+
+  # 手动跑一轮（单次更新，跑完就结束；不建议再套 cron / systemd timer）
+  container-autoupdate.sh --compose myapp
 
   # 直接跑远程脚本，跟随最新发布版（地址不含版本号，粘贴即用）
   curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
@@ -389,12 +412,12 @@ dcurl() {
 
 check_deps() {
   _missing=""
-  for _b in docker curl flock timeout sed awk grep; do
+  for _b in docker curl timeout sed awk grep; do
     command -v "$_b" >/dev/null 2>&1 || _missing="$_missing $_b"
   done
   if [ -n "$_missing" ]; then
     echo "ERR 缺少依赖命令：$_missing" >&2
-    echo "    需要 docker / curl / flock / timeout 以及 busybox 或 coreutils 基础工具" >&2
+    echo "    需要 docker / curl / timeout 以及 busybox 或 coreutils 基础工具" >&2
     exit 1
   fi
   if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
@@ -438,21 +461,6 @@ compat_state_dir() {
     printf '%s/compat/plain-%s' "$STATE_ROOT" "$(safe_key "$CONTAINER_NAME")"
   else
     printf '%s/compat' "$STATE_ROOT"
-  fi
-}
-
-# 互斥锁按更新目标派生：不同目标各用一把锁（可并行），同一目标才串行。
-acquire_lock() {
-  if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
-    _lt="compose-$(safe_key "$COMPOSE_NAME")"
-  else
-    _lt="container-$(safe_key "$CONTAINER_NAME")"
-  fi
-  LOCK="${LOCK_PREFIX}.${_lt}.lock"
-  exec 9>"$LOCK"
-  if ! flock -n 9; then
-    log "SKIP 同一更新目标（$_lt）的另一个任务仍在执行，本轮跳过"
-    exit 0
   fi
 }
 
@@ -594,9 +602,6 @@ pull_stream() {
   PULL_DIGEST=""; PULL_MSG=""
   _enc=$(printf '%s' "$_repo" | sed 's|/|%2F|g')
   : > "$_log"
-  dcurl -sN -X POST \
-    "$API/images/create?fromImage=${_enc}&tag=${_tag}" >> "$_log" 2>&1 &
-  _pid=$!
   _seen=0; _seen_at=$(now)
   _cap=$(( $(now) + T_PULL_MAX ))
   _hard=$(( START + T_HARD - (T_UP + T_HEALTH + T_ROLLBACK + 15) ))
@@ -604,6 +609,19 @@ pull_stream() {
   if [ -n "$_dl" ]; then
     case "$_dl" in ''|*[!0-9]*) ;; *) [ "$_dl" -lt "$_cap" ] && _cap=$_dl ;; esac
   fi
+  # 预算要先算出来再起 curl：curl 必须自带 --max-time，
+  # 否则脚本被 kill 时它还活着（后台函数的 $! 只是那个子 shell 的 PID，
+  # kill -9 杀不到它真正 fork 出来的 curl），残留进程会一直占着资源。
+  _mt=$(( _cap - $(now) ))
+  [ "$_mt" -lt 1 ] && _mt=1
+  if [ -n "$SOCK" ]; then
+    curl --unix-socket "$SOCK" -sN --max-time "$_mt" -X POST \
+      "$API/images/create?fromImage=${_enc}&tag=${_tag}" >> "$_log" 2>&1 &
+  else
+    curl -sN --max-time "$_mt" -X POST \
+      "$API/images/create?fromImage=${_enc}&tag=${_tag}" >> "$_log" 2>&1 &
+  fi
+  _pid=$!
   while kill -0 "$_pid" 2>/dev/null; do
     sleep 5
     _t=$(now); _sz=$(wc -c < "$_log" 2>/dev/null | tr -d ' ')
@@ -1184,7 +1202,9 @@ proj_containers() {
 }
 
 proj_images() {
-  (cd "$C_DIR" && compose_env && docker compose config --images 2>/dev/null) | awk '!seen[$0]++'
+  # 必须带超时：compose config 卡住时会把整轮的时间预算耗光，
+  # 计划任务会被拖到超时被杀，下一轮又接着卡。
+  (cd "$C_DIR" && compose_env && timeout -s KILL "$T_INSPECT" docker compose config --images 2>/dev/null) | awk '!seen[$0]++'
 }
 
 local_imgid_for() {
@@ -1422,7 +1442,6 @@ EOF
 if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
   case "$COMPOSE_NAME" in *[!A-Za-z0-9_.-]*) log "ERR Compose 名不合法"; exit 1 ;; esac
   check_deps
-  acquire_lock
   compat_notice "$(compat_state_dir)"
   resolve_compose || exit 1
   [ -n "$C_DIR" ] || {
@@ -1433,7 +1452,6 @@ if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
   compose_update
 elif [ -z "$COMPOSE_NAME" ] && [ -n "$CONTAINER_NAME" ]; then
   check_deps
-  acquire_lock
   compat_notice "$(compat_state_dir)"
   api_negotiate || exit 1
   plain_update

@@ -6,7 +6,7 @@
 #   固定版本（--ct-version / CT_VERSION）：本地有就直接跑，完全不联网。
 #   latest（默认）                       ：先探测远端 tag；本地同版本则直接复用，不同才下载并缓存。
 #
-# 用法（放进 DPanel 计划任务 / cron）：
+# 用法（放进 DPanel 计划任务）：
 #   sh -c 'curl -fsSL <本文件地址> | sh -s -- --compose myapp'
 # 或者把本文件落地一次，之后定时任务直接跑本地文件（更快、更稳）：
 #   /usr/local/bin/ct-bootstrap.sh --compose myapp

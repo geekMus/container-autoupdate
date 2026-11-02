@@ -1,5 +1,9 @@
 # 全部参数与环境变量
 
+> 脚本是给 **DPanel 计划任务**用的：跑一轮就结束，频率与并发交给 DPanel。
+> 同一目标只挂一个计划任务即可（脚本内部不再加互斥锁）。
+> 手动运行也允许，那只是单次运行；不建议再套 cron / systemd timer。
+
 ## 指定目标
 
 两种目标**必须且只能指定一个**。
@@ -33,8 +37,7 @@ CONTAINER_NAME=""
 | `docker` | 一切操作的前提 | — |
 | `docker buildx` | **查远端 digest 的唯一手段**（`docker buildx imagetools inspect`） | 精简安装的 Docker、只装了 `docker.io` 包的系统。缺它时脚本在动手前就报错——否则每轮都会误报「无法获取远端 digest」，把人引向网络问题 |
 | `curl` | 拉取镜像走 Docker Engine API 流（判断进度停滞）、查远端 digest | 极简镜像 |
-| `flock` | 按目标隔离的互斥锁，防止两轮任务互相踩 | **Alpine 默认有；Debian slim 可能没有**（`util-linux` 包） |
-| `timeout` | 每个外部调用都有超时，防止整轮被外部定时器 SIGKILL | busybox 有；某些精简镜像无 |
+| `timeout` | 每个外部调用都有超时，防止整轮被计划任务的执行超时 SIGKILL | busybox 有；某些精简镜像无 |
 | `sed` `awk` `grep` | 解析 `docker inspect` 输出 | busybox 全套足够，不需要 GNU 版 |
 
 Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `docker-compose`），
@@ -61,7 +64,7 @@ Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `doc
 | `--ct-help` | — | — | 显示引导器帮助。 |
 
 ```sh
-# 命令行（推荐写进 crontab / DPanel 脚本框）
+# 命令行（推荐写进 DPanel 计划任务的脚本框）
 ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
 
 # 环境变量（兼容旧写法）
@@ -99,7 +102,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `--state-dir <目录>` | `/tmp/.container-autoupdate` | `/tmp` 重启会被清空、而你希望中断后跨重启也能恢复；或 `/tmp` 空间紧张；或想让多个用户的任务互不干扰 |
 | `--bad-ttl-days <天>` | `7` | 坏版本钉住期。某个新版本反复起不来、你想更快重试就调小（如 `1`），想更保守就调大 |
 | `--compat <版本>` | 关 | **声明「我只验证到某个版本」**。脚本若比它新、且中间有破坏性变更，就硬停而不是冒险执行（退出码 `3`）。升级脚本后行为变了、你想先稳住现状时用它 |
-| `--dry-run` | 关 | 只检查不改动：不动容器、不动镜像标签、不清理旧镜像（仅写状态目录与锁文件）。**首次接入**、排查「为什么没更新」、确认某容器会被怎么处理 |
+| `--dry-run` | 关 | 只检查不改动：不动容器、不动镜像标签、不清理旧镜像（仅写状态目录）。**首次接入**、排查「为什么没更新」、确认某容器会被怎么处理 |
 | `-h` / `--help` | — | 显示帮助 |
 | `-V` / `--version` | — | 显示版本号 |
 
@@ -107,7 +110,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 
 | 变量 | 对应参数 | 什么时候需要它 |
 |---|---|---|
-| `UPD_COMPOSE` / `UPD_CONTAINER` | `--compose` / `--container` | DPanel 的 Environment 面板、systemd 的 `Environment=`、或一条命令服务多个目标 |
+| `UPD_COMPOSE` / `UPD_CONTAINER` | `--compose` / `--container` | DPanel 的 Environment 面板、或一条命令服务多个目标 |
 | `COMPOSE_DIR` | `--compose-dir` | 同上 |
 | `COMPOSE_BASE` | — | Compose 目录的**回退根路径**，脚本会尝试 `$COMPOSE_BASE/<项目名>`。只在自建环境里用，DPanel 用户不需要 |
 | `DOCKER_SOCK` | `--docker-sock` | 同上 |
@@ -116,20 +119,19 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `BAD_TTL_DAYS` | `--bad-ttl-days` | 同上 |
 | `COMPAT_UNTIL` | `--compat` | 同上 |
 | `STATE_ROOT` | `--state-dir` | 同上 |
-| `LOCK_PREFIX` | `/tmp/.container-autoupdate` | 互斥锁文件前缀。同一台机器跑多份脚本副本、想让它们各管各的锁时改它 |
 
 ## 超时参数
 
-**一般不用改。** 改之前必须确认：脚本自身硬上限（`T_HARD`）要小于外部定时器的超时。
+**一般不用改。** 改之前必须确认：脚本自身硬上限（`T_HARD`）要小于 DPanel 计划任务的「执行超时」。
 
 | 变量 | 默认 | 含义 | 什么时候调 |
 |---|---|---|---|
-| `T_HARD` | 540 秒 | 全脚本硬上限 | 外部定时器超时更短时，调小 |
+| `T_HARD` | 540 秒 | 全脚本硬上限 | 计划任务超时更短时，调小 |
 | `T_INSPECT` | 30 秒 | 查远端 digest 的超时 | 镜像仓库响应慢 |
 | `T_STALL` | 60 秒 | 拉取**进度停滞**判定：这么久没有新字节就判卡死并 kill | 网络特别慢、健康拉取也会长时间无输出时调大（如 `120`） |
 | `T_PULL_MAX` | 300 秒 | 单次拉取的绝对上限 | 镜像很大 |
 | `T_UP` | 60 秒 | 重建 / 启动容器的超时 | 容器启动慢 |
-| `T_HEALTH` | 120 秒 | 健康门禁**墙钟等待上限**（真正生效的那个） | 应用启动慢（Java 服务常见）时调大，同时加大 `T_HARD` 与外部超时 |
+| `T_HEALTH` | 120 秒 | 健康门禁**墙钟等待上限**（真正生效的那个） | 应用启动慢（Java 服务常见）时调大，同时加大 `T_HARD` 与计划任务「执行超时」 |
 | `HEALTH_TRIES` | `0`（不设） | 健康检查**额外**的轮询次数硬上限；`0` 表示只受 `T_HEALTH` 秒数约束 | 只想限制轮询次数、不想动秒数时用 |
 | `T_ROLLBACK` | 60 秒 | 回滚操作的超时 | 回滚慢 |
 | `PLAIN_BOOT` | 30 秒 | **无 healthcheck** 的容器，启动后观察多久算稳定 | 启动慢的容器调大 |
@@ -143,7 +145,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | 项目容器全停了，脚本说找不到目录 | 加 `--compose-dir /path/to/project` |
 | rootless Docker | 加 `--docker-sock /run/user/1000/docker.sock` |
 | 想先看效果 | 加 `--dry-run` |
-| 应用启动很慢（>120 秒才 healthy） | `T_HEALTH=300`（必要时 `T_HARD=600`），外部定时器超时同步加到 700+ |
+| 应用启动很慢（>120 秒才 healthy） | `T_HEALTH=300`（必要时 `T_HARD=600`），DPanel 计划任务的「执行超时」同步加到 700+ |
 | 镜像仓库经常卡住不返回 | `T_STALL=120`（别调太小，健康拉取也可能长时间静默） |
 | 同一个新版本反复失败，想快点重试 | `--bad-ttl-days 1` |
 | 脚本升到新版、但你想先稳住现有行为 | `--compat <你验证过的版本>`，例如 `--compat 1.2.3` |
@@ -157,4 +159,4 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `2` | 回滚本身失败，**需要人工介入**（现场保留在 `--state-dir`） | 按日志提示手工恢复，再删掉状态目录 |
 | `3` | **检测到破坏性变更**，你的调用方式已失效（本次未做任何改动） | 按日志里的「迁移方式」改命令；或锁版本；或加 `--compat` |
 | `130` | 被 `SIGINT`（Ctrl-C）中断 | 手动跑时按了 Ctrl-C，无妨 |
-| `143` | 被 `SIGTERM` / `SIGHUP` 中断（定时器超时最常见） | 说明外部超时太短，调大定时器或调小 `T_HARD` |
+| `143` | 被 `SIGTERM` / `SIGHUP` 中断（计划任务超时最常见） | 说明「执行超时」太短，调大它或调小 `T_HARD` |

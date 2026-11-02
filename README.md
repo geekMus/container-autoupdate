@@ -1,8 +1,10 @@
 # container-autoupdate
 
-给 Docker 做**容器自动更新**的单文件脚本。
+**DPanel 定时任务**用的容器自动更新脚本，单文件。
 
-跑一次 = 检查一次：有新版本就更新并验证，没有就立刻退出。**脚本不含调度**，频率交给你的定时器。
+跑一次 = 检查一次：有新版本就更新并验证，没有就立刻退出。**脚本不含调度**，频率、启停、并发全交给 DPanel 的「计划任务」。
+
+> 手动运行也允许，那只是「跑一轮就结束」的单次更新。**不建议**再套 cron / systemd timer 之类的时间器——脚本内部不再加互斥锁，同一个目标同时跑两轮会互相踩。
 
 ## 两种模式
 
@@ -34,29 +36,17 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 >
 > **生产环境建议锁版本**：给引导器加 `--ct-version <版本号>`（或设 `CT_VERSION`；版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
 
-### cron
+### 手动跑一轮
 
-用引导器最省事——它负责缓存，你只写一行 crontab：
-
-```sh
-# 每天 04:00 检查并更新
-0 4 * * * /usr/local/bin/ct-bootstrap.sh --compose myapp >> /var/log/ct-update.log 2>&1
-```
-
-先把引导器落地一次（之后它自己维护缓存，不需要再下载）：
+想临时检查一次，直接跑就行（跑完就结束，不会常驻）。引导器第一次要先落地到本地：
 
 ```sh
 curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh
+  -o /tmp/ct-bootstrap.sh
+sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
-想锁版本，在 crontab 里加 `--ct-version`（也可用环境变量 `CT_VERSION`）：
-
-```sh
-0 4 * * * /usr/local/bin/ct-bootstrap.sh --ct-version <版本号> --compose myapp >> /var/log/ct-update.log 2>&1
-```
-
-> 不想用引导器也行：直接把主脚本下载到本地，定时任务跑它即可（见[进阶用法](docs/advanced-usage.md)）。代价是脚本不会自己升级。
+> 不建议用 cron / systemd timer 来定时跑：脚本内部不再加互斥锁，同一个目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务——同一目标只挂一个计划任务即可。
 
 ## 引导器怎么工作
 
@@ -80,7 +70,7 @@ container-autoupdate.sh --container mycontainer      # 更新普通容器
 ```
 
 **第一次接入建议先跑 `--dry-run`**，确认日志里认到的目标和目录是对的，再去掉它。
-（演练只写状态目录和锁文件，不动容器、不动镜像标签、也不清理旧镜像。）
+（演练只写状态目录，不动容器、不动镜像标签、也不清理旧镜像。）
 
 ## 版本与升级
 
@@ -102,6 +92,26 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 ```
 
 锁版本时引导器完全不联网，对生产环境最稳。tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)。
+
+### 升级到「不再带互斥锁」的版本要注意什么
+
+新版本已经**移除了脚本内部的互斥锁**（`LOCK_PREFIX` 环境变量也随之作废）——
+并发改由 DPanel 计划任务保证。
+
+怎么判断你踩没踩到过这个问题：旧版本日志里如果反复出现
+
+```sh
+[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
+```
+
+而且**每一轮都一样、什么都没更新**——那说明旧版的锁被一个没退干净的子进程长期占住了。
+升级之后这个现象自然消失。
+
+升级后请确认两件事：
+
+1. **同一个目标只挂一个 DPanel 计划任务**（脚本不再帮你挡并发了）。
+2. 如果你的启动命令里还留着 `LOCK_PREFIX=...`，删掉它。留着的话脚本会按破坏性变更处理，
+   直接中止并给出提示（退出码 `3`），不会静默忽略。
 
 ### 用 latest 也安全
 
