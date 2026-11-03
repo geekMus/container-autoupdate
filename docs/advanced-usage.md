@@ -5,13 +5,15 @@
 新建计划任务 → 执行周期选每小时（或你要的频率）→ **执行超时设 600 秒** → 脚本框整段填下面这段：
 
 ```sh
-SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+G=https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+SRC='https://gh-proxy.com
+https://ghfast.top
+https://github.com'
 T=/tmp/ct-new.sh
 okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
 for u in $SRC; do
-  curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue
+  case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac
+  curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue
   okfile "$T" && break
 done
 okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
@@ -20,7 +22,9 @@ sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
 - 不要写 `curl … | sh`：管道的退出码是 `sh` 的，下载失败会被吞掉。
-- 想锁版本：把 `SRC` 里每一行的 `latest/download` 换成 `download/v4.0.0`。
+- `SRC` 只写站点域名；镜像站那条会拼成「站点/原始 GitHub 地址」，`https://github.com` 那条是直连。
+- 想锁版本：把 `G` 里的 `latest/download` 换成 `download/v4.0.1`。
+- 同一目标只挂一个计划任务；脚本内部没有锁。
 - 同一目标只挂一个计划任务；脚本内部没有锁。
 
 ## 手动跑一轮

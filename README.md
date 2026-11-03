@@ -16,13 +16,15 @@
 在 DPanel 里新建一个计划任务，脚本框整段填下面这段（按小时跑，执行超时设 600 秒）：
 
 ```sh
-SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+G=https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+SRC='https://gh-proxy.com
+https://ghfast.top
+https://github.com'
 T=/tmp/ct-new.sh
 okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
 for u in $SRC; do
-  curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue
+  case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac
+  curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue
   okfile "$T" && break
 done
 okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
@@ -30,10 +32,11 @@ okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
 sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
-- `SRC` 里一行一个源，按顺序试，**内容合格才算成功**（不只看 exit code，`gh-proxy.net` 那种返回 HTML 的会被挡掉）。
+- `SRC` 里一行一个源，只写站点域名，按顺序试，**内容合格才算成功**（不只看 exit code，`gh-proxy.net` 那种返回 HTML 的会被挡掉）。
+- 镜像站那条会拼成「站点/原始 GitHub 地址」；`https://github.com` 那条是直连（GitHub 能通时最快）。
 - 全部失败时沿用上一轮的 `/tmp/container-autoupdate.sh`，照样能跑；连副本都没有才报错退出（rc=1）。
 - 不用 `curl … | sh`：管道会把下载失败吞掉。
-- 想锁死版本：把 `SRC` 里每一行的 `latest/download` 换成 `download/v4.0.0`。
+- 想锁死版本：把 `G` 里的 `latest/download` 换成 `download/v4.0.1`。
 
 ## 两种模式
 

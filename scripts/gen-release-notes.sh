@@ -105,13 +105,15 @@ echo ""
 echo "把下面整段填进 DPanel 计划任务的「脚本」框（一个脚本就够）。"
 echo ""
 echo '```sh'
-echo "SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh"
-echo "https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh"
-echo "https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
+echo "G=https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh"
+echo "SRC='https://gh-proxy.com"
+echo "https://ghfast.top"
+echo "https://github.com'"
 echo "T=/tmp/ct-new.sh"
 echo 'okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }'
 echo 'for u in $SRC; do'
-echo '  curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue'
+echo '  case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac'
+echo '  curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue'
 echo '  okfile "$T" && break'
 echo 'done'
 echo 'okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh'
@@ -119,7 +121,7 @@ echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更�
 echo 'sh /tmp/container-autoupdate.sh --compose myapp'
 echo '```'
 echo ""
-echo "想锁死本版：把 \`SRC\` 里每一行的 \`latest/download\` 换成 \`download/$TAG\`。"
+echo "想锁死本版：把 \`G\` 里的 \`latest/download\` 换成 \`download/$TAG\`。"
 echo ""
 
 echo "排查残留进程和旧锁文件（只读脚本，不改任何东西）："

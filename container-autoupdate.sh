@@ -78,7 +78,7 @@ DPANEL_BIN="${DPANEL_BIN:-/app/server/dpanel}"  # DPanel CLI 在容器里的路�
 DPANEL_DOCKER_ENV="${DPANEL_DOCKER_ENV:-local}" # DPanel 里的 docker 环境名（对应它的「Docker 服务器」）
 
 START=$(date +%s)
-VERSION="4.0.0"
+VERSION="4.0.1"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -198,23 +198,27 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   container-autoupdate.sh --compose myapp --compose-dir /opt/myapp
 
   # 推荐：整段填进 DPanel 计划任务的「脚本」框
-  #   SRC 里一行一个源，按顺序试，第一个内容合格的才算成功；
+  #   SRC 里一行一个源，只写站点域名；镜像站那条会拼成「站点/原始 GitHub 地址」，
+  #   https://github.com 那条是直连。按顺序试，第一个内容合格的才算成功。
   #   全部失败时沿用上一轮的副本，照样能跑。
-  SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-  https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-  https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+  G=https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+  SRC='https://gh-proxy.com
+  https://ghfast.top
+  https://github.com'
   T=/tmp/ct-new.sh
   okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
   for u in $SRC; do
-    curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue
+    case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac
+    curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue
     okfile "$T" && break
   done
   okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
   [ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
   sh /tmp/container-autoupdate.sh --compose myapp
 
-  # 想锁死版本：把 SRC 里每一行的 latest/download 换成带版本号的路径
-  # releases/download/v4.0.0/container-autoupdate.sh
+  # 想锁死版本：把 G 里的 latest/download 换成带版本号的路径
+  # releases/download/v4.0.1/container-autoupdate.sh
+
 USAGE
 }
 
