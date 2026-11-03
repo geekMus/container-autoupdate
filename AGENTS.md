@@ -364,7 +364,7 @@ NEVER
 
 - `release.yml` 只在 `main` 上发版（`on.push.branches=[main]` + job 里 `if: github.ref == 'refs/heads/main'`）。
 - 其他分支与 PR 走 `ci.yml`，只校验不发版。
-- 工作流幂等：tag / Release 已存在就跳过。
+- 工作流幂等，但**判定条件是「tag 与 Release 都存在」**，不是只看 tag：Release 那步失败过（`gh release create` 偶发失败）、tag 却已经推上去时，只判 tag 会永远 skip，这个版本就再也发不出去（v4.0.2 实测踩到）。现在 tag 已存在时「打 tag」步跳过、「发布 Release」步带 4 次重试补发。
 - 发布说明由 `scripts/gen-release-notes.sh` 自动生成（定位句 + 提交列表 + 安装那段 + sha256）。
 
 ### 9.2 改了脚本却不改 VERSION 的后果
