@@ -33,7 +33,8 @@
 #     Compose 分支只用 compose 自己的 pull / up -d，不手工 tag、不手工 create、不删任何东西。
 #   · 失败原因同时落到真正的 stderr（计划任务失败时只收 stderr、丢弃 stdout）。
 #   · 只检查不动手：--dry-run。
-#   · 不做版本兼容层：参数/环境变量写错就报错退出（rc=1），不猜、不静默忽略。
+#   · 不做版本兼容层：不认识的参数就报错退出（rc=1），不猜、不静默忽略。
+#     环境变量没有这层检查（不认识的名字会被忽略，不报错）。
 #
 # 注意：容器回滚只能恢复容器与镜像，不能撤销新程序已经做过的数据迁移。
 # 生产数据库仍应另有备份。
@@ -78,7 +79,7 @@ DPANEL_BIN="${DPANEL_BIN:-/app/server/dpanel}"  # DPanel CLI 在容器里的路�
 DPANEL_DOCKER_ENV="${DPANEL_DOCKER_ENV:-local}" # DPanel 里的 docker 环境名（对应它的「Docker 服务器」）
 
 START=$(date +%s)
-VERSION="4.0.1"
+VERSION="4.0.2"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -130,7 +131,6 @@ log() {
       ;;
   esac
 }
-safe_key() { printf '%s' "$1" | sed 's|[^A-Za-z0-9_.-]|_|g'; }
 
 usage() {
   cat <<'USAGE'
@@ -262,8 +262,9 @@ parse_args() {
 # 两种运行方式，效果完全一样（同一个二进制、同一份 config、同一个 docker socket）：
 #   1) 脚本本来就在 DPanel 容器里（计划任务的常见情形）→ 直接执行二进制；
 #   2) 脚本在别的容器 / 宿主上 → docker exec 进 DPanel 容器执行。
+# 判定必须在 parse_args 之后（见主流程）：--dpanel-bin 能改 $DPANEL_BIN，
+# 在这里提前判会一直用默认路径做判断，走错分支。
 DP_IN_CONTAINER=0
-[ -x "$DPANEL_BIN" ] && DP_IN_CONTAINER=1
 
 # 调用 DPanel CLI。$1 = 超时秒数，其余是子命令与参数。
 # 不用 -q/--quiet：它会把结果 JSON 一起吞掉（DPanel 1.11.2 实测），
@@ -672,6 +673,10 @@ compose_update() {
 # ---------- 主流程 ----------
 parse_args "$@"
 
+# 判定「是不是就在 DPanel 容器里」：必须在 parse_args 之后，
+# 否则 --dpanel-bin 指定的路径不参与判断（DPanel 会自动探测它的存在）。
+[ -x "$DPANEL_BIN" ] && DP_IN_CONTAINER=1
+
 # --docker-sock 仍然认：以前它是给 docker API 用的，现在只用来指定 docker CLI 的端点。
 if [ -n "$DOCKER_SOCK" ]; then
   export DOCKER_HOST="unix://$DOCKER_SOCK"
@@ -681,7 +686,7 @@ fi
 # 跑的是哪一版脚本（升级过 latest 之后尤其重要）。
 log "container-autoupdate v$VERSION 启动"
 
-# 目标判定（供跨版本提示与后面的分支共用）
+# 目标判定（依赖检查与后面的分支都要用）
 _GOAL=""
 if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
   _GOAL="compose"

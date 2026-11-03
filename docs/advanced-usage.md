@@ -25,7 +25,6 @@ sh /tmp/container-autoupdate.sh --compose myapp
 - `SRC` 只写站点域名；镜像站那条会拼成「站点/原始 GitHub 地址」，`https://github.com` 那条是直连。
 - 想锁版本：把 `G` 里的 `latest/download` 换成 `download/v4.0.1`。
 - 同一目标只挂一个计划任务；脚本内部没有锁。
-- 同一目标只挂一个计划任务；脚本内部没有锁。
 
 ## 手动跑一轮
 
@@ -61,5 +60,5 @@ sh /tmp/container-autoupdate.sh --compose web
 | `ERR 无法执行 docker compose（缺 compose 插件？）` | 缺 Compose v2 插件，装好再跑 |
 | `ERR DPanel 返回了错误` | DPanel 那边拉镜像/重建失败，看后面的原始报错 |
 | 一直报「已是最新」但其实有新版本 | 镜像源没更新，或 tag 没变（`:latest` 没推新的） |
-| 计划任务显示失败但日志里只有 `exit status 1` | 失败原因在 stderr；旧版本才只有这一句，v1.1.2 起会带上原文 |
+| 计划任务显示失败但日志里只有 `exit status 1` | 失败原因在 stderr；v1.1.2 起会带上原文（若还只看到一句，说明跑的是更早的版本） |
 | 想回滚 | 容器：用 DPanel 的 `<容器名>-bak-<时间戳>` 备份容器；Compose：把旧镜像 tag 回 `:latest` 再 `up -d` |

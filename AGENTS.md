@@ -100,7 +100,7 @@ v2.1.0 起，脚本分两条路：**容器模式**把「拉镜像、重建容器
 - **不许给 DPanel CLI 加 `-q` / `--quiet`**：它会把结果 JSON 一起吞掉（只剩 `[DEBUG]` 行），解析必然失败；`-q` 抑制的是命令结果，不是日志。
 - **取 DPanel 结果的规则是「stdout 里最后一个以 `{` 开头的行」**：stdout 混着大量 `[DEBUG]` / GORM 日志，结果 JSON 永远在最后一行。
 - **失败原因要透传，而且不能被截断**：把 DPanel 的 `error` 文本打进日志；取 JSON 字符串字段时**不能按逗号截断**（DPanel 的错误文本里就有逗号，实测会被切成半句，真实原因就丢了）。
-- **参数/环境变量写错就报错退出（`rc=1`）**：不认识的写法不许静默忽略，也不许自动改写；错误信息里点名是哪一项，并指向 `--help`。
+- **参数写错就报错退出（`rc=1`）**：不认识的参数不许静默忽略，也不许自动改写；错误信息里点名是哪一项，并指向 `--help`。**环境变量没有这层检查**：不认识的环境变量会被直接忽略、不报错（v4.0.0 实测踩过：`CT_VERSION=1.2.3` 被忽略后脚本照常把生产项目更新了）——旧 env 只会「不生效」，不会「被拦」，测试这类行为必须指向不存在的目标（§6.5）。
 - **失败原因必须同时落到真正的 stderr**（v1.1.2 起的设计，v2.0.0 保留）：计划任务（DPanel）在任务失败时**只保留 stderr、丢弃 stdout**；理由与实现要点见下面「历史 MUST」。
 
 ### NEVER（v2.1.0 现行）
@@ -235,7 +235,7 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 | Compose 模式：剩余预算 < `DP_MIN_UPGRADE` | `rc=1`，既不 pull 也不 up |
 | Compose 模式：`--dry-run` | 只列出项目涉及的镜像，`rc=0`，不 pull 不 up，零改动 |
 | 配置二选一（都填 / 都不填 / 名字不存在） | `rc=1`，不动任何东西 |
-| 不认识参数 / 旧 flag / 旧 env | `rc=1`，点名是哪一项 |
+| 不认识参数 / 旧 flag | `rc=1`，点名是哪一项（旧 env 会被忽略、不报错，见 §6.5） |
 
 ### 6.2 制造「有新版本」的正确方法
 
@@ -299,7 +299,7 @@ docker compose up -d                  # 让容器跑在 1.35 的内容上
 
 - 不认识的参数就是错：打一句 `ERR 未知参数：…（用 --help 查看用法）`，`exit 1`。**不许**加「旧写法自动改写」「静默忽略」「跨版本提示」那一套。
 - 破坏性变更写进提交信息与发布说明的人话里即可，脚本内不再维护登记表。
-- 因此 `sh container-autoupdate.sh --version` 之类的「五个快速用例」只看 rc：认识的 `0`，不认识的 `1`。
+- 因此 `--help` / `--version` / 无参数 / `--bogus` 四个快速用例只看 rc：认识的 `0`，不认识的 `1`。
 
 ---
 
@@ -323,7 +323,7 @@ v3.0.0 起不再有引导器：整套脚本不到 50KB，计划任务里「下�
 - **下到的东西必须先校验再执行**：字节数 > 1000、`sh -n` 通过、含特征串 `container-autoupdate`。只做 `sh -n` 是不够的：一行 `garbage` 也能过语法检查，然后被当成脚本执行（实测报 `line 1: garbage: not found`，rc=127）；`gh-proxy.net` 还会返回 195 字节的 HTML 跳转页（`rc=0`，内容完全不是脚本）。
 - 旧引导器踩过的具体坑（探测窗口被 `VERSION=` 行的下移顶出 4KB、`sed` 捕获组漏反斜杠导致版本号恒为空、`api.github.com` 限流、自建源偶发 40s 超时）随它一起作废，不必在新代码里复刻。
 
-> 现行装法的权威写法只有一处：`README.md` 的「快速开始」代码块，以及 `scripts/gen-release-notes.sh` 为 v3+ 生成的那一段。二者必须逐行一致。
+> 现行装法有四处同步副本：`README.md` 的「安装（DPanel 计划任务）」代码块、`docs/advanced-usage.md` 的计划任务段、脚本 `usage()` 的示例段（多两格缩进）、`scripts/gen-release-notes.sh` 生成的那段。改了任何一处，其余三处必须内容一致。
 
 ### 8.6 文档只维护中文版
 
@@ -371,12 +371,12 @@ NEVER
 
 `releases/latest/download/` 会继续提供**旧**资产，而 HEAD 已不同 → 「本地 = HEAD = 资产 = 线上」这条不变量被打破，用户下载到的是旧代码。
 
-**结论：改了 `container-autoupdate.sh` 就必须按 §7.3 升 `VERSION`。**
+**结论：改了 `container-autoupdate.sh` 就必须按 §7.2 升 `VERSION`。**
 
 ### 9.3 推送后必须做端到端核对
 
 ```sh
-# 三方 sha1 必须完全相同
+# 三方 sha256 必须完全相同
 sha256sum container-autoupdate.sh                       # 本地
 git show HEAD:container-autoupdate.sh | sha256sum       # git HEAD（走 Python 读原始字节）
 curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
@@ -444,15 +444,15 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] `sh -n scripts/gen-release-notes.sh` 通过
 - [ ] `sh -n scripts/ct-stale-lock-check.sh` 通过
 - [ ] 三个 `.sh` 的 CR 计数为 0（`container-autoupdate.sh` 与 `scripts/*.sh`）
-- [ ] 改了脚本 → `VERSION` 已按 §7.3 升级
-- [ ] 不认识的参数 / 环境变量 → `rc=1` 并点名（没有兼容层）
+- [ ] 改了脚本 → `VERSION` 已按 §7.2 升级
+- [ ] 不认识的参数 → `rc=1` 并点名（没有兼容层；不认识的环境变量会被忽略、不报错，不要靠设旧 env 来「测拦截」，见 §6.5）
 - [ ] `--help`、`--version`、无参数、`--bogus` 四个快速用例行为正确（认识的 0，不认识的 1）
 - [ ] 至少跑了 §6.1 里受影响的那几行场景，并贴出真实输出
 - [ ] 测试容器 / 镜像 / 状态目录已清理，生产已复原且 `healthy`
 - [ ] 文档里没有新增硬编码的当前版本号
 - [ ] 下载地址是 `releases/...`，带 `-L`，没用 jsdelivr
 - [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
-- [ ] 推送后做了 §9.3 的三方 sha1 核对
+- [ ] 推送后做了 §9.3 的三方 sha256 核对
 - [ ] 改了用户文档 → 跑过 `python3 scripts/check-docs.py .`（链接与锚点、表格、CRLF、没有 `*.en.md`）
 - [ ] 改过 `log()` 或错误输出路径 → 跑过 stdout/stderr 分流实测（`sh 脚本 >out 2>err`），确认 ERR/CRITICAL 行与缩进补充行都在 stderr 里
 - [ ] 新增的「会失败的关键查询」（如查远端 digest）→ 有重试，且重试次数在日志里写明
@@ -480,9 +480,9 @@ v2.1.0 起另外还要过这几条：
 v3.0.0 起另外还要过这几条：
 
 - [ ] 仓库里**没有** `ct-bootstrap.sh`（CI 里有 `test ! -e ct-bootstrap.sh` 守卫；Release 只发两个资产）
-- [ ] 计划任务的装法只有一处权威写法：`README.md` 的快速开始代码块与 `scripts/gen-release-notes.sh` 为 v3+ 生成的那段**逐行一致**（改了其中一处就同步另一处）
+- [ ] 计划任务的装法保持四处副本内容一致：`README.md`、`docs/advanced-usage.md`、脚本 `usage()` 示例段、`scripts/gen-release-notes.sh` 生成段（改了任何一处就同步其余三处）
 - [ ] 那段装法仍然守两条底线：下载失败**不许静默成功**（沿用上一轮通过校验的副本，或 `ERR` + `rc=1`）；下到的东西**先校验再执行**（字节数 > 1000、`sh -n`、含 `container-autoupdate` 特征串）
 - [ ] 没有把 `curl ... | sh` 写进任何文档或示例（管道会吞掉下载失败）
-- [ ] `--ct-*` 任何形态、`CT_*` 任何非空值都 `rc=1` 并点名（v4.0.0 没有兼容层，不再有专门的迁移说明）
+- [ ] `--ct-*` 任何形态都 `rc=1` 并点名；`CT_*` 环境变量会被忽略、不报错（v4.0.0 没有兼容层）
 - [ ] 文档里锁版本的写法是**带 tag 的下载地址**（`releases/download/vX.Y.Z/…`），不是 `--ct-version`
 - [ ] 文档里没有残留「引导器 / ct-bootstrap / 缓存目录 / `--ct-*` 表」的现行说法（只允许出现在「v3.0.0 迁移」段与 AGENTS.md 的§8.5 历史节）

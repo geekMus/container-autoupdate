@@ -1,6 +1,6 @@
 # container-autoupdate
 
-一个给 **DPanel 计划任务** 用的容器自动更新脚本，单文件、无依赖（只用 `sh` 和 `docker`）。
+一个给 **DPanel 计划任务** 用的容器自动更新脚本，单文件，放在 dpanel 容器里跑（只用 `sh`；依赖 `timeout`、`sed`、`awk`、`grep`，Compose 模式另需 `docker` + Compose v2 插件）。
 
 它自己不做危险动作：容器交给 DPanel 升级，Compose 交给 `docker compose` 重新部署。
 

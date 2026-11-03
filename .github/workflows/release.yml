@@ -5,7 +5,7 @@ name: Release
 # 其他分支不会执行发版（见下面的 if 与 branches 限制）。
 #
 # 发布说明由 scripts/gen-release-notes.sh 自动生成：
-#   定位句 + 本版破坏性变更 + 提交列表 + 下载命令 + sha256
+#   定位句 + 提交列表 + 安装那段 + sha256（v4.0.0 起不再有破坏性变更登记表）
 # 同一个内容也用作 annotated tag 的消息，所以 `git show vX.Y.Z` 能看到改了什么。
 
 on:
