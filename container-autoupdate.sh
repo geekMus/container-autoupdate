@@ -33,8 +33,7 @@
 #     Compose 分支只用 compose 自己的 pull / up -d，不手工 tag、不手工 create、不删任何东西。
 #   · 失败原因同时落到真正的 stderr（计划任务失败时只收 stderr、丢弃 stdout）。
 #   · 只检查不动手：--dry-run。
-#   · 破坏性变更（参数 / 环境变量 / 行为）登记在 BREAKING_TABLE，脚本会主动
-#     识别旧写法并给出迁移说明，而不是静默忽略。
+#   · 不做版本兼容层：参数/环境变量写错就报错退出（rc=1），不猜、不静默忽略。
 #
 # 注意：容器回滚只能恢复容器与镜像，不能撤销新程序已经做过的数据迁移。
 # 生产数据库仍应另有备份。
@@ -77,11 +76,9 @@ COMPOSE_DIR="${COMPOSE_DIR:-}"
 DPANEL_NAME="${DPANEL_NAME:-dpanel}"            # DPanel 容器名
 DPANEL_BIN="${DPANEL_BIN:-/app/server/dpanel}"  # DPanel CLI 在容器里的路径
 DPANEL_DOCKER_ENV="${DPANEL_DOCKER_ENV:-local}" # DPanel 里的 docker 环境名（对应它的「Docker 服务器」）
-COMPAT_ROOT="${COMPAT_ROOT:-/tmp/.container-autoupdate/compat}"  # 跨版本提示的记录目录
-COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="3.0.0"
+VERSION="4.0.0"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -135,267 +132,6 @@ log() {
 }
 safe_key() { printf '%s' "$1" | sed 's|[^A-Za-z0-9_.-]|_|g'; }
 
-# ==================== 破坏性变更登记表 =====================================
-# 为什么需要这张表：README 推荐的下载地址是 releases/latest/download/…，用户
-# 粘贴一次就长期生效。上游发新版会直接作用到用户机器上。如果新版引入了破坏性
-# 变更，脚本必须自己识别「你的调用方式还是旧写法」，并在输出里给出可执行的
-# 迁移说明——而不是静默忽略旧参数，或抛出一句看不懂的错误。
-#
-# 每行用 | 分隔，空行与 # 开头的行忽略：
-#     版本 | 类别 | 旧写法 | 新写法 | 说明
-#
-# 类别：
-#   flag      命令行参数被移除/改名 → 用户传了它就立即中止并给出新写法
-#   env       环境变量被移除/改名   → 该变量仍被设置就立即中止并给出新写法
-#   behavior  默认行为或语义变化    → 无法从输入判断，靠「跨版本提示」与
-#                                     --compat 声明来兜住
-#
-# 登记原则：只登记「会让用户已有的调用方式失效」的变更。
-# 新增参数、改日志措辞、改内部实现都不要登记，否则每次发版都在打扰用户。
-BREAKING_TABLE='
-1.0.0|env|LOCK_PREFIX|删除这个环境变量|1.0.0 起脚本不再使用互斥锁，并发由 DPanel 计划任务保证
-1.0.0|behavior|同一更新目标由脚本内的互斥锁串行|同一目标只挂一个 DPanel 计划任务|1.0.0 起移除脚本内的互斥锁：v0.4.0 的锁会被残留的子进程长期占住，导致之后每一轮都跳过
-2.0.0|behavior|脚本自己拉镜像、自己重建容器 / Compose 项目（自带健康门禁与 :prev 回滚点）|容器走 DPanel 的 container:upgrade，Compose 项目走 DPanel 的 compose:deploy|2.0.0 起更新动作全部交给 DPanel：脚本只负责检查与转交，回滚交给 DPanel 的备份容器（<容器名>-bak-<时间戳>）
-2.0.0|flag|--state-dir|删除这个参数|2.0.0 起脚本不再维护状态目录；跨版本提示记录改到 COMPAT_ROOT
-2.0.0|flag|--bad-ttl-days|删除这个参数|2.0.0 起不再有「坏版本钉住」，回滚由 DPanel 负责
-2.0.0|flag|--pull-retries|删除这个参数|2.0.0 起拉取不再由脚本负责（容器模式交给 DPanel，Compose 模式交给 docker compose），脚本不再管理拉取与重试
-2.0.0|env|STATE_ROOT|删除这个环境变量|2.0.0 起脚本不再维护状态目录；跨版本提示记录改到 COMPAT_ROOT（默认 /tmp/.container-autoupdate/compat）
-2.0.0|env|BAD_TTL_DAYS|删除这个环境变量|2.0.0 起不再有「坏版本钉住」与 TTL，回滚由 DPanel 负责
-2.0.0|env|PULL_RETRIES|删除这个环境变量|2.0.0 起拉取不再由脚本负责（容器模式交给 DPanel，Compose 模式交给 docker compose），脚本不再管理拉取与重试
-2.0.0|env|DIGEST_RETRIES|删除这个环境变量|2.0.0 起「有没有新版本」不再由脚本查 digest：容器模式看 DPanel 的 upgrade，Compose 模式看 docker compose pull 拉到了什么
-2.0.0|env|DIGEST_RETRY_WAIT|删除这个环境变量|同上：不再由脚本查询远端 digest
-2.0.0|env|T_STALL|删除这个环境变量|2.0.0 起脚本不再读 Docker 拉取流，拉取停滞判定取消
-2.0.0|env|T_STALL_FINISH|删除这个环境变量|同上：拉取收尾由更新执行者（DPanel / docker compose）自行处理
-2.0.0|env|T_PULL_MAX|删除这个环境变量|拉取交给更新执行者；脚本侧可用 DP_T_PULL / DP_T_UPGRADE 限制单次调用的时长
-2.0.0|env|T_UP|删除这个环境变量|容器重建由 DPanel 完成（DP_T_UPGRADE 控制脚本等待多久）；Compose 侧用 DP_T_UP
-2.0.0|env|T_HEALTH|删除这个环境变量|健康观察由 DPanel 的升级流程负责
-2.0.0|env|HEALTH_TRIES|删除这个环境变量|健康门禁已移除，由 DPanel 负责
-2.0.0|env|T_ROLLBACK|删除这个环境变量|回滚由 DPanel 的备份机制负责
-2.0.0|env|PLAIN_BOOT|删除这个环境变量|无 healthcheck 容器的观察已交由 DPanel
-2.0.0|env|COMPOSE_BASE|删除这个环境变量|不再需要从容器标签反查 Compose 目录的基路径（反查用 compose 自己写在容器上的标签）
-2.1.0|behavior|Compose 更新交给 DPanel 的 compose:deploy|Compose 项目改用 docker compose pull + up -d 就地重新部署|2.1.0 起 Compose 模式不再依赖 DPanel 的 compose:deploy：不需要项目先在 DPanel 里登记，也不用管 --pull-image；容器模式仍然交给 DPanel
-3.0.0|behavior|先用引导器 ct-bootstrap.sh 下载主脚本再执行|DPanel 计划任务里直接下载主脚本并执行|3.0.0 起不再发布引导器：计划任务自己下载 container-autoupdate.sh、校验通过才执行；想锁版本就用带 tag 的下载地址
-3.0.0|flag|--ct-version|删除这个参数|3.0.0 起引导器已取消，全部 --ct-* 参数一并作废：锁版本请把下载地址换成 releases/download/vX.Y.Z/container-autoupdate.sh
-3.0.0|env|CT_VERSION|删除这个环境变量|3.0.0 起引导器已取消，全部 CT_* 环境变量一并作废；锁版本改用带 tag 的下载地址
-'
-# ==================== 登记表结束 ===========================================
-
-# 版本比较：A > B 返回 0，否则返回 1。只比较前 3 段数字，缺的段按 0 处理。
-ver_gt() {
-  _a="$1"; _b="$2"; _i=1
-  while [ "$_i" -le 3 ]; do
-    _x=$(printf '%s' "$_a" | cut -d. -f"$_i"); _x=${_x:-0}
-    _y=$(printf '%s' "$_b" | cut -d. -f"$_i"); _y=${_y:-0}
-    case "$_x" in ''|*[!0-9]*) _x=0 ;; esac
-    case "$_y" in ''|*[!0-9]*) _y=0 ;; esac
-    [ "$_x" -gt "$_y" ] && return 0
-    [ "$_x" -lt "$_y" ] && return 1
-    _i=$(( _i + 1 ))
-  done
-  return 1
-}
-
-# A >= B
-ver_ge() { ver_gt "$2" "$1" && return 1; return 0; }
-
-# 取登记表里某一类别的行，输出「版本|旧写法|新写法|说明」
-compat_rows() {
-  printf '%s\n' "$BREAKING_TABLE" | while IFS='|' read -r _v _k _t _n _d; do
-    case "$_v" in ''|'#'*) continue ;; esac
-    [ "$_k" = "$1" ] || continue
-    printf '%s|%s|%s|%s\n' "$_v" "$_t" "$_n" "$_d"
-  done
-}
-
-# 用户传了一个已被移除的参数：立刻中止，给出新写法与迁移方式。
-# 返回 0 表示「这是登记过的旧参数，已经报错退出」；返回 1 表示不认识的参数。
-compat_removed_flag() {
-  _rows=$(compat_rows flag)
-  [ -n "$_rows" ] || return 1
-  while IFS='|' read -r _v _t _n _d; do
-    [ -n "$_v" ] || continue
-    [ "$_t" = "$1" ] || continue
-    log "ERR 这个参数已经不能用了：$1"
-    # 「删除这个参数」是一个特殊的新写法：表示没有替代写法。
-    # 这时不要打印「把 X 换成 删除这个参数」那种绕口的句子。
-    if [ "$_n" = "删除这个参数" ]; then
-      log "    从 v$_v 起：$1 已移除"
-      log "    原因：$_d"
-      log "    迁移方式：删掉 $1 即可，不需要任何替代设置"
-    else
-      log "    从 v$_v 起改为：$_n"
-      log "    原因：$_d"
-      log "    迁移方式：把 $1 换成 $_n"
-    fi
-    log "    或者把下载地址固定到旧版本（见 README「版本与升级」）"
-    log "    本次未做任何改动，退出码 3"
-    exit 3
-  done <<EOF
-$_rows
-EOF
-  return 1
-}
-
-# 已被移除的环境变量仍被设置：同样中止并给出新写法。
-compat_removed_env() {
-  _rows=$(compat_rows env)
-  [ -n "$_rows" ] || return 0
-  while IFS='|' read -r _v _t _n _d; do
-    [ -n "$_v" ] || continue
-    eval "_cur=\${$_t:-}"
-    [ -n "$_cur" ] || continue
-    # 「删除这个环境变量」是一个特殊的新写法：表示没有替代写法。
-    # 这时不要打印「改为 X / 改用 X」那种绕口的句子。
-    if [ "$_n" = "删除这个环境变量" ]; then
-      log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
-      log "    从 v$_v 起：$_t 已移除"
-      log "    原因：$_d"
-      log "    迁移方式：删掉 $_t 即可，不需要任何替代设置"
-    else
-      log "ERR 这个环境变量已经不能用了：$_t（当前值=$_cur）"
-      log "    从 v$_v 起改为：$_n"
-      log "    原因：$_d"
-      log "    迁移方式：删掉 $_t，改用 $_n"
-    fi
-    log "    或者把下载地址固定到旧版本（见 README「版本与升级」）"
-    log "    本次未做任何改动，退出码 3"
-    exit 3
-  done <<EOF
-$_rows
-EOF
-  return 0
-}
-
-# 引导器（ct-bootstrap.sh）在 3.0.0 被取消，它的 9 个 CT_* 变量一并作废。
-# 单独处理而不是往 BREAKING_TABLE 里塞 9 行：用户看到的应该是同一条迁移说明。
-compat_bootstrap_env() {
-  _found=""
-  for _n in CT_VERSION CT_CACHE_DIR CT_CACHE_KEEP CT_FORCE CT_PROBE_BYTES CT_QUIET CT_SOURCE CT_T_NET CT_TRIES; do
-    eval "_cur=\${$_n:-}"
-    [ -n "$_cur" ] && _found="${_found:+$_found }$_n=$_cur"
-  done
-  [ -n "$_found" ] || return 0
-  log "ERR 这些环境变量已经不能用了：$_found"
-  log "    从 v3.0.0 起：引导器 ct-bootstrap.sh 已取消（连同 CT_* 变量一起作废）"
-  log "    原因：更新改成在 DPanel 计划任务里直接下载主脚本并执行，不再有引导器这一层"
-  log "    迁移方式：把计划任务换成 README 里那段「下载 → 校验 → 执行」的命令；想锁版本就把下载地址换成带 tag 的路径"
-  log "    本次未做任何改动，退出码 3"
-  exit 3
-}
-
-# --compat <版本>：用户声明「我只验证到这个版本」。
-# 若当前脚本含有比声明版本更新的 behavior 级破坏性变更，就硬停并说明原因。
-compat_gate() {
-  # 只有「显式给了 --compat 且给了非空值」才校验；--compat "" 是错误用法，不能静默放行。
-  if [ "${_SAW_COMPAT:-0}" = "1" ] && [ -z "${COMPAT_UNTIL:-}" ]; then
-    log "ERR --compat 的值不能为空（应形如 0.1.0）"
-    log "    本次未做任何改动，退出码 3"
-    exit 3
-  fi
-  [ -n "${COMPAT_UNTIL:-}" ] || return 0
-  case "$COMPAT_UNTIL" in
-    ''|*[!0-9.]*)
-      log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
-      log "    本次未做任何改动，退出码 3"
-      exit 3 ;;
-  esac
-  # 形态必须严格是「数字.数字.数字」：`1..2`、`1.2.` 这类会被 ver_gt 当成 0，悄悄放行。
-  case "$COMPAT_UNTIL" in
-    [0-9]*.[0-9]*.[0-9]*)
-      case "$COMPAT_UNTIL" in
-        *..*|*..|.*|*.*.*.*)
-          log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
-          log "    本次未做任何改动，退出码 3"
-          exit 3 ;;
-      esac ;;
-    *)
-      log "ERR --compat 的值不合法：$COMPAT_UNTIL（应形如 0.1.0）"
-      log "    本次未做任何改动，退出码 3"
-      exit 3 ;;
-  esac
-  if ver_gt "$COMPAT_UNTIL" "$VERSION"; then
-    log "ERR 声明的兼容版本($COMPAT_UNTIL)比当前脚本($VERSION)还新"
-    log "    这通常意味着你在降级。请确认下载地址里的版本号，或去掉 --compat"
-    log "    本次未做任何改动，退出码 3"
-    exit 3
-  fi
-  _rows=$(compat_rows behavior)
-  [ -n "$_rows" ] || return 0
-  while IFS='|' read -r _v _t _n _d; do
-    [ -n "$_v" ] || continue
-    ver_gt "$_v" "$COMPAT_UNTIL" || continue    # 变更版本 <= 声明版本：用户已验证过，放行
-    ver_ge "$VERSION" "$_v" || continue         # 当前脚本还没到该版本：不适用
-    log "ERR 版本不兼容：当前脚本 $VERSION 含有影响你的破坏性变更"
-    log "    从 v$_v 起：$_d"
-    log "    应对：$_n"
-    log "    你声明兼容到 $COMPAT_UNTIL（--compat）"
-    log "    处理方式：按上面的「应对」改配置；或把 --compat 提到 v$_v；或改用固定版本"
-    log "    本次未做任何改动，退出码 3"
-    exit 3
-  done <<EOF
-$_rows
-EOF
-  return 0
-}
-
-# 跨版本提示：记住每个更新目标上次跑过的版本，若本次版本更高且两者之间存在
-# behavior 级破坏性变更，主动在日志里说明（不中止，仅提示，每个版本提示一次）。
-compat_notice() {
-  _dir="$1"
-  [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
-  _lf="$_dir/lastver"
-  _prev=""
-  [ -f "$_lf" ] && _prev=$(cat "$_lf" 2>/dev/null)
-  case "$_prev" in ''|*[!0-9.]*) _prev="" ;; esac
-  if [ -n "$_prev" ] && ! ver_gt "$VERSION" "$_prev"; then
-    return 0                      # 同版本或更旧：不提示
-  fi
-  if [ -n "$_prev" ]; then
-    _rows=$(compat_rows behavior)
-    if [ -n "$_rows" ]; then
-      while IFS='|' read -r _v _t _n _d; do
-        [ -n "$_v" ] || continue
-        ver_gt "$_v" "$_prev" || continue
-        ver_ge "$VERSION" "$_v" || continue
-        log "WARN 你从 $VERSION 之前的版本(${_prev})升级上来，v$_v 引入了破坏性变更"
-        log "     变更：$_d"
-        log "     应对：$_n"
-        # 注意：不能建议「加 --compat $_prev」——那会让 compat_gate 判定
-        # 「存在比声明版本更新的破坏性变更」而硬停 rc=3，等于把用户锁死在
-        # 升级后的第一轮。正确做法只有两条：接受新行为，或把下载地址固定回旧版。
-        log "     本次仍会继续执行。两条路选一条："
-        log "       1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat $VERSION）"
-        log "       2) 想继续用旧行为，把下载地址固定到 v$_prev 那个 tag"
-      done <<EOF
-$_rows
-EOF
-    fi
-  fi
-  return 0
-}
-
-# 记录「这个目标已经见过当前版本」：下次同版本不再重复提示。
-# 与 compat_notice 分开是刻意的：提示要早（依赖检查之前就要打印，否则会被
-# 「找不到 docker / DPanel CLI」盖掉），记录要晚（只有真跑起来的轮次才算
-# 用户已经知悉；依赖缺失时不该把提示永久吞掉）。
-compat_record() {
-  _dir="$1"
-  [ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null || return 0
-  printf '%s\n' "$VERSION" > "$_dir/lastver" 2>/dev/null || true
-  return 0
-}
-
-# 每个目标一个记录目录，用于「跨版本提示」。
-compat_state_dir() {
-  if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
-    printf '%s/compose-%s' "$COMPAT_ROOT" "$(safe_key "$COMPOSE_NAME")"
-  elif [ -z "$COMPOSE_NAME" ] && [ -n "$CONTAINER_NAME" ]; then
-    printf '%s/container-%s' "$COMPAT_ROOT" "$(safe_key "$CONTAINER_NAME")"
-  else
-    printf '%s' "$COMPAT_ROOT"
-  fi
-}
-
 usage() {
   cat <<'USAGE'
 DPanel 定时任务自动更新脚本
@@ -427,7 +163,6 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   --dpanel-bin <路径>       DPanel CLI 在容器里的路径（默认 /app/server/dpanel）
   --dpanel-docker-env <名>  DPanel 里的 docker 环境名（默认 local）
   --dry-run              只检查不动手：容器模式问 DPanel，Compose 模式只列出涉及的镜像
-  --compat <版本>        声明只验证到某个版本；脚本若含更新的破坏性变更就中止
   -h, --help             显示本帮助
   -V, --version          显示版本
 
@@ -438,9 +173,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   DPANEL_NAME                   DPanel 容器名（默认 dpanel）
   DPANEL_BIN                    DPanel CLI 路径（默认 /app/server/dpanel）
   DPANEL_DOCKER_ENV             DPanel 里的 docker 环境名（默认 local）
-  COMPAT_ROOT                   跨版本提示记录目录（默认 /tmp/.container-autoupdate/compat）
   DRY_RUN=1                     同 --dry-run
-  COMPAT_UNTIL                  同 --compat
   T_HARD                        整轮时间硬上限（秒，默认 540）
   T_INSPECT / DP_T_CHECK        单次「检查」调用超时（秒，默认 120）
   DP_T_UPGRADE                  单次容器升级调用超时（秒，默认 420）
@@ -448,19 +181,10 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   DP_MIN_UPGRADE                剩余预算低于这个值就不动手（秒，默认 90）
 
 退出码：
-  0  成功，或无需更新，或按规则跳过
+  0  成功，或无需更新
   1  配置/环境错误，或本轮未能完成更新（目标保持原样）
-  2  保留（v2.0.0 起不再出现：容器回滚由 DPanel 负责；Compose 就地重新部署，
-     失败时脚本不部署，不会留下半新半旧的项目）
-  3  检测到破坏性变更，你的调用方式已失效（本次未做任何改动，日志里有迁移说明）
   130  被 Ctrl-C（SIGINT）中断
   143  被 SIGTERM / SIGHUP 中断（计划任务执行超时常见）
-
-关于版本与兼容：
-  脚本每次运行都会把版本号写进日志（首行 `container-autoupdate v<x.y.z> 启动`）。
-  如果新版引入了会破坏你已有调用方式的变更，脚本会主动识别并在输出里给出
-  迁移方式，而不是静默忽略旧写法。想彻底避免意外，把下载地址固定到某个 tag
-  （见 README「版本与升级」）。
 
 示例：
   # DPanel 计划任务里跑（推荐）：把下面这条命令填进计划任务的「命令」，
@@ -473,22 +197,24 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   # Compose 项目的目录通常是自动认出来的；要显式指定也可以：
   container-autoupdate.sh --compose myapp --compose-dir /opt/myapp
 
-  # 推荐：整段填进 DPanel 计划任务的「脚本」框（v3.0.0 起没有引导器了）
-  #   下载 → 校验 → 通过才替换 → 执行；下载失败时沿用上一轮的副本，照样能跑。
-  U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
-  U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+  # 推荐：整段填进 DPanel 计划任务的「脚本」框
+  #   SRC 里一行一个源，按顺序试，第一个内容合格的才算成功；
+  #   全部失败时沿用上一轮的副本，照样能跑。
+  SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+  https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+  https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
   T=/tmp/ct-new.sh
-  curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
-  if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
-     && grep -q container-autoupdate "$T"; then
-    mv -f "$T" /tmp/container-autoupdate.sh
-  fi
+  okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
+  for u in $SRC; do
+    curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue
+    okfile "$T" && break
+  done
+  okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
   [ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
   sh /tmp/container-autoupdate.sh --compose myapp
 
-  # 想锁死版本：把上面两个地址里的 latest/download 换成带版本号的路径
-  # releases/download/v3.0.0/container-autoupdate.sh
-  # 不需要 -L：那三个地址都不是 302；用 latest/download 时 curl -L 也不会出错。
+  # 想锁死版本：把 SRC 里每一行的 latest/download 换成带版本号的路径
+  # releases/download/v4.0.0/container-autoupdate.sh
 USAGE
 }
 
@@ -515,19 +241,10 @@ parse_args() {
                       DPANEL_BIN="$2"; shift 2 ;;
       --dpanel-docker-env) [ "$#" -ge 2 ] || { echo "ERR --dpanel-docker-env 缺少参数" >&"$ERR_FD"; exit 1; }
                       DPANEL_DOCKER_ENV="$2"; shift 2 ;;
-      --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&"$ERR_FD"; exit 1; }
-                      COMPAT_UNTIL="$2"; _SAW_COMPAT=1; shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       -V|--version)   echo "$VERSION"; exit 0 ;;
-      --ct-*)         log "ERR 这个参数已经不能用了：$1"
-                      log "    从 v3.0.0 起：引导器 ct-bootstrap.sh 已取消，全部 --ct-* 参数一并作废"
-                      log "    原因：更新改成在 DPanel 计划任务里直接下载主脚本并执行，不再有引导器这一层"
-                      log "    迁移方式：把计划任务换成 README 里那段「下载 → 校验 → 执行」的命令；想锁版本就用带 tag 的下载地址"
-                      log "    本次未做任何改动，退出码 3"
-                      exit 3 ;;
-      *)              compat_removed_flag "$1"
-                      echo "ERR 未知参数：$1（用 --help 查看用法）" >&"$ERR_FD"; exit 1 ;;
+      *)              echo "ERR 未知参数：$1（用 --help 查看用法）" >&"$ERR_FD"; exit 1 ;;
     esac
   done
   # 命令行上两个目标都显式给过 → 直接拒绝，不做「后者胜出」的静默覆盖
@@ -960,18 +677,6 @@ fi
 # 跑的是哪一版脚本（升级过 latest 之后尤其重要）。
 log "container-autoupdate v$VERSION 启动"
 
-# 破坏性变更防线（顺序很重要）：
-#   1. 旧环境变量还在设 → 说明用户仍按旧文档调用，立刻中止并给出新写法
-#   2. --compat 声明的版本比脚本旧、且中间有 behavior 级变更 → 中止
-# 这两步必须放在 check_deps 之前：调用方式已经失效时，要给出迁移说明，
-# 而不是先抱怨「找不到 docker / 找不到 DPanel CLI」——那会把用户引向
-# 完全无关的排查方向。
-# 引导器的 CT_* 排在最前面：它们要的是一条「改用新安装方式」的说明，
-# 而不是逐变量的「删掉即可」（CT_VERSION 在登记表里也有一行，仅作备案）。
-compat_bootstrap_env
-compat_removed_env
-compat_gate
-
 # 目标判定（供跨版本提示与后面的分支共用）
 _GOAL=""
 if [ -n "$COMPOSE_NAME" ] && [ -z "$CONTAINER_NAME" ]; then
@@ -980,18 +685,7 @@ elif [ -z "$COMPOSE_NAME" ] && [ -n "$CONTAINER_NAME" ]; then
   _GOAL="container"
 fi
 
-# 跨版本提示放在这里：它说的是「你的调用方式可能受影响」，
-# 不该被一句「找不到 docker / DPanel CLI」盖过去。
-if [ -n "$_GOAL" ]; then
-  compat_notice "$(compat_state_dir)"
-fi
-
 check_deps
-
-# 依赖齐了才记录 lastver：这一轮真的会跑到更新逻辑，用户已经看到提示了。
-if [ -n "$_GOAL" ]; then
-  compat_record "$(compat_state_dir)"
-fi
 
 case "$_GOAL" in
   compose)   compose_update ;;

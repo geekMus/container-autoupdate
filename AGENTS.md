@@ -11,7 +11,7 @@
 | 读什么 | 为什么 |
 |---|---|
 | `container-autoupdate.sh` 头部注释 | 安全原则的原始表述 |
-| `container-autoupdate.sh` 的 `BREAKING_TABLE` | 判断你的改动是否破坏兼容 |
+| `container-autoupdate.sh` 的 `VERSION` | 改脚本必须升版本（§7） |
 | `container-autoupdate.sh` 主流程（文件末尾） | 退出码与收尾逻辑在哪决定 |
 | `docs/how-it-works.md` | 安全不变量：什么情况该跳过 |
 | `docs/releasing.md` | 发版链路 |
@@ -100,7 +100,7 @@ v2.1.0 起，脚本分两条路：**容器模式**把「拉镜像、重建容器
 - **不许给 DPanel CLI 加 `-q` / `--quiet`**：它会把结果 JSON 一起吞掉（只剩 `[DEBUG]` 行），解析必然失败；`-q` 抑制的是命令结果，不是日志。
 - **取 DPanel 结果的规则是「stdout 里最后一个以 `{` 开头的行」**：stdout 混着大量 `[DEBUG]` / GORM 日志，结果 JSON 永远在最后一行。
 - **失败原因要透传，而且不能被截断**：把 DPanel 的 `error` 文本打进日志；取 JSON 字符串字段时**不能按逗号截断**（DPanel 的错误文本里就有逗号，实测会被切成半句，真实原因就丢了）。
-- **兼容防线（旧 flag/env、`--compat`）必须排在依赖检查之前**：缺 docker 的机器上也要先看到「这个写法不能用了、该怎么改」，而不是先报「缺少依赖命令」。跨版本 `WARN` 也在依赖检查之前打印，但 lastver 在依赖检查**之后**才写（依赖缺失的那轮不算「用户已知悉」，提示不会被永久吞掉）。
+- **参数/环境变量写错就报错退出（`rc=1`）**：不认识的写法不许静默忽略，也不许自动改写；错误信息里点名是哪一项，并指向 `--help`。
 - **失败原因必须同时落到真正的 stderr**（v1.1.2 起的设计，v2.0.0 保留）：计划任务（DPanel）在任务失败时**只保留 stderr、丢弃 stdout**；理由与实现要点见下面「历史 MUST」。
 
 ### NEVER（v2.1.0 现行）
@@ -235,9 +235,7 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 | Compose 模式：剩余预算 < `DP_MIN_UPGRADE` | `rc=1`，既不 pull 也不 up |
 | Compose 模式：`--dry-run` | 只列出项目涉及的镜像，`rc=0`，不 pull 不 up，零改动 |
 | 配置二选一（都填 / 都不填 / 名字不存在） | `rc=1`，不动任何东西 |
-| 旧 flag / 旧 env | `rc=3`，点名是哪一项，并给出新写法 |
-| `--compat` 非法值 / 形态错 | `rc=3`，与「未知参数」的 `rc=1` 区分开 |
-| 跨版本升级（lastver 是更早的版本） | 打印 `WARN` 后**继续执行**；lastver 写成当前版本；同版本不再重复提示 |
+| 不认识参数 / 旧 flag / 旧 env | `rc=1`，点名是哪一项 |
 
 ### 6.2 制造「有新版本」的正确方法
 
@@ -278,31 +276,18 @@ docker compose up -d                  # 让容器跑在 1.35 的内容上
 - 复原被测试动过的生产状态：容器镜像与 tag 一致、无残留 `rollback-pending`。
 - 确认生产容器仍 `healthy`。
 - 删掉上传到生产机的测试脚本（容器内 `/tmp/...`、宿主 `/tmp/...`）——调试文件不许留。
+- **在生产机上测「不认识的写法会被忽略」这类用例时，必须指向一个不存在的目标**（`--compose ct_no_such_project` / `--container ct_no_such`）：v4.0.0 没有兼容层，`CT_VERSION=1.2.3 sh … --compose magpie_gateway` 不会再被拦，它会**真的去更新生产项目**（v4.0.0 实测踩到：一次测试把生产 magpie_gateway 更新到了新镜像）。
 
 ---
 
-## 7. 破坏性变更与版本
+## 7. 版本
 
 ### 7.1 `VERSION` 是唯一版本来源
 
 - 不许在别处（脚本头部注释、usage 文本、文档示例）**硬编码当前版本号**——会过时。例外：文档里「锁死版本」的示例。
 - `VERSION` 只能含数字和点，不带 `v` 前缀（工作流会拦）。
 
-### 7.2 什么必须登记进 `BREAKING_TABLE`
-
-**只要会让用户已有的调用方式失效，就必须登记**：
-
-| 类别 | 例子 |
-|---|---|
-| `flag` | 命令行参数被移除 / 改名 |
-| `env` | 环境变量被移除 / 改名 |
-| `behavior` | 默认行为或语义变化 |
-
-**不登记**：新增参数、改日志措辞、改内部实现。
-
-> 没登记的破坏性变更对使用者是**完全静默**的。这是本仓库最容易犯的错。
-
-### 7.3 版本号怎么升
+### 7.2 版本号怎么升
 
 | 改动性质 | 版本段 |
 |---|---|
@@ -310,13 +295,11 @@ docker compose up -d                  # 让容器跑在 1.35 的内容上
 | 加参数 / 加能力，向后兼容 | minor |
 | 改默认行为、用户需改配置 | major 段 |
 
-### 7.4 三道防线不许拆
+### 7.3 没有兼容层（v4.0.0 起）
 
-1. `flag`/`env` 命中 → 立即中止，`exit 3`，给出新写法与迁移方式。
-2. `behavior` → 跨版本 `WARN`（记住每个目标上次跑过的版本）+ `--compat <版本>` 硬停。
-3. 退出码 `3` 必须与「未知参数」的 `1` 区分开。
-
-`compat_state_dir()` 的目录**必须与事务目录分开**。曾与 `C_WORK` 同路径，而收尾会 `rm -rf "$C_WORK"`，导致 `lastver` 每轮被删、跨版本提示永远不触发。
+- 不认识的参数就是错：打一句 `ERR 未知参数：…（用 --help 查看用法）`，`exit 1`。**不许**加「旧写法自动改写」「静默忽略」「跨版本提示」那一套。
+- 破坏性变更写进提交信息与发布说明的人话里即可，脚本内不再维护登记表。
+- 因此 `sh container-autoupdate.sh --version` 之类的「五个快速用例」只看 rc：认识的 `0`，不认识的 `1`。
 
 ---
 
@@ -361,7 +344,7 @@ MUST
   中文版 `> 语言：[中文](README.md) | [English](README.en.md)`；
   英文版 `> Language: [English](README.en.md) | [中文](README.md)`。
 - **英文文档里的本地链接必须指向英文文件**，锚点要按英文标题重算（GitHub 规则：小写、空格→连字符、去掉反引号/括号/点）。链接指向的文件不存在、锚点对不上标题 ⇒ 文档坏掉。
-- **代码标识符不翻译**：参数名、环境变量名、文件名、tag、镜像名、`BREAKING_TABLE`、`VERSION` 等一律原样，用反引号包起来。
+- **代码标识符不翻译**：参数名、环境变量名、文件名、tag、镜像名、`VERSION` 等一律原样，用反引号包起来。
 - **脚本真实输出的中文日志原样保留**，在代码块末尾补 `→` 开头的英文对照行；不要逐行夹杂英文。
 - **术语必须一致**（同一概念在所有英文文档里用同一个词）：DPanel 计划任务 → DPanel scheduled task；引导器 → bootstrapper；互斥锁 → mutex lock；健康门禁 → health gate；回滚点 → rollback point；演练 → dry run；退出码 → exit code；破坏性变更 → breaking change；迁移方式 → migration path；跨版本提示 → cross-version notice。
 - **英文文档里不许残留中文**，除了：脚本日志原文、代码标识符、切换条里的「中文」二字。
@@ -389,7 +372,7 @@ NEVER
 - `release.yml` 只在 `main` 上发版（`on.push.branches=[main]` + job 里 `if: github.ref == 'refs/heads/main'`）。
 - 其他分支与 PR 走 `ci.yml`，只校验不发版。
 - 工作流幂等：tag / Release 已存在就跳过。
-- 发布说明由 `scripts/gen-release-notes.sh` 自动生成（定位句 + 本版破坏性变更 + 提交列表 + 下载命令 + sha256）。
+- 发布说明由 `scripts/gen-release-notes.sh` 自动生成（定位句 + 提交列表 + 安装那段 + sha256）。
 
 ### 9.2 改了脚本却不改 VERSION 的后果
 
@@ -410,7 +393,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 
 ### 9.4 提交信息
 
-`type: 一句话说明`（`feat` / `fix` / `docs` / `chore` / `refactor`）。破坏性变更在正文里写清「从 vX 起改成什么」以及「是否已登记 `BREAKING_TABLE`」。
+`type: 一句话说明`（`feat` / `fix` / `docs` / `chore` / `refactor`）。破坏性变更在正文里写清「从 vX 起改成什么」。
 
 ---
 
@@ -427,7 +410,6 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 正常拉取被判「digest 不一致」 | 拿开头快照比对，上游在拉取期间发新版 | 用拉取流里的 `"status":"Digest: ..."` |
 | 回滚点凭空消失 | pull 之前就移动了 `:prev` | 用 `:rollback-pending` 占位，健康后才移 |
 | 容器跑旧镜像但 `:latest` 是新镜像 | 中止路径没还原 tag | `abort_tags` |
-| 跨版本 `WARN` 从不触发 | `lastver` 目录与事务目录同路径被 `rm -rf` | 状态目录分开 |
 | busybox 算术算出荒谬的天数 | `$(( 2026-31 ))` 把日期当算式 | `date -d` 转 epoch 再减 |
 | `--compose a --container b` 静默通过 | 两个分支各自清空对方变量，变成「后者胜出」 | `parse_args` 里用 `_SAW_COMPOSE`/`_SAW_CONTAINER` 标志位，循环后判两者同为 1 则 `exit 1` |
 | awk 脚本静默不生效 | 用了 `\s` / `\x27`（POSIX awk 不保证，mawk 不支持） | `[[:space:]]`、`sprintf("%c",39)` |
@@ -455,7 +437,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | `docker compose` 不可用 | 缺 Compose v2 插件（或只有 v1 的 `docker-compose`） | `check_deps` 里显式 `docker compose version`，缺就报错退出 1 |
 | DPanel 的结果 JSON 解析不到 | 要么加了 `-q`（结果被一起吞掉），要么取了第一行而不是最后一行 | 不加 `-q`；取 stdout 里**最后一个**以 `{` 开头的行 |
 | DPanel 的报错只剩半句话 | 用「到逗号为止」的方式取值，而错误文本里就有逗号 | 字符串值先按 `"key":"..."` 整串匹配，匹配不到再退数字/布尔 |
-| 首轮只看到「缺少依赖命令」，看不到迁移说明 | 兼容防线排在了依赖检查之后 | 旧 flag/env 与 `--compat` 必须排在 `check_deps` 之前 |
+| 不认识的参数被静默忽略 | `parse_args` 没有兜底的「未知参数」分支 | `*` 分支必须报错并 `exit 1` |
 | 计划任务里只有一句 `exit status 1` | 失败原因只写了 stdout，而 DPanel 失败时只保留 stderr | 把 `ERR`/`CRITICAL` 行与紧随的缩进补充行写进真 stderr |
 | 每轮都重建容器 | 跳过了「先检查后升级」 | 先不带 `--upgrade` 调一次，`upgrade` 为 true 才真升级 |
 | 升级后没有回滚点 | 传了 `--disable-bak` | 不许传它：`<容器名>-bak-<时间戳>` 就是回滚点 |
@@ -470,8 +452,8 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] `sh -n scripts/ct-stale-lock-check.sh` 通过
 - [ ] 三个 `.sh` 的 CR 计数为 0（`container-autoupdate.sh` 与 `scripts/*.sh`）
 - [ ] 改了脚本 → `VERSION` 已按 §7.3 升级
-- [ ] 若含破坏性变更 → 已登记 `BREAKING_TABLE`，且类别（`flag`/`env`/`behavior`）选对
-- [ ] `--help`、`--version`、无参数、`--bogus`、`--compat` 非法值 五个快速用例行为正确
+- [ ] 不认识的参数 / 环境变量 → `rc=1` 并点名（没有兼容层）
+- [ ] `--help`、`--version`、无参数、`--bogus` 四个快速用例行为正确（认识的 0，不认识的 1）
 - [ ] 至少跑了 §6.1 里受影响的那几行场景，并贴出真实输出
 - [ ] 测试容器 / 镜像 / 状态目录已清理，生产已复原且 `healthy`
 - [ ] 文档里没有新增硬编码的当前版本号
@@ -499,7 +481,7 @@ v2.1.0 起另外还要过这几条：
 - [ ] 判 DPanel 成败是**解析 JSON**，不是看退出码；「没有 `code` 字段」没有被当成失败
 - [ ] 容器模式仍然**先检查后升级**，且没有 `--disable-bak`、没有 `-q` / `--quiet`
 - [ ] 取结果用的是「stdout 最后一个以 `{` 开头的行」，取字符串字段不会被逗号截断
-- [ ] 兼容防线（旧 flag/env、`--compat`）仍排在依赖检查之前
+- [ ] 没有把兼容层加回来（§7.3）：旧写法就是 `rc=1`，没有改写、没有提示表
 - [ ] `docker compose version` 在 `check_deps` 里被显式检查（缺 v2 插件要报清楚，别让人以为是网络问题）
 - [ ] N1 真机跑过**两条路**：Compose（标签反查目录 → pull → up -d → 三态报告）与容器模式（容器内直执 + `docker exec` 各一次），并贴出真实输出
 - [ ] 测试留下的 `<容器名>-bak-<时间戳>` 备份容器、被顶掉的镜像 tag、`compose-*` 事务残留都已清干净
@@ -511,6 +493,6 @@ v3.0.0 起另外还要过这几条：
 - [ ] 计划任务的装法只有一处权威写法：`README.md` / `README.en.md` 的快速开始代码块与 `scripts/gen-release-notes.sh` 为 v3+ 生成的那段**逐行一致**（改了其中一处就同步另一处）
 - [ ] 那段装法仍然守两条底线：下载失败**不许静默成功**（沿用上一轮通过校验的副本，或 `ERR` + `rc=1`）；下到的东西**先校验再执行**（字节数 > 1000、`sh -n`、含 `container-autoupdate` 特征串）
 - [ ] 没有把 `curl ... | sh` 写进任何文档或示例（管道会吞掉下载失败）
-- [ ] `--ct-*` 任何形态、`CT_*` 任何非空值都 `rc=3` 并给出「改用计划任务里那段下载校验执行」的迁移说明（不是逐变量「删掉即可」——`compat_bootstrap_env` 必须排在 `compat_removed_env` 之前）
+- [ ] `--ct-*` 任何形态、`CT_*` 任何非空值都 `rc=1` 并点名（v4.0.0 没有兼容层，不再有专门的迁移说明）
 - [ ] 文档里锁版本的写法是**带 tag 的下载地址**（`releases/download/vX.Y.Z/…`），不是 `--ct-version`
 - [ ] 文档里没有残留「引导器 / ct-bootstrap / 缓存目录 / `--ct-*` 表」的现行说法（只允许出现在「v3.0.0 迁移」段与 AGENTS.md 的§8.5 历史节）

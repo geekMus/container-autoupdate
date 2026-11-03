@@ -14,12 +14,12 @@
 #
 # 说明内容由三部分组成，全部来自仓库自身：
 #   1. 脚本头部注释里的定位句
-#   2. 本版新增的破坏性变更（从脚本内 BREAKING_TABLE 按版本区间筛出）
-#   3. 上一个 tag 到本次的提交列表
-# 末尾附脚本文件的 sha256 / 大小 / 行数与下载命令。
+#   2. 上一个 tag 到本次的提交列表
+#   3. 安装 / 更新的那一段（与 README 的「快速开始」逐行一致）
+# 末尾附脚本文件的 sha256 / 大小 / 行数。
 #
 # 兼容性要求：只用 POSIX sh 与 POSIX awk（Ubuntu 默认 awk 是 mawk，
-# 不认 \s、\x27 这类 GNU 扩展，所以这里一律用 [[:space:]] 和 sprintf("%c",39)）。
+# 不认 \s、\x27 这类 GNU 扩展，所以这里一律用 [[:space:]]）。
 
 set -eu
 
@@ -32,8 +32,6 @@ if [ ! -f "$SCRIPT_FILE" ]; then
   echo "ERR 找不到脚本文件：$SCRIPT_FILE" >&2
   exit 1
 fi
-
-PREV_VER="${PREV_TAG#v}"
 
 # ---------------------------------------------------------------------------
 # 1) 定位句：脚本头部注释里的第一段正文
@@ -61,74 +59,7 @@ DESC=$(awk '
 ' "$SCRIPT_FILE" 2>/dev/null || true)
 
 # ---------------------------------------------------------------------------
-# 2) 破坏性变更：解析脚本里的 BREAKING_TABLE，只保留
-#    「版本 <= 本版」且「版本 > 上一版」的登记项。
-#    每行格式：版本|类别|旧写法|新写法|说明
-# ---------------------------------------------------------------------------
-BREAK_ROWS=$(awk -v cur="$VERSION" -v prev="$PREV_VER" '
-  function trim(s) {
-    gsub(/^[[:space:]]+/, "", s)
-    gsub(/[[:space:]]+$/, "", s)
-    return s
-  }
-  # 版本号转可比较的整数：1.2.3 -> 1*10^6 + 2*10^3 + 3
-  function vkey(s,   n, a, i, k) {
-    n = split(s, a, ".")
-    k = 0
-    for (i = 1; i <= 3; i++) k = k * 1000 + (a[i] + 0)
-    return k
-  }
-  BEGIN {
-    q = sprintf("%c", 39)          # 单引号；不能直接写，会破坏 shell 引号
-    qhead = "^" q                  # 行首单引号
-    qtail = q "[[:space:]]*$"      # 行尾单引号
-    in_tbl = 0
-    nl = 0
-  }
-  # BREAKING_TABLE 开始：可能同行就有内容，也可能是多行形式
-  /^BREAKING_TABLE=/ {
-    rest = substr($0, index($0, "=") + 1)
-    rest = trim(rest)
-    if (rest == q) {
-      in_tbl = 1                   # 多行形式：TABLE=\x27 换行 … 换行 \x27
-    } else if (rest != "") {
-      sub(qhead, "", rest)         # 单行形式：TABLE=\x27a|b|c\x27
-      sub(qtail, "", rest)
-      if (rest != "") { nl++; lines[nl] = rest }
-    }
-    next
-  }
-  in_tbl {
-    if ($0 == q) { in_tbl = 0; next }
-    nl++; lines[nl] = $0
-  }
-  END {
-    for (i = 1; i <= nl; i++) {
-      line = lines[i]
-      if (line ~ /^[[:space:]]*#/) continue      # 注释
-      if (line ~ /^[[:space:]]*$/) continue      # 空行
-      n = split(line, f, "|")
-      if (n < 4) continue
-      v = trim(f[1])
-      if (v == "") continue
-      kv = vkey(v)
-      if (kv > vkey(cur)) continue                       # 比本版新：还没发生
-      if (prev != "" && kv <= vkey(prev)) continue       # 上一版之前：早就发过
-      cat  = trim(f[2])
-      old  = trim(f[3])
-      new  = trim(f[4])
-      desc = trim(f[5])
-      if (cat == "flag")      kind = "命令行参数"
-      else if (cat == "env")  kind = "环境变量"
-      else                    kind = "默认行为"
-      printf "- **%s**（%s）：`%s` → `%s`\n", v, kind, old, new
-      if (desc != "") printf "  %s\n", desc
-    }
-  }
-' "$SCRIPT_FILE" 2>/dev/null || true)
-
-# ---------------------------------------------------------------------------
-# 3) 提交列表
+# 2) 提交列表
 # ---------------------------------------------------------------------------
 if [ -n "$PREV_TAG" ]; then
   RANGE="$PREV_TAG..HEAD"
@@ -138,7 +69,7 @@ fi
 COMMITS=$(git log --no-merges --pretty='- %s（%h）' "$RANGE" 2>/dev/null | head -n 40 || true)
 
 # ---------------------------------------------------------------------------
-# 4) 文件信息
+# 3) 文件信息
 # ---------------------------------------------------------------------------
 if command -v sha256sum >/dev/null 2>&1; then
   SHA=$(sha256sum "$SCRIPT_FILE" | cut -d' ' -f1)
@@ -151,34 +82,12 @@ BYTES=$(wc -c < "$SCRIPT_FILE" | tr -d ' ')
 LINES=$(wc -l < "$SCRIPT_FILE" | tr -d ' ')
 
 # ---------------------------------------------------------------------------
-# 维护者提醒：主/次版本号变了但没有登记破坏性变更时，发一条 workflow 警告。
-# 没登记的破坏性变更对使用者是完全静默的，这是最容易犯的错。
-# ---------------------------------------------------------------------------
-if [ -n "$PREV_VER" ]; then
-  CUR_MM=$(printf '%s' "$VERSION" | cut -d. -f1,2)
-  PREV_MM=$(printf '%s' "$PREV_VER" | cut -d. -f1,2)
-  if [ "$CUR_MM" != "$PREV_MM" ] && [ -z "$BREAK_ROWS" ]; then
-    echo "::warning::VERSION 从 $PREV_VER 升到 $VERSION（主/次版本号有变化），但 BREAKING_TABLE 里没有对应登记。若这次含破坏性变更请补登记；若只是新增能力，可忽略此提示。"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
 # 输出
 # ---------------------------------------------------------------------------
 echo "## 本版内容"
 echo ""
 if [ -n "$DESC" ]; then
   echo "$DESC"
-  echo ""
-fi
-
-if [ -n "$BREAK_ROWS" ]; then
-  echo "### 破坏性变更"
-  echo ""
-  echo "$BREAK_ROWS"
-  echo ""
-  echo "> 用 \`releases/latest/download/\` 的用户如果仍在用上面的旧写法，脚本会立刻"
-  echo "> 停下并给出迁移方式（退出码 3），不会静默出错。"
   echo ""
 fi
 
@@ -193,49 +102,30 @@ echo ""
 
 echo "### 安装 / 更新"
 echo ""
-if [ "$(printf '%s' "$VERSION" | cut -d. -f1)" -ge 3 ] 2>/dev/null; then
-  echo "**本版起没有引导器了**：把下面整段填进 DPanel 计划任务的「脚本」框（一个脚本就够）。"
-  echo ""
-  echo '```sh'
-  echo "U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
-  echo "U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
-  echo "T=/tmp/ct-new.sh"
-  echo 'curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true'
-  echo 'if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \'
-  echo '   && grep -q container-autoupdate "$T"; then'
-  echo '  mv -f "$T" /tmp/container-autoupdate.sh'
-  echo 'fi'
-  echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }'
-  echo 'sh /tmp/container-autoupdate.sh --compose myapp'
-  echo '```'
-  echo ""
-  echo "想锁死本版：把上面两个地址里的 \`latest/download\` 换成 \`download/$TAG\`。"
-  echo "从旧版（带 \`ct-bootstrap.sh\` 的任务）迁移：直接把这整段替换掉原来的两行即可；"
-  echo "任务里若还留着 \`CT_*\` 变量或 \`--ct-*\` 参数，脚本会停下并说明（退出码 3）。"
-else
-  echo "**生产环境推荐用引导器**（自带缓存，不必每轮联网；锁版本时完全不联网）："
-  echo ""
-  echo '```sh'
-  echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
-  echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
-  echo "/usr/local/bin/ct-bootstrap.sh --ct-version $VERSION --compose myapp   # 锁到本版"
-  echo '```'
-  echo ""
-  echo "想直接跑主脚本（自己维护文件，不会自动升级）："
-  echo ""
-  echo '```sh'
-  echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/download/$TAG/container-autoupdate.sh \\"
-  echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
-  echo '```'
-fi
+echo "把下面整段填进 DPanel 计划任务的「脚本」框（一个脚本就够）。"
 echo ""
-echo "> \`latest/download\` 会返回 302，用 \`curl\` 时加 \`-L\`；上面那段已经带了。"
-echo "> 国内网络可用前缀 \`https://gh-proxy.com/\`（公共站）或 \`https://github.mus.pp.ua/\`（自建站）。"
+echo '```sh'
+echo "SRC='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh"
+echo "https://ghfast.top/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh"
+echo "https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
+echo "T=/tmp/ct-new.sh"
+echo 'okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }'
+echo 'for u in $SRC; do'
+echo '  curl -fsSL --max-time 30 "$u" -o "$T" 2>/dev/null || continue'
+echo '  okfile "$T" && break'
+echo 'done'
+echo 'okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh'
+echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }'
+echo 'sh /tmp/container-autoupdate.sh --compose myapp'
+echo '```'
 echo ""
+echo "想锁死本版：把 \`SRC\` 里每一行的 \`latest/download\` 换成 \`download/$TAG\`。"
+echo ""
+
 echo "排查残留进程和旧锁文件（只读脚本，不改任何东西）："
 echo ""
 echo '```sh'
-echo "curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \\"
+echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \\"
 echo "  -o /tmp/ct-stale-lock-check.sh"
 echo "sh /tmp/ct-stale-lock-check.sh"
 echo '```'

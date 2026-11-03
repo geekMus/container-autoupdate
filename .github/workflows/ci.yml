@@ -83,29 +83,24 @@ jobs:
           sh container-autoupdate.sh --help >/dev/null
           sh container-autoupdate.sh --version
 
-      - name: 迁移防线仍然有效
+      - name: 不认识的东西一律报错退出
         run: |
           set -eu
-          # 旧写法必须硬停并给迁移说明（退出码 3），不能被当成未知参数（1）或被忽略。
+          # 4.0.0 起没有兼容层：不认识的参数就是错，退出码 1。
+          # 这条守卫防止有人又把「静默忽略」加回来。
           rc=0
-          sh container-autoupdate.sh --ct-version 1.2.3 --compose a >/dev/null 2>&1 || rc=$?
-          if [ "$rc" != "3" ]; then
-            echo "::error::--ct-version 应以退出码 3 中止，实际是 $rc"
-            exit 1
-          fi
-          rc=0
-          CT_VERSION=1.2.3 sh container-autoupdate.sh --compose a >/dev/null 2>&1 || rc=$?
-          if [ "$rc" != "3" ]; then
-            echo "::error::CT_VERSION 仍被设置时应以退出码 3 中止，实际是 $rc"
+          sh container-autoupdate.sh --compat 4.0.0 --compose a >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "1" ]; then
+            echo "::error::--compat 应以退出码 1 中止，实际是 $rc"
             exit 1
           fi
           rc=0
           sh container-autoupdate.sh --state-dir /tmp/x --compose a >/dev/null 2>&1 || rc=$?
-          if [ "$rc" != "3" ]; then
-            echo "::error::--state-dir 应以退出码 3 中止，实际是 $rc"
+          if [ "$rc" != "1" ]; then
+            echo "::error::--state-dir 应以退出码 1 中止，实际是 $rc"
             exit 1
           fi
-          echo "迁移防线检查通过"
+          echo "未知参数检查通过"
 
       - name: 文档检查
         run: |
