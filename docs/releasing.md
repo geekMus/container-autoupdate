@@ -1,7 +1,5 @@
 # 发版流程（维护者）
 
-> 语言：[中文](releasing.md) | [English](releasing.en.md)
-
 ## 发版流程
 
 1. 改脚本 → 升 `VERSION`（`container-autoupdate.sh` 里唯一那一行）。

@@ -105,7 +105,7 @@ jobs:
       - name: 文档检查
         run: |
           set -eu
-          # 中英文双版本文档必须同步：语言切换条、本地链接与锚点、表格结构、CRLF。
+          # 文档只维护中文版：本地链接与锚点、表格结构、CRLF。
           if [ -f scripts/check-docs.py ]; then
             python3 scripts/check-docs.py .
           fi

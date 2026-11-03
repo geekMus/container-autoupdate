@@ -1,7 +1,5 @@
 # 进阶用法
 
-> 语言：[中文](advanced-usage.md) | [English](advanced-usage.en.md)
-
 ## DPanel 计划任务
 
 新建计划任务 → 执行周期选每小时（或你要的频率）→ **执行超时设 600 秒** → 脚本框整段填下面这段：

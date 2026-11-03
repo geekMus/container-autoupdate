@@ -1,7 +1,5 @@
 # 参数与环境变量
 
-> 语言：[中文](parameters.md) | [English](parameters.en.md)
-
 ## 参数
 
 | 参数 | 默认 | 说明 |
