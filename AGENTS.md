@@ -85,13 +85,16 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 
 以下行为是经过 40+ 项故障实测才定下来的。**改脚本时不许为了「简洁」删掉其中任何一条。**
 
-v2.0.0 起，脚本把「拉镜像、重建容器、判健康、留回滚点」全部交给 DPanel 的命令行（`container:upgrade` / `compose:deploy`）。所以本节分成两半：**上面是当前必须守住的**，**下面标着「历史」的是 v1.x 时代自己拉取/重建时期的教训**——那些代码已经删掉，但你要是重写同类逻辑，不许重犯。
+v2.1.0 起，脚本分两条路：**容器模式**把「拉镜像、重建容器、判健康、留回滚点」交给 DPanel 的命令行（`container:upgrade`）；**Compose 模式**用 docker 自己的 `docker compose pull` + `docker compose up -d` 就地重新部署。所以本节分成两半：**上面是当前必须守住的**，**下面标着「历史」的是 v1.x 时代自己拉取/重建、以及 v2.0.0 短暂把 Compose 交给 `compose:deploy` 时期的教训**——那些代码已经删掉，但你要是重写同类逻辑，不许重犯。
 
-### MUST（v2.0.0 现行）
+### MUST（v2.1.0 现行）
 
-- **更新动作只许交给 DPanel**：容器走 `container:upgrade`，Compose 走 `compose:deploy`。**不许在脚本里重新实现**「拉镜像 / 重建容器 / 复刻网络与挂载 / 健康门禁 / `:prev` 回滚点」——v1.x 为此写了一千多行，实测反复出事（拉取被误判卡死、失败原因打两遍、回滚点被清理逻辑误删）。要重建容器，先用**一次实验**证明你会比 DPanel 做得更对。
-- **DPanel 的成败只能解析 JSON 判**：`compose:deploy` 对未登记的项目返回 `rc=0`，JSON 却是 `{"code":500,...}`；成功时（`{"name":"<项目名>"}`）**根本没有 `code` 字段**。判定条件必须是「`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败」。
-- **`compose:deploy` 必须显式 `--pull-image dpanel`**：它的默认值是 `command`，实测那条路**不会去拉新镜像**（镜像标签已存在就不回源），结果是「部署成功但版本没变」——最容易被误当成没事。
+- **容器模式的更新动作只许交给 DPanel**（`container:upgrade`），**不许在脚本里重新实现**「拉镜像 / 重建容器 / 复刻网络与挂载 / 健康门禁 / `:prev` 回滚点」——v1.x 为此写了一千多行，实测反复出事（拉取被误判卡死、失败原因打两遍、回滚点被清理逻辑误删）。要重建容器，先用**一次实验**证明你会比 DPanel 做得更对。
+- **Compose 模式只用 compose 自己的命令**：`docker compose pull` 然后 `docker compose up -d`。**不许加 `--remove-orphans`**；不许手工 `tag` / `create` / `rm`；compose 参数（`COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES`）必须走环境变量（拼成命令行时，路径含空格会让 compose 打印 Usage 却返回 `rc=0`）。
+- **Compose 的拉取失败了就不许部署**：`pull` 非 0 就报错退出（退出码 1），项目必须原样不动；`up -d` 失败同样报错退出码 1，脚本不许改 compose 文件或容器定义，要能让用户「直接再跑一轮」。
+- **报告必须如实区分三种情况**：容器换了镜像（`已重建：<名>（旧12位 → 新12位）`）、这一轮新建的容器（`新建：<名>`）、真的什么都没变（`已是最新（拉取后没有容器需要重建）`）。把「新建」写成「已是最新」、或把「部署成功」写成「已更新到最新版」，都是不许的。
+- **Compose 项目目录优先从容器标签反查**（`com.docker.compose.project.working_dir` / `.config_files` / `.environment_file`），反查不到才用 `--compose-dir` / `COMPOSE_DIR` 兜底；两者都没有就退出码 1 并给出二选一指引。不许靠「猜常见目录」。
+- **DPanel 的成败只能解析 JSON 判**（容器模式）：`compose:deploy` 对未登记的项目返回 `rc=0`，JSON 却是 `{"code":500,...}`；成功时（`{"name":"<项目名>"}`）**根本没有 `code` 字段**。判定条件必须是「`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败」。
 - **容器模式必须先检查、后升级**：先不带 `--upgrade` 调一次 `container:upgrade` 看 `upgrade` 是不是 `true`，是才真升级。跳过检查直接升级 = 每轮都重建容器。
 - **不许传 `--disable-bak`**：DPanel 的备份容器（`<容器名>-bak-<时间戳>`）就是容器模式的回滚点，关掉它等于没有回滚点。
 - **不许给 DPanel CLI 加 `-q` / `--quiet`**：它会把结果 JSON 一起吞掉（只剩 `[DEBUG]` 行），解析必然失败；`-q` 抑制的是命令结果，不是日志。
@@ -100,12 +103,14 @@ v2.0.0 起，脚本把「拉镜像、重建容器、判健康、留回滚点」�
 - **兼容防线（旧 flag/env、`--compat`）必须排在依赖检查之前**：缺 docker 的机器上也要先看到「这个写法不能用了、该怎么改」，而不是先报「缺少依赖命令」。跨版本 `WARN` 也在依赖检查之前打印，但 lastver 在依赖检查**之后**才写（依赖缺失的那轮不算「用户已知悉」，提示不会被永久吞掉）。
 - **失败原因必须同时落到真正的 stderr**（v1.1.2 起的设计，v2.0.0 保留）：计划任务（DPanel）在任务失败时**只保留 stderr、丢弃 stdout**；理由与实现要点见下面「历史 MUST」。
 
-### NEVER（v2.0.0 现行）
+### NEVER（v2.1.0 现行）
 
 - 不许用 DPanel CLI 的**退出码**判成败。实测三种失败（容器不存在、项目未登记、镜像清单读不到）退出码都是 `0`。
 - 不许把「JSON 里没有 `code` 字段」当成失败——成功的形状就没有它。
-- 不许自己写「有没有新版本」的 digest 比对：容器模式用 DPanel 返回的 `upgrade`；Compose 模式**本来就无法预知**（脚本只负责转交），别假装知道。
-- 不许把 `--pull-image` 留成默认值，也不许在日志里把「部署成功」写成「已更新到最新版」——部署成功只说明 DPanel 执行完了，不是版本变了。
+- 不许自己写「有没有新版本」的 digest 比对：容器模式用 DPanel 返回的 `upgrade`；Compose 模式靠 `docker compose pull` 本身（**拉取就是判断**），别假装提前知道。
+- 不许在 Compose 模式里手工 `docker tag` / `docker create` / `docker rm` 去动容器——只许 `docker compose pull` + `docker compose up -d`。
+- 不许把「部署成功」写成「已更新到最新版」：`up -d` 成功只说明 compose 跑完了；版本变没变要看容器镜像 id 的比对结论（`已重建` / `新建` / `已是最新`）。
+- 不许把「部署前没有这个容器」（`新建`）混进「已是最新」报出去——那是两种完全不同的事实。
 
 ### 历史 MUST（v1.x：脚本自己拉取与重建容器）
 
@@ -166,7 +171,7 @@ v2.0.0 起，脚本把「拉镜像、重建容器、判健康、留回滚点」�
 
 ## 4. （历史）v1.x 的拉取与进度判定
 
-> v2.0.0 起脚本不再自己拉镜像（交给 DPanel），本节整节都是历史。留着是因为「怎么判断一次拉取到底成没成」这个问题不会消失，而下面每条都是实测踩出来的。
+> v2.0.0 起**容器模式**不再自己拉镜像（交给 DPanel）；v2.1.0 起 **Compose 模式**用 `docker compose pull`，拉取完全交给 compose，本节讲的「自己读拉取流、按字节数判卡死、从流里抓 digest」那一套整节都是历史。留着是因为「怎么判断一次拉取到底成没成」这个问题不会消失，而下面每条都是实测踩出来的。
 
 ### 4.1 不许用 `docker pull` / `docker compose pull` 的 stdout 判断卡死
 
@@ -201,9 +206,10 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 
 - 全脚本硬上限 `T_HARD=540` 秒；DPanel 任务的 `scriptRunTimeout` 设 **600**。
 - **内部超时必须显著小于外部超时。** 被 DPanel SIGKILL 的那一轮，`ims_cron_log.value` 里的 message 是**空字符串**——进程被 KILL 前来不及 flush，日志里只剩一行 `signal: killed`，什么都查不到。
-- v2.0.0 的预算分给三次调用：`DP_T_CHECK`（查有没有新版本，默认 120 秒）、`DP_T_UPGRADE`（真正升级/部署，默认 420 秒）、`DP_MIN_UPGRADE`（低于这个剩余秒数就**不动手**，默认 90 秒）。
+- v2.1.0 的预算分给五种调用：`DP_T_CHECK`（容器模式查有没有新版本，默认 120 秒）、`DP_T_UPGRADE`（容器模式真正升级，默认 420 秒）、`DP_T_PULL`（Compose 模式 `docker compose pull`，默认 420 秒）、`DP_T_UP`（Compose 模式 `docker compose up -d`，默认 180 秒）、`DP_MIN_UPGRADE`（低于这个剩余秒数就**不动手**，默认 90 秒）。
   - **每一次调用都要按剩余预算重新收敛**（不许直接用配置值），否则最后一句话没说完就被 SIGKILL。
   - 剩余时间不够时**提前收手并如实报错**，不许「试一把再说」——被 KILL 的那一轮在计划任务里什么都查不到。
+  - Compose 模式的 `pull` 比容器模式慢（要逐层拉），但它失败时项目没被动过，属于「白跑一轮」而不是「留下半新半旧」；`up -d` 才是会改状态的那一步，所以它的超时可以短一些。
 
 ---
 
@@ -219,9 +225,15 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 | 容器模式：DPanel 报失败（`status=failed`） | `rc=1`，日志里有 DPanel 的**原始错误文本** |
 | 容器模式：剩余预算 < `DP_MIN_UPGRADE` | `rc=1`，**不动手** |
 | 容器不存在 | `rc=1`，透传 `No such container`（不是「升级成功」） |
-| Compose 模式：部署成功 | JSON 是 `{"name":...}`（无 `code`）→ `rc=0`，且断言**确实传了 `--pull-image dpanel`** |
-| Compose 模式：项目未登记 | CLI `rc=0` 但 JSON `code:500` → 脚本 `rc=1` + 迁移指引 |
-| Compose 模式：`--dry-run` | 只提示「没有只检查能力」，`rc=0`，零改动 |
+| Compose 模式：拉取后有变化 | `docker compose pull` → `docker compose up -d` → 报 `已重建：<名>（旧12位 → 新12位）` + `已重新部署（N/M 个容器换了镜像）`，`rc=0`，容器 id 变了 |
+| Compose 模式：拉取后无变化 | 报 `已是最新（拉取后没有容器需要重建）`，`rc=0`，容器 id 不变（不许谎报 `已重建`） |
+| Compose 模式：首次部署（部署前没有这个容器） | 报 `新建：<名>` + `已部署（N 个容器新建）`，**不许**说「已是最新」 |
+| Compose 模式：`pull` 失败 | `rc=1`，**不执行** `up -d`，项目原样不动 |
+| Compose 模式：`up -d` 失败 | `rc=1`，脚本不改 compose 文件、不手工动容器 |
+| Compose 模式：`up` 之后有容器没在运行 | `rc=1`，日志逐条点名「名字 状态」 |
+| Compose 模式：反查不到项目目录 | `rc=1`，给出二选一指引（`--compose-dir` / 确认项目名），错误进 stderr |
+| Compose 模式：剩余预算 < `DP_MIN_UPGRADE` | `rc=1`，既不 pull 也不 up |
+| Compose 模式：`--dry-run` | 只列出项目涉及的镜像，`rc=0`，不 pull 不 up，零改动 |
 | 配置二选一（都填 / 都不填 / 名字不存在） | `rc=1`，不动任何东西 |
 | 旧 flag / 旧 env | `rc=3`，点名是哪一项，并给出新写法 |
 | `--compat` 非法值 / 形态错 | `rc=3`，与「未知参数」的 `rc=1` 区分开 |
@@ -238,6 +250,17 @@ docker tag ct_fake busybox:1.36                # 顶掉 tag，DPanel 就会认�
 ```
 
 测完必须把被顶掉的 tag 复原（重新 `docker pull` 并比对 digest），否则你留下的「假旧镜像」会污染后续每一轮判断。
+
+**Compose 模式不能用上面这一招**：它的判据是 `docker compose pull` 拉到了什么，而 `export`/`import` 出来的镜像**丢了镜像配置**（实测：容器起不来，先是 `exec: "sleep": executable file not found in $PATH`，显式写 entrypoint 又报 `exec: "/bin/busybox": stat /bin/busybox: no such file or directory` —— 未启动的容器 `docker export` 出来是空的 rootfs）。正确做法是**拿一个真实可运行的旧标签顶替**：
+
+```sh
+docker pull busybox:1.35            # 真旧版本，能正常运行
+docker tag busybox:1.35 busybox:1.36  # 顶掉 compose 文件里写的那个 tag
+docker compose up -d                  # 让容器跑在 1.35 的内容上
+# 现在跑脚本：pull 会把真 1.36 拉回来 → up -d 重建 → 应当报「已重建」
+```
+
+测完同样要把 tag 复原（重新 `docker pull busybox:1.36` 并比对 digest）。第一次部署（容器都还不存在）用 `STUB_NEWPROJ` 那类桩在本地测就行，别在生产机上删容器。
 
 ### 6.3 打桩方式
 
@@ -440,7 +463,12 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 拉取最后卡在「层都拉完了」被判卡死，daemon 报 `context canceled` | Docker 写镜像配置期间不吐字节，被当成停滞掐掉，已下载的层全作废 | 层拉完后进收尾宽限（`T_STALL_FINISH`）；放弃前先问 daemon 镜像是否已落盘 |
 | DPanel CLI 明明失败了，脚本却报成功 | 用 CLI 退出码判成败，而失败时退出码仍是 0（容器不存在、项目未登记、镜像清单读不到） | 解析 JSON：`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败 |
 | 反过来：DPanel 成功了却被判失败 | 成功的形状（`{"name":"..."}`、`{"containerId":"..."}`）**没有 `code` 字段** | 没有 `code` 不是失败信号 |
-| `compose:deploy` 跑完镜像没变，却报成功 | `--pull-image` 默认是 `command`，那条路不拉新镜像 | 显式 `--pull-image dpanel` |
+| （v2.0.0 历史）`compose:deploy` 跑完镜像没变，却报成功 | `--pull-image` 默认是 `command`，那条路不拉新镜像 | 显式 `--pull-image dpanel`（v2.1.0 起 Compose 不再走 DPanel，已无此坑） |
+| Compose 明明重建了容器，却报「新建」 | 快照按**容器 ID** 当键，而 `up -d` 重建后 ID 会变，旧的删了、新的没见过 | 快照一律按**容器名**当键（N1 真机实测踩到：报的是 `新建：…` 而不是 `已重建：…`） |
+| Compose 报「已是最新」，可容器明明是新起的 | 把「部署前没有这个容器」当成「没变化」 | 分三态报告：`已重建` / `新建` / `已是最新`，谁都不许并进别人 |
+| Compose 反查不到项目目录 | 项目从没部署过、容器已被 `down`、或项目名写错 | 用 `--compose-dir` 指目录，或先手动 `docker compose up -d` 一次 |
+| 造假旧镜像起不来（`exec: "sleep": … not found`、`stat /bin/busybox: …`） | `docker export`/`import` 丢镜像配置；未启动的容器导出的 rootfs 是空的 | 别用 export/import：`docker pull` 一个真实旧标签顶掉 tag（见 §6.2） |
+| `docker compose` 不可用 | 缺 Compose v2 插件（或只有 v1 的 `docker-compose`） | `check_deps` 里显式 `docker compose version`，缺就报错退出 1 |
 | DPanel 的结果 JSON 解析不到 | 要么加了 `-q`（结果被一起吞掉），要么取了第一行而不是最后一行 | 不加 `-q`；取 stdout 里**最后一个**以 `{` 开头的行 |
 | DPanel 的报错只剩半句话 | 用「到逗号为止」的方式取值，而错误文本里就有逗号 | 字符串值先按 `"key":"..."` 整串匹配，匹配不到再退数字/布尔 |
 | 首轮只看到「缺少依赖命令」，看不到迁移说明 | 兼容防线排在了依赖检查之后 | 旧 flag/env 与 `--compat` 必须排在 `check_deps` 之前 |
@@ -478,18 +506,20 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 改过拉取的停滞/收尾判定 → 复跑「层拉完后长时间静默」场景（不进普通卡死判定），且**放弃之前**问过 daemon 镜像是否已落盘
 - [ ] 改过失败原因的打印位置 → 同一句失败原因在 stdout 与 stderr 里**各只出现一次**（stdout 完整日志 + stderr 给计划任务看是两回事，不许当成重复）
 
-v2.0.0 起另外还要过这几条：
+v2.1.0 起另外还要过这几条：
 
-- [ ] 更新动作**没有**在脚本里重新实现（仍全部交给 `container:upgrade` / `compose:deploy`；没有新的 pull / create / 健康门禁 / `:prev` 代码）
+- [ ] **容器模式**的更新动作没有在脚本里重新实现（仍只调 `container:upgrade`；没有新的 pull / create / 健康门禁 / `:prev` 代码）
+- [ ] **Compose 模式**只调 `docker compose pull` 与 `docker compose up -d`，没有手工 `tag`/`create`/`rm`，也没有 `--remove-orphans`
+- [ ] compose 参数仍走 `COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES`（没拼成命令行）
+- [ ] `pull` 失败时**没有**继续执行 `up -d`（测试里有断言）
+- [ ] 报告分得清三态：`已重建` / `新建` / `已是最新`，且**快照按容器名当键**（按 ID 会把重建误判成新建，N1 真机踩过）
+- [ ] `--compose-dir` 与 `COMPOSE_DIR` **恢复可用**（不再被当成已移除的旧写法），`T_INSPECT` 仍被接受
+- [ ] `DP_T_PULL` / `DP_T_UP` / `DP_T_CHECK` / `DP_T_UPGRADE` 都**按剩余预算重新收敛**（不是直接用配置值）
 - [ ] 判 DPanel 成败是**解析 JSON**，不是看退出码；「没有 `code` 字段」没有被当成失败
-- [ ] `compose:deploy` 仍然显式带着 `--pull-image dpanel`（测试里有断言，不是靠人眼）
-- [ ] 容器模式仍然**先检查后升级**（不带上 `--upgrade` 的调用没被删掉或合并）
-- [ ] 调用 DPanel CLI 时**没有** `-q` / `--quiet`
-- [ ] 取结果用的是「stdout 最后一个以 `{` 开头的行」
-- [ ] 取 JSON 字符串字段**不会**被逗号截断（拿一条带逗号的 `error` 文本实测过）
+- [ ] 容器模式仍然**先检查后升级**，且没有 `--disable-bak`、没有 `-q` / `--quiet`
+- [ ] 取结果用的是「stdout 最后一个以 `{` 开头的行」，取字符串字段不会被逗号截断
 - [ ] 兼容防线（旧 flag/env、`--compat`）仍排在依赖检查之前
-- [ ] 三种 DPanel 失败（容器不存在 / 项目未登记 / 镜像清单读不到）**各自**实测过：脚本 `rc=1` 且日志里有 DPanel 的原始错误文本
-- [ ] N1 真机跑过两条路径（容器模式；容器内直执 + `docker exec` 两种调用方式各一次），并贴出真实输出
-- [ ] 测试留下的 `<容器名>-bak-<时间戳>` 备份容器已删干净（生产上不许堆）
+- [ ] `docker compose version` 在 `check_deps` 里被显式检查（缺 v2 插件要报清楚，别让人以为是网络问题）
+- [ ] N1 真机跑过**两条路**：Compose（标签反查目录 → pull → up -d → 三态报告）与容器模式（容器内直执 + `docker exec` 各一次），并贴出真实输出
+- [ ] 测试留下的 `<容器名>-bak-<时间戳>` 备份容器、被顶掉的镜像 tag、`compose-*` 事务残留都已清干净
 - [ ] N1 上的测试脚本与临时文件（容器内 `/tmp/...`、宿主 `/tmp/...`）已删
-- [ ] 提醒用户：`compose:deploy` 只认 DPanel 里**已登记**的项目，没登记的要么先在 DPanel 里加，要么继续用旧版本

@@ -4,9 +4,9 @@
 
 A single-file container auto-update script for **DPanel scheduled tasks**.
 
-One run = one check: the script does exactly three things — decide whether an update is due, hand the update action to DPanel, and report the result faithfully. It does not pull images or rebuild containers itself. **The script contains no scheduler** — the frequency, the start/stop control and the concurrency are all delegated to DPanel's "scheduled task".
+One run = one check: the script does exactly three things — decide whether an update is due, perform the update action, and report the result faithfully. **The script contains no scheduler** — the frequency, the start/stop control and the concurrency are all delegated to DPanel's "scheduled task".
 
-> Starting with v2.0.0, every update action is left to DPanel itself. The reason is simple: rebuilding a container means reproducing its network, mounts (including the real names of anonymous volumes), resource limits, restart policy, capabilities and much more, and missing one of them is a production incident; DPanel already does all of that properly, and the backup container it leaves behind doubles as a ready-made rollback point. The script therefore shrank from 1700-odd lines to around 700, with a small, controllable surface.
+> Each of the two paths plays to its own strength: **a plain container is handed to DPanel**, while **a Compose project is handed to Docker's own Compose command**. Rebuilding a container means reproducing its network, mounts (including the real names of anonymous volumes), resource limits, restart policy, capabilities and much more, and missing one of them is a production incident; DPanel already does all of that properly, and on a failed upgrade it rolls back by itself and leaves a ready-made backup container behind. A Compose project, on the other hand, carries all the information about which containers belong to it, which Compose file it uses and how to rebuild them, so `docker compose pull` + `docker compose up -d` is simply its standard procedure. The script therefore shrank from 1700-odd lines to around 700, with a small, controllable surface.
 
 > Running it by hand is allowed too; that is a one-off run that ends when it is done. It is **not recommended** to wrap it in another timer such as cron or a systemd timer — concurrency is guaranteed by the DPanel scheduled task, one scheduled task per target.
 
@@ -14,20 +14,32 @@ One run = one check: the script does exactly three things — decide whether an 
 
 | How your container was started | Which argument to use | What the script actually runs |
 |---|---|---|
-| `docker compose up -d` | `--compose <project-name>` | `dpanel compose:deploy --name <project-name> --pull-image dpanel` |
+| `docker compose up -d` | `--compose <project-name>` | `docker compose pull` + `docker compose up -d` (redeploy in place) |
 | `docker run ...` | `--container <container-name>` | `dpanel container:upgrade --name <container-name>` (it checks first and adds `--upgrade` only when an upgrade is needed) |
 
-The script reads neither the Compose file nor the image reference: in both modes it just hands the target to DPanel by name.
+**Container mode** just hands the target name to DPanel and does nothing else.
 
-> Pulling from the registry is entirely delegated to DPanel / the Docker daemon, using **the registry mirrors that you and the daemon configured**; the script never touches a registry at all — so "racing several mirror prefixes in parallel" is no longer needed under v2.0.0.
+**Compose mode** does not go through DPanel. It first identifies the project inside Docker: it finds a container of the project with
+`docker ps -a --filter label=com.docker.compose.project=<project-name>`, then reads three Compose labels off it —
+`com.docker.compose.project.working_dir` (working directory), `com.docker.compose.project.config_files` (Compose file) and
+`com.docker.compose.project.environment_file` (env file). Only when that lookup fails (the project has not a single container) does it fall back to `--compose-dir <path>`
+(**available again as of v2.1.0**). With the directory known, it runs Compose's own `pull` and `up -d` there, and then reports faithfully which containers changed image and whether any container failed to come up.
+
+> Why Compose does not go through DPanel: **the project does not have to be registered in the DPanel web UI first**, and you do not have to
+> deal with the `--pull-image` default-value trap of `compose:deploy` (the default `command` never pulls a new image, so you end up with
+> "the deployment succeeded but the version did not change"). The script only runs `docker compose pull` + `docker compose up -d` and
+> **never adds `--remove-orphans`** — that would delete containers that are not in the current Compose file, which is a data incident.
+
+> Pulling from the registry is entirely delegated to the Docker daemon / DPanel, using **the registry mirrors that you and the daemon configured**; the script never touches a registry at all — so "racing several mirror prefixes in parallel" is no longer needed.
 
 ## Prerequisites
 
-- **DPanel** must be installed on the target machine: every update action relies on DPanel's own command line (the `container:upgrade` / `compose:deploy` that ship with DPanel 1.11.x).
+- **Container mode** requires **DPanel** on the target machine: the upgrade action relies on DPanel's own command line (the `container:upgrade` that ships with DPanel 1.11.x).
 - **Running inside the dpanel container is recommended**: DPanel's "scheduled task" executes inside the dpanel container by default, and the script calls `/app/server/dpanel` directly.
-- Running on the host also works, but the host needs the `docker` command: the script then calls into the container with `docker exec dpanel /app/server/dpanel ...`. When the DPanel container is not called `dpanel`, name it with `--dpanel-container <name>`.
-- **The Compose project must already be registered in the DPanel web UI** (DPanel web UI → Compose → create / import). When it is not registered, DPanel returns an error, the script recognises it and prints a migration path, exit code `1`.
-- Required commands: `timeout` `sed` `awk` `grep` (busybox or coreutils both work). Outside the dpanel container, `docker` is needed as well. The main script **no longer needs `curl` or `flock`** (the bootstrapper still needs `curl` to download the script).
+- Container mode also works on the host, but the host needs the `docker` command: the script then calls into the container with `docker exec dpanel /app/server/dpanel ...`. When the DPanel container is not called `dpanel`, name it with `--dpanel-container <name>`.
+- **Compose mode does not depend on DPanel**: it needs `docker` and the **Compose v2 plugin** (`docker compose`, not `docker-compose`); when the plugin is unavailable it prints `ERR 无法执行 docker compose（缺 compose 插件？）` and exits `1`.
+- **A Compose project does not have to be registered in the DPanel web UI**: the script looks the project directory and the Compose file up from the container labels by project name; when that lookup fails, point at the directory with `--compose-dir <path>`, or run `docker compose up -d` by hand once so that the labels land on the containers.
+- Required commands: `timeout` `sed` `awk` `grep` (busybox or coreutils both work). Compose mode, and anything not running inside the dpanel container, needs `docker` as well. The main script **needs neither `curl` nor `flock`** (the bootstrapper still needs `curl` to download the script).
 
 ## Quick start
 
@@ -77,14 +89,14 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 
 The cache lives in `/var/cache/container-autoupdate` (change it with `--ct-cache-dir` / `CT_CACHE_DIR`), one file per version, keeping only the 3 most recent (`--ct-cache-keep` / `CT_CACHE_KEEP`). Cached files are checked for syntax, version number and signature string, so a half-downloaded file is never executed as a script. The bootstrapper's own switches always use the `--ct-*` prefix (the same `CT_*` environment variables also work; the command line wins); everything else is passed through to the main script unchanged.
 
-
 ## Common commands
 
 ```sh
 container-autoupdate.sh --container mycontainer --dry-run   # container mode: ask DPanel whether a new version exists, change nothing
 container-autoupdate.sh --container mycontainer             # upgrade a plain container
-container-autoupdate.sh --compose myapp                     # deploy a Compose project (must be registered in DPanel)
-container-autoupdate.sh --dpanel-container mydpanel --compose myapp   # when the DPanel container is not called dpanel
+container-autoupdate.sh --compose myapp                     # redeploy a Compose project in place (no DPanel registration needed)
+container-autoupdate.sh --compose myapp --compose-dir /opt/myapp   # when the project directory cannot be looked up
+container-autoupdate.sh --dpanel-container mydpanel --container mycontainer   # when the DPanel container is not called dpanel
 ```
 
 **`--dry-run` behaves differently in the two modes:**
@@ -99,17 +111,25 @@ container-autoupdate.sh --dpanel-container mydpanel --compose myapp   # when the
 → DRY: check only, hands off; no upgrade this round
 ```
 
-- **Compose mode**: DPanel's `compose:deploy` is a deploy action in itself and has no "check only" ability. The script prints one explanatory line, exits `0` and **does nothing at all** (it does not tell you whether a new version exists either):
+- **Compose mode**: it only lists the images this project uses, then exits `0`; **it pulls nothing and deploys nothing**. Compose has no "check whether a new version exists" ability — the pull itself is the decision:
 
 ```text
-[2026-11-03 06:00:12] DRY Compose 模式没有「只检查」能力（DPanel 的 compose:deploy 会直接部署）
-[2026-11-03 06:00:12]     本轮未执行部署；要检查容器有没有新版本请用 --container 模式
+[2026-11-03 06:00:12] MODE compose 项目=myapp
+[2026-11-03 06:00:12]     目录=/opt/myapp
+[2026-11-03 06:00:12]     文件=/opt/myapp/compose.yaml
+[2026-11-03 06:00:12]     镜像: ghcr.1ms.run/yetone/magpie:latest
+[2026-11-03 06:00:12] DRY 只检查不动手：上面是这个项目涉及的镜像，本轮不拉取、不部署
+[2026-11-03 06:00:12]     要真正更新就去掉 --dry-run（拉取本身就是「有没有新版本」的判断）
 
-→ DRY: Compose mode has no "check only" ability (DPanel's compose:deploy deploys directly)
-→     no deployment was performed this round; to check whether a container has a new version, use --container mode
+→ MODE compose project=myapp
+→     directory=/opt/myapp
+→     file=/opt/myapp/compose.yaml
+→     image: ghcr.1ms.run/yetone/magpie:latest
+→ DRY: check only, hands off; the images above are what this project uses; nothing is pulled or deployed this round
+→     to really update, drop --dry-run (the pull itself is the "is there a new version" decision)
 ```
 
-To rehearse on a Compose project, either deploy for real on a test project, or switch to container mode for the check.
+To rehearse on a Compose project, either look at the image list like this first, or run a real round on a test project.
 
 > **A failed scheduled task now shows the reason directly**: the failure reason is written to stderr on top of being part of the complete log.
 > A scheduled task keeps only stderr when the task fails; earlier versions wrote to stdout only, so the task was left with nothing but `exit status 1` and nothing to debug with.
@@ -119,17 +139,23 @@ To rehearse on a Compose project, either deploy for real on a test project, or s
 The rollback point differs between container mode and Compose mode, and the difference matters.
 
 **Container mode**: the rollback point is the **backup container** DPanel creates, named like `<container-name>-bak-<timestamp>` (for example `myapp-bak-20261103163808`).
-It runs the image from before the upgrade and is in the `Exited` state; it is visible right in the DPanel web UI, and rolling back means putting it back.
+It runs the image from before the upgrade and is in the `Exited` state; it is visible right in the DPanel web UI. Rolling back from the command line:
 
-**Compose mode**: it **does not create a backup container and does not maintain `:prev`** — DPanel's compose deployment has no backup mechanism.
-Rolling back relies on the old image still being present locally:
+```sh
+docker stop <container-name> && docker rm <container-name>
+docker rename <container-name>-bak-<timestamp> <container-name>
+docker start <container-name>
+```
+
+**Compose mode**: it **does not create a backup container and does not maintain `<repo>:prev`**. What helps is that the `docker compose pull` here only pulls and never deletes old images, so the old image is still present locally; the previous round's log line `已重建：<名>（旧12位 → 新12位）` records both the old and the new image id.
+The emergency fix is to re-tag the old image as `<repo>:latest` and force a rebuild:
 
 ```sh
 docker tag <old-image-id> <repo>:latest
 docker compose up -d --force-recreate
 ```
 
-> Note down the image ID the container is currently using before the upgrade (`docker inspect -f '{{.Image}}' <container-name>`), otherwise you may not find that old image afterwards.
+> To be safer, note down the image ID the container currently uses before the upgrade (`docker inspect -f '{{.Image}}' <container-name>`), so you do not have to dig through logs afterwards.
 
 ## Versions and upgrades
 
@@ -152,26 +178,27 @@ To **pin a specific version** (so it does not follow the latest), give the boots
 
 A pinned bootstrapper never goes online at all, which is the most stable shape for production. Tag numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page.
 
-### What to check when upgrading to v2.0.0
+### What to check when upgrading to v2.x
 
-v2.0.0 hands the whole update action to DPanel: **the script no longer pulls images itself and no longer rebuilds containers itself**, and it no longer maintains a `:prev` rollback point, a state directory or bad-version pinning. If you are upgrading from an earlier version, read the following first.
+Starting with v2.0.0 the script no longer implements "pull the image / rebuild the container" itself: the update action is carried out by DPanel (container mode) and by Docker's own Compose command (Compose mode) instead, and the script no longer maintains a `:prev` rollback point, a state directory or bad-version pinning. If you are upgrading from an earlier version, read the following first.
 
-**Four arguments are obsolete** (passing one aborts immediately with exit code `3` and a migration note in the log):
+**Three arguments are obsolete** (passing one aborts immediately with exit code `3` and a migration note in the log):
 
-- `--compose-dir`: Compose updates are handled by DPanel by project name; the project directory is no longer needed.
 - `--state-dir`: the script keeps no state directory any more; the cross-version record moved to `COMPAT_ROOT` (default `/tmp/.container-autoupdate/compat`).
 - `--bad-ttl-days`: bad-version pinning is gone; rollback is DPanel's job.
-- `--pull-retries`: pulling is done by DPanel; the script no longer manages pulls or retries.
+- `--pull-retries`: pulling in container mode is done by DPanel and in Compose mode by `docker compose pull`; the script no longer manages pulls or retries.
 
-**A batch of environment variables is obsolete the same way** (setting one aborts the run). The main ones: `STATE_ROOT`, `BAD_TTL_DAYS`, `PULL_RETRIES`, `DIGEST_RETRIES`, `DIGEST_RETRY_WAIT`, `T_STALL`, `T_STALL_FINISH`, `T_PULL_MAX`, `T_UP`, `T_HEALTH`, `HEALTH_TRIES`, `T_ROLLBACK`, `PLAIN_BOOT`, `COMPOSE_DIR`, `COMPOSE_BASE` (see [All parameters and environment variables](docs/parameters.en.md) for the complete list). Just delete them; no replacement setting is needed.
+> `--compose-dir` is **not on the obsolete list**: it is available again as of v2.1.0, as a fallback for the project directory.
 
-> One exception: `T_INSPECT` is still accepted, and is equivalent to the new `DP_T_CHECK`.
+**A batch of environment variables is obsolete the same way** (setting one aborts the run): `STATE_ROOT`, `BAD_TTL_DAYS`, `PULL_RETRIES`, `DIGEST_RETRIES`, `DIGEST_RETRY_WAIT`, `T_STALL`, `T_STALL_FINISH`, `T_PULL_MAX`, `T_UP`, `T_HEALTH`, `HEALTH_TRIES`, `T_ROLLBACK`, `PLAIN_BOOT`, `COMPOSE_BASE`, `LOCK_PREFIX` (see [All parameters and environment variables](docs/parameters.en.md) for the complete list). Just delete them; no replacement setting is needed.
+
+> Two exceptions: `T_INSPECT` is the old name of `DP_T_CHECK` and is **still accepted**; `COMPOSE_DIR` is available again as of v2.1.0 and is equivalent to `--compose-dir`.
 
 Other things to note:
 
-- **The old `LOCK_PREFIX` still trips the abort**: the script no longer takes a mutex lock internally (concurrency is guaranteed by the DPanel scheduled task), so a `LOCK_PREFIX=...` left in your start command is treated as a breaking change, aborts immediately (exit code `3`) and tells you so. Remove it.
-- **The Compose project must already be registered in the DPanel web UI**, otherwise the round fails and exits (exit code `1`) instead of updating.
-- The main script no longer needs `curl` or `flock`; pull controls such as `--pull-retries` are all obsolete — pulling is DPanel's job.
+- **`LOCK_PREFIX` is treated as a breaking change**: the script no longer takes a mutex lock internally (concurrency is guaranteed by the DPanel scheduled task), so a `LOCK_PREFIX=...` left in your start command aborts immediately (exit code `3`) and tells you so. Remove it.
+- **Compose mode no longer needs DPanel registration**; it needs `docker` and the Compose v2 plugin instead. The project directory is looked up from the container labels by default, with `--compose-dir` as the fallback.
+- The main script no longer needs `curl` or `flock`; pull controls such as `--pull-retries` are all obsolete — container-mode pulling is DPanel's job, Compose-mode pulling is `docker compose pull`'s job.
 
 ### Investigating leftover processes and old lock files
 

@@ -8,25 +8,29 @@
 # 目标二选一：一个 Compose 项目名，或一个容器名。可以用命令行参数、
 # 环境变量或文件顶部配置区指定，三者等价，优先级：命令行 > 环境变量 > 配置区。
 #
-# ★ 本版本起：更新动作全部交给 DPanel 自己完成，脚本不再自己拉镜像、
-#   不再自己重建容器。脚本只做三件事：
-#     1) 问 DPanel「这个目标有没有新版本」；
-#     2) 有新版本就把更新交给 DPanel 执行；
-#     3) 把 DPanel 的结果如实报出来（成功 / 失败 / 无需更新）。
-#       容器 → DPanel `container:upgrade`（先检查，确实有新版本才升级）
-#       Compose 项目 → DPanel `compose:deploy`（该项目需已在 DPanel 里登记）
+# ★ 本版本的更新动作分两条路：
+#     容器          → 交给 DPanel `container:upgrade`（先检查，确实有新版本才升级）
+#     Compose 项目  → 脚本自己调 `docker compose pull` + `docker compose up -d`
+#   脚本自己只做三件事：
+#     1) 判断这个目标有没有新版本（容器 = 问 DPanel；Compose = 拉取本身就是判断）；
+#     2) 有的话执行更新（容器交给 DPanel；Compose 交给 docker compose）；
+#     3) 把结果如实报出来（成功 / 失败 / 无需更新）。
 #
-# 为什么这么做：
-#   · 重建一个容器要复刻的东西太多（网络、挂载、匿名卷、资源限制、标签……），
-#     任何一处漏掉都是一次事故；而 DPanel 本来就是干这件事的，它还有升级
-#     失败自动回滚（留下 <容器名>-bak-<时间戳> 备份容器）。
+# 为什么这么分：
+#   · 容器更新交给 DPanel：重建一个容器要复刻的东西太多（网络、挂载、匿名卷、
+#     资源限制、标签……），任何一处漏掉都是一次事故；而 DPanel 本来就是干这件事的，
+#     它还有升级失败自动回滚（留下 <容器名>-bak-<时间戳> 备份容器）。
+#   · Compose 更新直接用 docker compose：compose 自己就带着「哪些容器属于这个
+#     项目、用哪个 compose 文件、怎么重建」的全部信息，`pull` + `up -d` 就是它的
+#     标准做法；项目目录与文件还能从容器标签自动认出来，不需要用户配置，
+#     也不需要项目先在 DPanel 里登记。
 #   · 回滚点不再由脚本打 <仓库>:prev 标签自己维护，也就不会出现「回滚点被
 #     清理逻辑误删」这类问题。
 #   · 脚本从 1700 多行降到几百行，剩下的每一条都能一眼看懂、一眼验证。
 #
 # 安全原则：
-#   · 脚本自己不写 Docker：不 pull、不 tag、不 create、不 rm；
-#     所有变更动作只有 DPanel 一个执行者。
+#   · 容器分支不写 Docker：变更动作只有 DPanel 一个执行者。
+#     Compose 分支只用 compose 自己的 pull / up -d，不手工 tag、不手工 create、不删任何东西。
 #   · 失败原因同时落到真正的 stderr（计划任务失败时只收 stderr、丢弃 stdout）。
 #   · 只检查不动手：--dry-run。
 #   · 破坏性变更（参数 / 环境变量 / 行为）登记在 BREAKING_TABLE，脚本会主动
@@ -65,6 +69,9 @@ CONTAINER_NAME=""
 [ -n "${UPD_CONTAINER:-}" ] && CONTAINER_NAME="$UPD_CONTAINER"
 
 DOCKER_SOCK="${DOCKER_SOCK:-}"     # --docker-sock：传给 docker CLI（DOCKER_HOST）
+# Compose 项目目录：可选。不给时脚本从现有容器的 compose 标签里反查
+# （com.docker.compose.project.working_dir / .config_files），通常都不用填。
+COMPOSE_DIR="${COMPOSE_DIR:-}"
 # DPanel 的位置。脚本在 DPanel 容器里跑时最省事（直接执行二进制）；
 # 在别处跑时脚本会用 `docker exec` 进 DPanel 容器执行，两者等价。
 DPANEL_NAME="${DPANEL_NAME:-dpanel}"            # DPanel 容器名
@@ -74,11 +81,13 @@ COMPAT_ROOT="${COMPAT_ROOT:-/tmp/.container-autoupdate/compat}"  # 跨版本提�
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="2.0.0"
+VERSION="2.1.0"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
-DP_T_UPGRADE="${DP_T_UPGRADE:-420}"  # 单次「升级/部署」调用超时；实际还会被剩余预算收敛
+DP_T_UPGRADE="${DP_T_UPGRADE:-420}"  # 单次「升级」调用超时（容器模式；实际还会被剩余预算收敛）
+DP_T_PULL="${DP_T_PULL:-420}"        # Compose 模式：单次 `docker compose pull` 超时
+DP_T_UP="${DP_T_UP:-180}"            # Compose 模式：单次 `docker compose up -d` 超时
 DP_MIN_UPGRADE="${DP_MIN_UPGRADE:-90}" # 剩余预算低于这个值就不动手，避免被计划任务半路杀掉
 DRY_RUN="${DRY_RUN:-0}"
 EXIT_CODE=0
@@ -147,25 +156,24 @@ BREAKING_TABLE='
 1.0.0|env|LOCK_PREFIX|删除这个环境变量|1.0.0 起脚本不再使用互斥锁，并发由 DPanel 计划任务保证
 1.0.0|behavior|同一更新目标由脚本内的互斥锁串行|同一目标只挂一个 DPanel 计划任务|1.0.0 起移除脚本内的互斥锁：v0.4.0 的锁会被残留的子进程长期占住，导致之后每一轮都跳过
 2.0.0|behavior|脚本自己拉镜像、自己重建容器 / Compose 项目（自带健康门禁与 :prev 回滚点）|容器走 DPanel 的 container:upgrade，Compose 项目走 DPanel 的 compose:deploy|2.0.0 起更新动作全部交给 DPanel：脚本只负责检查与转交，回滚交给 DPanel 的备份容器（<容器名>-bak-<时间戳>）
-2.0.0|flag|--compose-dir|删除这个参数|2.0.0 起 Compose 更新由 DPanel 按项目名处理，不再需要项目目录
 2.0.0|flag|--state-dir|删除这个参数|2.0.0 起脚本不再维护状态目录；跨版本提示记录改到 COMPAT_ROOT
 2.0.0|flag|--bad-ttl-days|删除这个参数|2.0.0 起不再有「坏版本钉住」，回滚由 DPanel 负责
-2.0.0|flag|--pull-retries|删除这个参数|2.0.0 起拉取由 DPanel 完成，脚本不再管理拉取与重试
+2.0.0|flag|--pull-retries|删除这个参数|2.0.0 起拉取不再由脚本负责（容器模式交给 DPanel，Compose 模式交给 docker compose），脚本不再管理拉取与重试
 2.0.0|env|STATE_ROOT|删除这个环境变量|2.0.0 起脚本不再维护状态目录；跨版本提示记录改到 COMPAT_ROOT（默认 /tmp/.container-autoupdate/compat）
 2.0.0|env|BAD_TTL_DAYS|删除这个环境变量|2.0.0 起不再有「坏版本钉住」与 TTL，回滚由 DPanel 负责
-2.0.0|env|PULL_RETRIES|删除这个环境变量|2.0.0 起拉取由 DPanel 完成，脚本不再管理拉取与重试
-2.0.0|env|DIGEST_RETRIES|删除这个环境变量|2.0.0 起远端有没有新版本由 DPanel 判断，脚本不再自己查 digest
-2.0.0|env|DIGEST_RETRY_WAIT|删除这个环境变量|同上：远端 digest 由 DPanel 查询
+2.0.0|env|PULL_RETRIES|删除这个环境变量|2.0.0 起拉取不再由脚本负责（容器模式交给 DPanel，Compose 模式交给 docker compose），脚本不再管理拉取与重试
+2.0.0|env|DIGEST_RETRIES|删除这个环境变量|2.0.0 起「有没有新版本」不再由脚本查 digest：容器模式看 DPanel 的 upgrade，Compose 模式看 docker compose pull 拉到了什么
+2.0.0|env|DIGEST_RETRY_WAIT|删除这个环境变量|同上：不再由脚本查询远端 digest
 2.0.0|env|T_STALL|删除这个环境变量|2.0.0 起脚本不再读 Docker 拉取流，拉取停滞判定取消
-2.0.0|env|T_STALL_FINISH|删除这个环境变量|同上：拉取收尾宽限由 DPanel 自行处理
-2.0.0|env|T_PULL_MAX|删除这个环境变量|拉取由 DPanel 完成；脚本侧可用 DP_T_UPGRADE 限制单次升级调用的时长
-2.0.0|env|T_UP|删除这个环境变量|容器重建由 DPanel 完成（DP_T_UPGRADE 控制脚本等待多久）
+2.0.0|env|T_STALL_FINISH|删除这个环境变量|同上：拉取收尾由更新执行者（DPanel / docker compose）自行处理
+2.0.0|env|T_PULL_MAX|删除这个环境变量|拉取交给更新执行者；脚本侧可用 DP_T_PULL / DP_T_UPGRADE 限制单次调用的时长
+2.0.0|env|T_UP|删除这个环境变量|容器重建由 DPanel 完成（DP_T_UPGRADE 控制脚本等待多久）；Compose 侧用 DP_T_UP
 2.0.0|env|T_HEALTH|删除这个环境变量|健康观察由 DPanel 的升级流程负责
 2.0.0|env|HEALTH_TRIES|删除这个环境变量|健康门禁已移除，由 DPanel 负责
 2.0.0|env|T_ROLLBACK|删除这个环境变量|回滚由 DPanel 的备份机制负责
 2.0.0|env|PLAIN_BOOT|删除这个环境变量|无 healthcheck 容器的观察已交由 DPanel
-2.0.0|env|COMPOSE_DIR|删除这个环境变量|Compose 更新由 DPanel 按项目名处理，不再需要项目目录
-2.0.0|env|COMPOSE_BASE|删除这个环境变量|同上：不再需要从容器标签反查 Compose 目录
+2.0.0|env|COMPOSE_BASE|删除这个环境变量|不再需要从容器标签反查 Compose 目录的基路径（反查用 compose 自己写在容器上的标签）
+2.1.0|behavior|Compose 更新交给 DPanel 的 compose:deploy|Compose 项目改用 docker compose pull + up -d 就地重新部署|2.1.0 起 Compose 模式不再依赖 DPanel 的 compose:deploy：不需要项目先在 DPanel 里登记，也不用管 --pull-image；容器模式仍然交给 DPanel
 '
 # ==================== 登记表结束 ===========================================
 
@@ -375,9 +383,11 @@ DPanel 定时任务自动更新脚本
 跑一轮更新就结束，触发频率交给 DPanel 的「计划任务」配置。
 同一目标只挂一个计划任务即可（脚本内部不加锁，并发由 DPanel 保证）。
 
-更新动作由 DPanel 自己完成：
-  容器          → DPanel `container:upgrade`（先检查，确实有新版本才升级）
-  Compose 项目  → DPanel `compose:deploy`（该项目需已在 DPanel 里登记）
+两条路各用各的长处：
+  容器          → 交给 DPanel `container:upgrade`（先检查，确实有新版本才升级；
+                  升级失败 DPanel 会自行回滚，并留下 <容器名>-bak-<时间戳> 备份容器）
+  Compose 项目  → 用 `docker compose pull` + `docker compose up -d` 就地重新部署
+                  （compose 自己知道这个项目有哪些容器、用哪个文件，不需要额外登记）
 
 用法：
   container-autoupdate.sh --compose <项目名>     更新一个 Compose 项目
@@ -389,13 +399,14 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
 两种目标必须且只能指定一个。
 
 选项：
-  --compose <名>         Compose 项目名（必须是 DPanel 里登记过的项目）
+  --compose <名>         Compose 项目名（项目目录/文件会自动从容器标签反查）
   --container <名>       容器名
+  --compose-dir <路径>   Compose 项目目录；不给时自动反查，一般不用填
   --docker-sock <路径>   docker CLI 用的 socket；也可用 DOCKER_HOST
   --dpanel-container <名>   DPanel 容器名（默认 dpanel）；在容器内直接跑时用不到
   --dpanel-bin <路径>       DPanel CLI 在容器里的路径（默认 /app/server/dpanel）
   --dpanel-docker-env <名>  DPanel 里的 docker 环境名（默认 local）
-  --dry-run              只检查有没有新版本，不执行升级（Compose 模式无只检查能力）
+  --dry-run              只检查不动手：容器模式问 DPanel，Compose 模式只列出涉及的镜像
   --compat <版本>        声明只验证到某个版本；脚本若含更新的破坏性变更就中止
   -h, --help             显示本帮助
   -V, --version          显示版本
@@ -403,6 +414,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
 环境变量：
   UPD_COMPOSE / UPD_CONTAINER   目标（同命令行）
   DOCKER_SOCK / DOCKER_HOST     docker CLI 的连接端点
+  COMPOSE_DIR                   Compose 项目目录（同 --compose-dir）
   DPANEL_NAME                   DPanel 容器名（默认 dpanel）
   DPANEL_BIN                    DPanel CLI 路径（默认 /app/server/dpanel）
   DPANEL_DOCKER_ENV             DPanel 里的 docker 环境名（默认 local）
@@ -411,13 +423,15 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   COMPAT_UNTIL                  同 --compat
   T_HARD                        整轮时间硬上限（秒，默认 540）
   T_INSPECT / DP_T_CHECK        单次「检查」调用超时（秒，默认 120）
-  DP_T_UPGRADE                  单次「升级 / 部署」调用超时（秒，默认 420）
+  DP_T_UPGRADE                  单次容器升级调用超时（秒，默认 420）
+  DP_T_PULL / DP_T_UP           Compose 模式的 pull / up -d 超时（秒，默认 420 / 180）
   DP_MIN_UPGRADE                剩余预算低于这个值就不动手（秒，默认 90）
 
 退出码：
   0  成功，或无需更新，或按规则跳过
-  1  配置/环境错误，或本轮未能完成更新（容器保持原样）
-  2  保留（v2.0.0 起不再出现：回滚由 DPanel 负责，脚本不感知）
+  1  配置/环境错误，或本轮未能完成更新（目标保持原样）
+  2  保留（v2.0.0 起不再出现：容器回滚由 DPanel 负责；Compose 就地重新部署，
+     失败时脚本不部署，不会留下半新半旧的项目）
   3  检测到破坏性变更，你的调用方式已失效（本次未做任何改动，日志里有迁移说明）
   130  被 Ctrl-C（SIGINT）中断
   143  被 SIGTERM / SIGHUP 中断（计划任务执行超时常见）
@@ -436,6 +450,9 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   # 先看一眼有没有新版本，不动手
   container-autoupdate.sh --container myapp --dry-run
 
+  # Compose 项目的目录通常是自动认出来的；要显式指定也可以：
+  container-autoupdate.sh --compose myapp --compose-dir /opt/myapp
+
   # 直接跑远程脚本，跟随最新发布版（地址不含版本号，粘贴即用）
   # 先落地再执行：`curl ... | sh` 会把下载失败的退出码吞掉，出问题时看不到原因。
   _t=$(mktemp)
@@ -444,7 +461,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   rm -f "$_t"
 
   # 生产环境想锁死版本：把上面的 latest/download 换成带版本号的路径
-  # releases/download/v2.0.0/container-autoupdate.sh
+  # releases/download/v2.1.0/container-autoupdate.sh
   # -L 不能省：latest/download 会返回 302 跳转。
 USAGE
 }
@@ -464,6 +481,8 @@ parse_args() {
                       CONTAINER_NAME="$2"; COMPOSE_NAME=""; _SAW_CONTAINER=1; shift 2 ;;
       --docker-sock)  [ "$#" -ge 2 ] || { echo "ERR --docker-sock 缺少参数" >&"$ERR_FD"; exit 1; }
                       DOCKER_SOCK="$2"; shift 2 ;;
+      --compose-dir)  [ "$#" -ge 2 ] || { echo "ERR --compose-dir 缺少参数" >&"$ERR_FD"; exit 1; }
+                      COMPOSE_DIR="$2"; shift 2 ;;
       --dpanel-container) [ "$#" -ge 2 ] || { echo "ERR --dpanel-container 缺少参数" >&"$ERR_FD"; exit 1; }
                       DPANEL_NAME="$2"; shift 2 ;;
       --dpanel-bin)   [ "$#" -ge 2 ] || { echo "ERR --dpanel-bin 缺少参数" >&"$ERR_FD"; exit 1; }
@@ -545,37 +564,59 @@ dp_failed() {
   return 1
 }
 
-# 取出本次调用的可用超时：不超过 DP_* 默认值，也不超过剩余预算。
-dp_timeout() {
+# 取出本次调用的可用超时：不超过该调用的期望值，也不超过剩余预算（至少 10 秒）。
+# 内部超时必须显著小于计划任务的外部超时，否则被 SIGKILL 时日志里什么都留不下。
+budget_timeout() {
   _want="$1"; _rest=$(left)
   [ "$_rest" -lt 10 ] && _rest=10
   [ "$_want" -gt "$_rest" ] && _want="$_rest"
   echo "$_want"
 }
+# DPanel 调用用的同一个预算函数（名字保留，读代码时更直观）
+dp_timeout() { budget_timeout "$1"; }
 
 check_deps() {
   _missing=""
   for _b in timeout sed awk grep; do
     command -v "$_b" >/dev/null 2>&1 || _missing="$_missing $_b"
   done
-  if [ "$DP_IN_CONTAINER" != "1" ]; then
+  # 什么时候需要 docker CLI：
+  #   · Compose 分支要自己调 `docker compose`；
+  #   · 容器分支在 DPanel 容器里跑时，用 `docker exec` 进 DPanel（所以也需要）；
+  #     只有「本来就跑在 DPanel 容器里 + 容器分支」这一种情况用不到 docker。
+  _need_docker=0
+  if [ "$_GOAL" = "compose" ] || [ "$DP_IN_CONTAINER" != "1" ]; then
+    _need_docker=1
     command -v docker >/dev/null 2>&1 || _missing="$_missing docker"
   fi
   if [ -n "$_missing" ]; then
     echo "ERR 缺少依赖命令：$_missing" >&"$ERR_FD"
-    echo "    需要 timeout 与 busybox 或 coreutils 基础工具；不在 DPanel 容器里跑时还需要 docker" >&"$ERR_FD"
+    echo "    需要 timeout 与 busybox 或 coreutils 基础工具；" >&"$ERR_FD"
+    echo "    Compose 模式还需要 docker（含 docker compose 插件）；不在 DPanel 容器里跑时也需要 docker" >&"$ERR_FD"
     exit 1
   fi
-  if [ "$DP_IN_CONTAINER" != "1" ]; then
-    # 只有走 docker exec 路径时才依赖本机的 docker CLI；脚本就在 DPanel 容器里时，
-    # 直接执行二进制，不需要 docker 命令。
+  if [ "$_need_docker" = "1" ]; then
+    # 要用 docker 就先验证它真的连得上：连不上时报「找不到 DPanel CLI」
+    # 会把人引到完全无关的排查方向（AGENTS.md 记过这个坑）。
     if ! timeout -s KILL 20 docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
       echo "ERR 无法连接 Docker（DOCKER_HOST=${DOCKER_HOST:-未设置}）" >&"$ERR_FD"
       echo "    请确认 Docker 正在运行，且当前用户有权限访问 socket" >&"$ERR_FD"
       exit 1
     fi
   fi
-  # DPanel CLI 必须可用：所有更新动作都靠它。它不可用就没必要继续。
+  if [ "$_GOAL" = "compose" ]; then
+    # Compose 分支的更新动作全靠 compose 插件，它不可用就没必要继续。
+    if ! timeout -s KILL 20 docker compose version >/dev/null 2>&1; then
+      echo "ERR 无法执行 docker compose（缺 compose 插件？）" >&"$ERR_FD"
+      echo "    Compose 模式需要 Docker Compose v2 插件版（docker compose，不是 docker-compose）" >&"$ERR_FD"
+      exit 1
+    fi
+    return 0
+  fi
+  # 还没指定目标时不必检查 DPanel：下面的主流程会直接报「必须且只能指定一个目标」，
+  # 那才是用户真正要处理的问题。
+  [ -z "$_GOAL" ] && return 0
+  # 容器分支：DPanel CLI 必须可用，所有更新动作都靠它。
   _dv=$(dp_cli "$(dp_timeout "$DP_T_CHECK")" version | sed -n 's/^version: *//p' | head -n1)
   if [ -z "$_dv" ]; then
     echo "ERR 无法调用 DPanel CLI（$DPANEL_BIN）" >&"$ERR_FD"
@@ -651,57 +692,226 @@ container_update() {
   return 0
 }
 
-# ---------- Compose 模式：交给 DPanel compose:deploy ----------
+# ---------- Compose 模式：用 docker compose 自己就地重新部署 ----------
+# compose 自己就把「这个项目有哪些容器、用哪个 compose 文件、工作目录在哪」
+# 记在容器的标签上（com.docker.compose.project.*），所以既不需要用户配置目录，
+# 也不需要项目先在别处登记。这一支只做三件事：
+#   认清项目 → `docker compose pull` → `docker compose up -d`，
+# 然后把「哪些容器换了镜像」「有没有容器起不来」如实报出来。
+#
+# 安全原则：只用 compose 自己的 pull / up -d；不手工 tag、不手工 create、
+# 不加 --remove-orphans（它会删掉不在当前 compose 文件里的容器，属于数据事故）。
+
+# compose 调用的环境：参数一律走环境变量，不拼进命令行。
+# （路径含空格时 compose 会打印 Usage 却返回 rc=0 —— 静默出错，AGENTS.md 有记载。）
+compose_env() {
+  COMPOSE_PROJECT_NAME="$COMPOSE_NAME"
+  export COMPOSE_PROJECT_NAME
+  if [ -n "$C_FILE" ]; then
+    COMPOSE_FILE="$C_FILE"
+    COMPOSE_PATH_SEPARATOR=":"
+    export COMPOSE_FILE COMPOSE_PATH_SEPARATOR
+  fi
+  if [ -n "$C_ENVF" ]; then
+    COMPOSE_ENV_FILES="$C_ENVF"
+    export COMPOSE_ENV_FILES
+  fi
+}
+
+# 在项目目录里跑 compose。工作目录必须对：compose 文件里的相对路径靠它解析。
+# 退出码 99 = 进不去目录（与 compose 自己的退出码区分开）。
+# stderr 合并进 stdout：失败时要把 compose 说的话一起报出来。
+compose_run() {
+  _t="$1"; shift
+  ( cd "$C_DIR" 2>/dev/null || exit 99
+    compose_env
+    timeout -s KILL "$_t" docker compose "$@" 2>&1 )
+}
+
+# 只要 stdout（stderr 丢掉）：给 `config --images` 这种要解析输出的调用用，
+# 免得 compose 的告警混进要解析的内容里。
+compose_out() {
+  _t="$1"; shift
+  ( cd "$C_DIR" 2>/dev/null || exit 99
+    compose_env
+    timeout -s KILL "$_t" docker compose "$@" 2>/dev/null )
+}
+
+# 镜像 id 取短一点，日志里好读
+_short_id() { printf '%s' "$1" | sed 's/^sha256://' | awk '{print substr($0,1,12)}'; }
+
+# 认清这个项目：工作目录 + compose 文件 + env 文件。
+# 优先用 compose 自己写在容器上的标签（那是最准的：就是当初用的那个文件），
+# 标签查不到时才用 --compose-dir / COMPOSE_DIR 兜底（那种情况让 compose 在
+# 该目录里自己找 compose.yaml / docker-compose.yml）。
+compose_locate() {
+  C_DIR=""; C_FILE=""; C_ENVF=""
+  _cid=$(docker ps -a --filter "label=com.docker.compose.project=$COMPOSE_NAME" \
+           --format '{{.ID}}' 2>/dev/null | head -n1)
+  if [ -n "$_cid" ]; then
+    _wd=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$_cid" 2>/dev/null)
+    _cf=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$_cid" 2>/dev/null)
+    _ef=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.environment_file"}}' "$_cid" 2>/dev/null)
+    [ -n "$_wd" ] && C_DIR="$_wd"
+    [ -n "$_cf" ] && C_FILE="$_cf"
+    [ -n "$_ef" ] && C_ENVF="$_ef"
+  fi
+  if [ -z "$C_DIR" ] && [ -n "$COMPOSE_DIR" ]; then
+    C_DIR="$COMPOSE_DIR"
+  fi
+  if [ -z "$C_DIR" ]; then
+    log "ERR 找不到 Compose 项目 $COMPOSE_NAME 的项目目录"
+    log "    当前 Docker 里没有带「$COMPOSE_NAME」这个 compose 项目标签的容器，反查不到"
+    log "    处理方式二选一："
+    log "      1) 用 --compose-dir <路径> 指定 compose 文件所在目录"
+    log "      2) 确认项目名写法；项目还没部署过就先手动 compose up 一次"
+    return 1
+  fi
+  if [ ! -d "$C_DIR" ]; then
+    log "ERR Compose 项目目录不存在：$C_DIR"
+    return 1
+  fi
+  return 0
+}
+
+# 本项目所有容器（含已停止的）
+compose_cids() {
+  docker ps -a --filter "label=com.docker.compose.project=$COMPOSE_NAME" \
+    --format '{{.ID}}' 2>/dev/null
+}
+
+# 「容器名 → 镜像 id」快照，用来对比哪些容器换了镜像。
+# 必须用**容器名**当键：`docker compose up -d` 重建容器后 ID 会变，
+# 用 ID 当键的话，每个被重建的容器在「部署后」里都是新 ID，
+# 于是全被误判成「新建」，永远报不出「已重建」（N1 真机实测踩到）。
+compose_snapshot() {
+  compose_cids | while IFS= read -r _id; do
+    [ -n "$_id" ] || continue
+    _nm=$(docker inspect -f '{{.Name}}' "$_id" 2>/dev/null | sed 's|^/||')
+    [ -n "$_nm" ] || continue
+    echo "$_nm $(docker inspect -f '{{.Image}}' "$_id" 2>/dev/null)"
+  done
+}
+
+# 运行状态统计：输出「运行中的数量 总数」
+compose_running_stat() {
+  _tot=0; _run=0
+  for _id in $(compose_cids); do
+    _tot=$(( _tot + 1 ))
+    case "$(docker inspect -f '{{.State.Running}}' "$_id" 2>/dev/null)" in
+      true) _run=$(( _run + 1 )) ;;
+    esac
+  done
+  echo "$_run $_tot"
+}
+
 compose_update() {
   log "MODE compose 项目=$COMPOSE_NAME"
+  compose_locate || { EXIT_CODE=1; return 1; }
+
+  _raw=$(compose_out "$(budget_timeout "$DP_T_CHECK")" config --images)
+  _irc=$?
+  _imgs=$(printf '%s\n' "$_raw" | awk 'NF && !seen[$0]++')
+  log "    目录=$C_DIR"
+  [ -n "$C_FILE" ] && log "    文件=$C_FILE"
+  if [ "$_irc" -ne 0 ]; then
+    log "WARN docker compose config 没能读出这个项目的镜像清单（退出码 $_irc），继续按流程走"
+  fi
+  if [ -n "$_imgs" ]; then
+    printf '%s\n' "$_imgs" | while IFS= read -r _i; do
+      [ -n "$_i" ] && log "    镜像: $_i"
+    done
+  fi
+
   if [ "$DRY_RUN" = "1" ]; then
-    # DPanel 没有给 compose 提供「只检查」的接口（compose:deploy 会直接部署），
-    # 所以这里只做连通性确认，然后如实说明本轮什么都没干。
-    log "DRY Compose 模式没有「只检查」能力（DPanel 的 compose:deploy 会直接部署）"
-    log "    本轮未执行部署；要检查容器有没有新版本请用 --container 模式"
+    log "DRY 只检查不动手：上面是这个项目涉及的镜像，本轮不拉取、不部署"
+    log "    要真正更新就去掉 --dry-run（拉取本身就是「有没有新版本」的判断）"
     return 0
   fi
+
   _rest=$(left)
   if [ "$_rest" -lt "$DP_MIN_UPGRADE" ]; then
     log "WARN 剩余时间不足（${_rest}s < ${DP_MIN_UPGRADE}s），本轮不部署，项目保持原样"
     EXIT_CODE=1
     return 1
   fi
-  _t=$(dp_timeout "$DP_T_UPGRADE")
-  log "交给 DPanel 部署（等待上限 ${_t}s）"
-  # --pull-image dpanel 必须显式给：默认值 "command" 那条路实测**不去拉新镜像**
-  # （已是最新的镜像标签不会重新回源），结果就是「部署成功但版本没变」。
-  # "dpanel" 让 DPanel 用自己的拉取逻辑先把每个服务的镜像拉下来，再走部署 ——
-  # 这才真正符合「更新交给 DPanel」这件事，而且拉取进度会打进日志。
-  _out=$(dp_cli "$_t" compose:deploy --name "$COMPOSE_NAME" --pull-image dpanel --docker-env "$DPANEL_DOCKER_ENV")
-  _j=$(dp_json "$_out")
-  if [ -z "$_j" ]; then
-    log "ERR DPanel 没有返回可解析的结果（compose:deploy --name $COMPOSE_NAME）"
-    dp_noise "$_out" | while IFS= read -r _nl; do log "    $_nl"; done
-    log "    项目保持原样"
+
+  _before=$(compose_snapshot)
+
+  # 1) 拉取。这一步同时也是「有没有新版本」的判断：没有新版时它是很快的空操作。
+  _t=$(budget_timeout "$DP_T_PULL")
+  log "拉取镜像（docker compose pull，等待上限 ${_t}s）"
+  _out=$(compose_run "$_t" pull)
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    if [ "$_rc" = "99" ]; then
+      log "ERR 无法进入 Compose 项目目录：$C_DIR"
+    else
+      log "ERR 拉取失败（docker compose pull 退出码 $_rc），本轮不部署，项目保持原样"
+      printf '%s\n' "$_out" | tail -n5 | while IFS= read -r _nl; do log "    $_nl"; done
+    fi
     EXIT_CODE=1
     return 1
   fi
-  if dp_failed "$_j"; then
-    case "$_j" in
-      *commonDataNotFoundOrDeleted*)
-        log "ERR DPanel 里没有登记名为 $COMPOSE_NAME 的 Compose 项目"
-        log "    compose:deploy 只能操作 DPanel「Compose」页面里登记过的项目"
-        log "    处理方式二选一："
-        log "      1) 在 DPanel 网页里新建 Compose 项目，名称填 $COMPOSE_NAME（指向它的 docker-compose.yaml）"
-        log "      2) 改用容器模式：--container <该项目里的容器名>"
-        log "    项目未做任何改动"
-        ;;
-      *)
-        log "ERR DPanel 部署失败：$(jp_val "$_j" error)"
-        dp_noise "$_out" | while IFS= read -r _nl; do log "    $_nl"; done
-        log "    项目保持原样"
-        ;;
-    esac
+
+  # 2) 就地重新部署。不加 --remove-orphans：它会删掉不在当前 compose 文件里的容器。
+  _t=$(budget_timeout "$DP_T_UP")
+  log "就地重新部署（docker compose up -d，等待上限 ${_t}s）"
+  _out=$(compose_run "$_t" up -d)
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    log "ERR 重新部署失败（docker compose up -d 退出码 $_rc）"
+    printf '%s\n' "$_out" | tail -n5 | while IFS= read -r _nl; do log "    $_nl"; done
+    log "    compose 文件与容器定义都没被脚本改过，可以直接再跑一轮"
     EXIT_CODE=1
     return 1
   fi
-  log "OK DPanel 已部署 Compose 项目 $COMPOSE_NAME"
+
+  # 3) 如实报告：哪些容器换了镜像、哪些是这一轮新建的、有没有容器起不来。
+  # 按**容器名**比对（见 compose_snapshot 的注释：重建后容器 ID 会变，用 ID 当键会把重建误判成新建）。
+  # 循环直接用 compose_cids 的 ID 列表，不放进管道里 —— 管道会开子 shell，计数器就丢了。
+  _changed=0
+  _new=0
+  for _id in $(compose_cids); do
+    _nm=$(docker inspect -f '{{.Name}}' "$_id" 2>/dev/null | sed 's|^/||')
+    [ -n "$_nm" ] || continue
+    _a=$(docker inspect -f '{{.Image}}' "$_id" 2>/dev/null)
+    _b=$(printf '%s\n' "$_before" | awk -v n="$_nm" '$1==n{print $2; exit}')
+    if [ -n "$_a" ] && [ -z "$_b" ]; then
+      # 部署前没有这个容器：它是这一轮新建的（首次部署，或 compose 文件里新加的服务）。
+      _new=$(( _new + 1 ))
+      log "    新建：$_nm（$(_short_id "$_a")）"
+    elif [ -n "$_b" ] && [ -n "$_a" ] && [ "$_b" != "$_a" ]; then
+      _changed=$(( _changed + 1 ))
+      log "    已重建：$_nm（$(_short_id "$_b") → $(_short_id "$_a")）"
+    fi
+  done
+
+  _stat=$(compose_running_stat)
+  _run=${_stat%% *}; _tot=${_stat##* }
+
+  # 汇总要如实：换了镜像 / 新建 / 真的什么都没变，是三件不同的事，不能混成一句话。
+  if [ "$_changed" -gt 0 ] && [ "$_new" -gt 0 ]; then
+    log "OK Compose 项目 $COMPOSE_NAME 已重新部署（$_changed/$_tot 个容器换了镜像，$_new 个新建）"
+  elif [ "$_changed" -gt 0 ]; then
+    log "OK Compose 项目 $COMPOSE_NAME 已重新部署（$_changed/$_tot 个容器换了镜像）"
+  elif [ "$_new" -gt 0 ]; then
+    log "OK Compose 项目 $COMPOSE_NAME 已部署（$_new 个容器新建）"
+  else
+    log "OK Compose 项目 $COMPOSE_NAME 已是最新（拉取后没有容器需要重建）"
+  fi
+
+  if [ "$_tot" -gt 0 ] && [ "$_run" != "$_tot" ]; then
+    log "ERR 有容器没在运行（$_run/$_tot running）："
+    for _id in $(compose_cids); do
+      _st=$(docker inspect -f '{{.State.Status}}' "$_id" 2>/dev/null)
+      [ "$_st" = "running" ] || log "    $(docker inspect -f '{{.Name}}' "$_id" 2>/dev/null | sed 's|^/||') $_st"
+    done
+    log "    compose 文件没被改过；用 docker compose logs <服务名> 看具体原因"
+    EXIT_CODE=1
+    return 1
+  fi
+  log "    运行状态：$_run/$_tot"
   return 0
 }
 
