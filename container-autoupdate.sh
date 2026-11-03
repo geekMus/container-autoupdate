@@ -79,7 +79,7 @@ DPANEL_BIN="${DPANEL_BIN:-/app/server/dpanel}"  # DPanel CLI 在容器里的路�
 DPANEL_DOCKER_ENV="${DPANEL_DOCKER_ENV:-local}" # DPanel 里的 docker 环境名（对应它的「Docker 服务器」）
 
 START=$(date +%s)
-VERSION="4.0.2"
+VERSION="4.0.3"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -100,6 +100,12 @@ left()    { echo $(( T_HARD - $(elapsed) )); }
 # 判定规则：消息以 ERR / CRITICAL 开头的算「错误行」；紧随错误行之后的缩进补充行
 # （log "   ..."）属于同一个错误块，一起进 stderr。
 # 用 _LOG_ERR 记住「上一个错误块是否还在延续」，不靠猜缩进。
+#
+# WARN 行要看本轮是不是已经判了失败（EXIT_CODE=1）：
+#   · 判了 → 它就是这一轮的失败原因（例如「剩余时间不足，本轮不动手」），
+#           必须和 ERR 一样进真 stderr，否则计划任务里只剩一句 exit status 1；
+#   · 没判 → 它只是提示（例如 config 读不出镜像清单，流程照走），留在 stdout。
+# 所以凡是「先 WARN 再 EXIT_CODE=1」的地方，都要把 EXIT_CODE=1 提到 log 之前。
 _log_stderr() {
   if [ "${ERR_FD:-2}" = "3" ]; then
     echo "$1" >&3
@@ -116,6 +122,17 @@ log() {
     ERR\ *|CRITICAL\ *)
       _log_stderr "$_l"
       _LOG_ERR=1
+      ;;
+    WARN\ *)
+      # 本轮已经判了失败 ⇒ 这句 WARN 就是失败原因，跟 ERR 一样进真 stderr，
+      # 后面的缩进补充行（说明为什么不动作）也要跟着进去。
+      # 还没判失败 ⇒ 只是提示，留在 stdout，也不打断上一个错误块。
+      if [ "${EXIT_CODE:-0}" != "0" ]; then
+        _log_stderr "$_l"
+        _LOG_ERR=1
+      else
+        _LOG_ERR=0
+      fi
       ;;
     "   "*)
       # 缩进补充行：属于上一个错误块时一起进 stderr。
@@ -420,9 +437,10 @@ container_update() {
   fi
   _rest=$(left)
   if [ "$_rest" -lt "$DP_MIN_UPGRADE" ]; then
+    # 先判失败再打 WARN：log() 靠 EXIT_CODE 决定这句要不要进真 stderr（见文件头部说明）
+    EXIT_CODE=1
     log "WARN 剩余时间不足（${_rest}s < ${DP_MIN_UPGRADE}s），本轮不启动升级，容器保持原样"
     log "     下一轮计划任务会重新检查；也可以把 T_HARD 或计划任务的超时调大"
-    EXIT_CODE=1
     return 1
   fi
   _t=$(dp_timeout "$DP_T_UPGRADE")
@@ -586,8 +604,9 @@ compose_update() {
 
   _rest=$(left)
   if [ "$_rest" -lt "$DP_MIN_UPGRADE" ]; then
-    log "WARN 剩余时间不足（${_rest}s < ${DP_MIN_UPGRADE}s），本轮不部署，项目保持原样"
+    # 先判失败再打 WARN：log() 靠 EXIT_CODE 决定这句要不要进真 stderr（见文件头部说明）
     EXIT_CODE=1
+    log "WARN 剩余时间不足（${_rest}s < ${DP_MIN_UPGRADE}s），本轮不部署，项目保持原样"
     return 1
   fi
 

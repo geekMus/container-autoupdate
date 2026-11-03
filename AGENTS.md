@@ -127,6 +127,7 @@ v2.1.0 起，脚本分两条路：**容器模式**把「拉镜像、重建容器
   - 脚本里 `exec 2>&1` 会把 fd 2 指到 stdout，所以**必须在它之前**把真 stderr 另存一份（`exec 3>&2`），失败原因写那份。
   - `ERR` / `CRITICAL` 行**以及紧随其后的缩进补充行**（`log "   ..."`）都属于失败原因，要一起进 stderr —— 只写半截等于没写。
   - 用「上一个错误块是否还在延续」的标记来判断补充行的归属，不许靠猜缩进。
+  - `WARN` 行**本身不是**失败原因，要看这一轮是不是已经判了失败（`EXIT_CODE=1`）：判了（例如「剩余时间不足，本轮不动手」）就必须跟 `ERR` 一样进 stderr；没判（例如 `docker compose config` 读不出镜像清单、流程照走）留在 stdout。所以**「先 `log "WARN ..."` 再 `EXIT_CODE=1`」这种顺序会漏掉它**——`EXIT_CODE=1` 必须写在 `log` 之前（v4.0.3 修的就是这个：两处预算不足的失败在计划任务里只剩 `exit status 1`）。
   - stdout 也要保留完整日志（两处都写），否则手动运行时日志会缺行。
 - **查远端 digest 必须允许重试**：digest 查询是瞬时故障高发点，取不到就整轮放弃太脆。默认重试 2 次、间隔 5 秒（`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT`）。
   - 重试结果用**全局变量**回传（`DIGEST_RESULT`），不许 `echo` 返回 —— 该函数在 `$( )` 里被调用，而 `log()` 写 stdout，`echo` 会把重试提示一起收进 digest 里。
@@ -432,6 +433,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | DPanel 的报错只剩半句话 | 用「到逗号为止」的方式取值，而错误文本里就有逗号 | 字符串值先按 `"key":"..."` 整串匹配，匹配不到再退数字/布尔 |
 | 不认识的参数被静默忽略 | `parse_args` 没有兜底的「未知参数」分支 | `*` 分支必须报错并 `exit 1` |
 | 计划任务里只有一句 `exit status 1` | 失败原因只写了 stdout，而 DPanel 失败时只保留 stderr | 把 `ERR`/`CRITICAL` 行与紧随的缩进补充行写进真 stderr |
+| 预算不足那类失败照样只剩 `exit status 1` | 那句是 `WARN` 开头的，而 `log()` 只按 `ERR`/`CRITICAL` 前缀分流入 stderr；且 `EXIT_CODE=1` 写在 `log` **之后**，判失败时已经来不及 | `log()` 里让 `WARN` 也看 `EXIT_CODE`：已判失败就进 stderr；相关调用点把 `EXIT_CODE=1` 提到 `log` 之前（v4.0.3） |
 | 每轮都重建容器 | 跳过了「先检查后升级」 | 先不带 `--upgrade` 调一次，`upgrade` 为 true 才真升级 |
 | 升级后没有回滚点 | 传了 `--disable-bak` | 不许传它：`<容器名>-bak-<时间戳>` 就是回滚点 |
 | `releases/latest/download/ct-stale-lock-check.sh` 404 | Release 只传了主脚本 | 两个资产都要传（v3.0.0 起没有引导器） |
@@ -454,7 +456,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
 - [ ] 推送后做了 §9.3 的三方 sha256 核对
 - [ ] 改了用户文档 → 跑过 `python3 scripts/check-docs.py .`（链接与锚点、表格、CRLF、没有 `*.en.md`）
-- [ ] 改过 `log()` 或错误输出路径 → 跑过 stdout/stderr 分流实测（`sh 脚本 >out 2>err`），确认 ERR/CRITICAL 行与缩进补充行都在 stderr 里
+- [ ] 改过 `log()` 或错误输出路径 → 跑过 stdout/stderr 分流实测（`sh 脚本 >out 2>err`），确认 `ERR`/`CRITICAL` 行与缩进补充行都在 stderr 里，**且「伴随失败的 `WARN`」也在 stderr 里、纯提示的 `WARN` 不在**（两侧都要验：预算不足 vs `config` 读不出清单）
 - [ ] 新增的「会失败的关键查询」（如查远端 digest）→ 有重试，且重试次数在日志里写明
 - [ ] 改过拉取的停滞/收尾判定 → 复跑「层拉完后长时间静默」场景（不进普通卡死判定），且**放弃之前**问过 daemon 镜像是否已落盘
 - [ ] 改过失败原因的打印位置 → 同一句失败原因在 stdout 与 stderr 里**各只出现一次**（stdout 完整日志 + stderr 给计划任务看是两回事，不许当成重复）
