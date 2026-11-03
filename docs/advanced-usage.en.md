@@ -2,289 +2,283 @@
 
 > Language: [English](advanced-usage.en.md) | [中文](advanced-usage.md)
 
-> For the basic usage see the [README](../README.en.md). What is covered here is **how to download the script, exit codes, scheduled task details, and a few easy traps**.
+> For the basic usage see the [README](../README.en.md); all arguments are in the [parameter reference](parameters.en.md).
 >
-> The script is meant for a **DPanel scheduled task**: one run ends by itself, the frequency and the concurrency are delegated to DPanel.
-> One scheduled task per target is enough (the script takes no mutex lock internally). Running it by hand is a one-off run,
-> and it is not recommended to wrap it in another cron / systemd timer.
+> As of v2.0.0 the script **no longer pulls images or recreates containers itself**: it only decides whether an update is needed, hands the update over to DPanel's command line
+> (containers via `container:upgrade`, Compose projects via `compose:deploy`), and reports the result faithfully. See [How it works and safety boundaries](how-it-works.en.md) for the mechanics.
+>
+> So this page covers: how to configure the DPanel scheduled task, exit codes, breaking changes and migration, how to roll back, and how to clean up leftovers from before the upgrade.
 
-## 1. Getting the script onto a machine
+## 1. DPanel scheduled task
 
-**The bootstrapper is recommended in production** (`ct-bootstrap.sh`): it takes care of downloading and caching, and you only maintain one command line.
+### Two lines in the script box
 
-### Recommended: use the bootstrapper (it has a cache, so it does not have to go online every round)
+Create a scheduled task and put **two lines** in the script box:
 
 ```sh
+# Line 1: fetch the bootstrapper to a local file (it has its own cache, so the same version is not downloaded twice)
 curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /usr/local/bin/ct-bootstrap.sh
-chmod +x /usr/local/bin/ct-bootstrap.sh
-/usr/local/bin/ct-bootstrap.sh --compose myapp
+  -o /tmp/ct-bootstrap.sh
+# Line 2: run one round. Replace --compose with your project name; use --container <name> for a plain container
+sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
-What the bootstrapper does on each run:
+- Do not write `curl ... | sh`: with a pipe a failed download **silently succeeds** (the task log cannot show that this round did nothing). The bootstrapper writes the file first and executes it only after validation, so a failure returns non-zero explicitly.
+- To pin a version in production, add `--ct-version <version>` to the bootstrapper (or set `CT_VERSION`; the version numbers are on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page) — it then stops probing the remote and never goes online. See the [parameter reference](parameters.en.md) for every bootstrapper switch.
+- The two modes:
 
-| Situation | Network cost |
-|---|---|
-| Pinned with `--ct-version <version>` (or `CT_VERSION`) and the local copy exists | **Zero** (never goes online) |
-| Default (follows latest), the local copy is the same version | One Range probe (fetches the head of the file, 16KB; about 1 second), no download |
-| Default, the remote has a new version | Probe + one full download, then cached |
-| Probe failed but a local cache exists | Zero (uses the cache, prints `WARN`) |
-| Probe failed and there is no cache | Zero, but **fails loudly** (never a silent success) |
-
-There are three benefits: a failed download returns a non-zero code explicitly; a cache hit needs no network (mirror flakiness does not stop the script from starting); the cached file is checked for syntax + version number + signature string, so a half-downloaded file is never executed as a script.
-
-See the [parameter reference](parameters.en.md#bootstrapper-ct-bootstrapsh-parameters-and-environment-variables) for all configuration options.
-
-### Alternative: download the main script to a file and execute it (no cache)
-
-If you do not want to use the bootstrapper, run the main script directly. Note that in this case **the script does not upgrade itself** — you have to download it again yourself from time to time:
-
-```sh
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
-  -o /usr/local/bin/container-autoupdate.sh
-chmod +x /usr/local/bin/container-autoupdate.sh
-/usr/local/bin/container-autoupdate.sh --compose myapp
-```
-
-### For verification only: write to a temporary file and execute it (leaves nothing on disk)
-
-Use this when you want to check the network and the arguments quickly, without leaving a file behind:
-
-```sh
-URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-_t=$(mktemp)
-if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
-  sh "$_t" --compose myapp
-else
-  echo "下载失败" >&2; rm -f "$_t"; exit 1
-fi
-rm -f "$_t"
-    → the failure message printed to stderr is Chinese ("download failed")
-```
-
-When the download fails, `exit 1` shows up in the task log instead of being silently treated as success. **But it downloads on every round**, so it is not recommended for production.
-
-### Not recommended: execute straight through a pipe
-
-```sh
-curl -fsSL "$URL" | sh -s -- --compose myapp
-```
-
-It runs, but there are three limitations you have to know:
-
-1. **A failed download is swallowed.** When `curl -f` fails the pipeline still counts as a "success" (`sh` gets empty input, executes nothing, exit code 0). The scheduled task sees "this round finished normally" while in fact nothing happened.
-2. **It goes online to download on every round** — mirror flakiness (403/522/`Recv failure`) is enough to make that round fail to start.
-3. **Do not put a fallback inside the pipe.** The `curl A || curl B | sh` form has two traps:
-   - When A succeeds its output is **discarded**; what actually runs is `curl B | sh` — you think you are running A's version, but B is the one that runs;
-   - When both fail, `sh` gets empty input and silently succeeds with exit code 0.
-
-   To add a fallback, put them in parentheses: `( curl A || curl B ) | sh`, or simply write to a temporary file (see above).
-
-> To make the pipe form surface failures too, wrap it in `set -o pipefail` in your own outer layer (busybox sh supports it as well):
-> ```sh
-> set -o pipefail
-> curl -fsSL "$URL" | sh -s -- --compose myapp
-> ```
-> This way the whole command returns non-zero when `curl` fails.
->
-> **But it has one side effect**: if the script exits before it has read the whole input (the fast-exit cases such as `--version`, `--help` or an argument error), `curl` gets `curl: (23) Failure writing output to destination`, and the whole pipeline then returns `23` — even though the script itself succeeded. Measured: `--version` with pipefail returns `23`, while `--compose ... --dry-run` returns `0` when it runs to the end.
->
-> So **pipefail is only suitable for fixed arguments and for scenarios that run the whole flow to the end** (for example `--compose myapp` hard-coded in a DPanel scheduled task). When you want to use `--version`/`--help`, or when the arguments may be wrong, use the temporary file form above instead.
-
-## 2. Versions: follow the latest release by default, or pin one
-
-**Default usage**: the bootstrapper's URL uses `releases/latest/download/ct-bootstrap.sh`, and on every run it decides by itself whether the main script has to be updated.
-
-It is not the same as `/main/`: `/main/` points at the newest commit of the branch, including intermediate states that have not been released (including commits that only touch the documentation); `releases/latest/` points only at a version that **has passed the checks and been officially released**.
-
-**To pin a version**: give the bootstrapper `--ct-version` (you do not have to change the download URL; the environment variable `CT_VERSION` works as well):
-
-```sh
-/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
-```
-
-Once pinned, the bootstrapper **never goes online to fetch a new version** — if the local copy has that version it runs it directly. This is the most stable shape for production.
-
-If you do not use the bootstrapper and run the main script directly, replace `latest/download` in the URL with a concrete tag (the tag numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page):
-
-```sh
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
-    → the trailing comment is Chinese ("example placeholder: replace v1.2.3 with the real tag from the Releases page")
-```
-
-When you should pin: when you do not want the behaviour to change suddenly on an unattended production machine. Once pinned, an upgrade becomes an explicit version-number replacement.
-
-To see which version is currently in use:
-
-```sh
-sh container-autoupdate.sh --version
-```
-
-> **Release mechanism**: the `VERSION` field in the repository (the `VERSION` field at the top of the script, of the form `VERSION="1.2.3"`) is the single source of the version. When it is pushed to `main`, GitHub Actions reads it; if the corresponding tag does not exist yet, it creates the tag and publishes the Release automatically, uploading the script as a Release asset. So an upgrade only means changing one place, `VERSION`; neither the README nor the download URLs have to change.
-
-> Note: **do not use the `refs/tags/<tag>` form**. Some mirror services (including the self-hosted one) time out on it. Use `/releases/download/<tag>/` or a short tag path.
-
-### How breaking changes show up when you follow latest
-
-This explains the mechanism behind "following latest is safe too". When upstream breaks your invocation, the script handles it in three categories:
-
-| Change type | Example | What the script does |
+| How your container was started | Which argument | What the script actually runs |
 |---|---|---|
-| An argument was removed or renamed | `--target` split into `--compose` / `--container` | **Aborts immediately** with exit code `3`; the log states which argument no longer works, what it became starting from which version, and how to change it |
-| An environment variable was removed or renamed | `UPD_TARGET` split into `UPD_COMPOSE` / `UPD_CONTAINER` | Same as above |
-| A default behaviour or the semantics changed | The number of rollback copies changes from 1 to 2 by default | Cannot be judged from the input; the two mechanisms below cover it |
+| `docker compose up -d` | `--compose <project>` | `dpanel compose:deploy --name <project> --pull-image dpanel` |
+| `docker run ...` | `--container <name>` | `dpanel container:upgrade --name <name>` (first without `--upgrade` to check, and only then with it) |
 
-The last category is covered by these two mechanisms:
+The Compose project must already be **registered in DPanel** (DPanel web UI → Compose → create / import). If it is not, DPanel answers `commonDataNotFoundOrDeleted`; see section 7.
 
-**① Cross-version notice.** The script remembers under `--state-dir` the version each target last ran with (`compat/compose-<名>/lastver`, `compat/plain-<名>/lastver`). When this run's version is higher and there is a breaking change in between, the log gets an extra section at the beginning:
+### Set the execution timeout to ≥ 600 seconds
 
-```sh
-[2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.9.0)升级上来，v1.0.0 引入了破坏性变更
-[2026-11-01 03:52:03]      变更：默认保留 2 份回滚副本
-[2026-11-01 03:52:03]      应对：如只想保留 1 份，加 --keep 1
-[2026-11-01 03:52:03]      本次仍会继续执行。两条路选一条：
-[2026-11-01 03:52:03]        1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat 1.0.0）
-[2026-11-01 03:52:03]        2) 想继续用旧行为，把下载地址固定到 v0.9.0 那个 tag
-    → WARN: you are upgrading from a version before 1.0.0 (0.9.0); v1.0.0 introduced a breaking change
-    →     change: 2 rollback copies are kept by default
-    →     how to deal with it: if you only want to keep 1 copy, add --keep 1
-    →     this run will still continue. Pick one of the two paths:
-    →       1) accept the new behaviour above (to stop before the next breaking change, add --compat 1.0.0)
-    →       2) keep the old behaviour and pin the download URL to the v0.9.0 tag
-```
+- The script's own hard limit for a round is `T_HARD` (540 seconds by default). DPanel's "execution timeout" must be **clearly larger**, so use **≥ 600 seconds**.
+- The timeout of a single call is controlled separately: `DP_T_CHECK` (the check, 120 seconds by default) and `DP_T_UPGRADE` (the upgrade / deploy, 420 seconds by default); every call is additionally narrowed to the remaining budget.
+- If the timeout is too short, the round is killed by DPanel and ends with exit code `143`; a round that was SIGKILLed may leave only `signal: killed` in the log, with no reason visible at all.
+- When DPanel edits a task in the UI it rewrites the task's settings JSON, and the "execution timeout" you typed by hand can be dropped (measured). After changing the schedule, come back and check it once.
+- When less than `DP_MIN_UPGRADE` (90 seconds by default) of the budget is left, the script **does not act**: it reports the failure honestly and exits with `1`, and the next round retries.
 
-It does **not abort** (because it cannot know whether you depend on the old behaviour), it only notifies. The same version does not trigger a repeated notice, and a downgrade does not trigger one either.
+### One scheduled task per target
 
-> Note: do not follow the notice by adding `--compat 0.9.0`: that value makes the `--compat` mechanism described below **stop hard** (exit code `3`),
-> which means it stops on every single run. To "stop before the breaking change" you should write `--compat 1.0.0` (= the current script version).
+The script takes **no mutex lock** internally; concurrency is guaranteed by the DPanel scheduled task. Two rounds for the same target at the same time step on each other, so **one scheduled task per target**.
 
-**② `--compat <version>`.** You can declare "I have only verified up to this version". If the script is newer and there is a breaking change in between, it stops hard (exit code `3`) instead of taking the risk:
+Different targets do not affect each other and can each have their own task (see section 7).
 
-```sh
-container-autoupdate.sh --compose myapp --compat 0.9.0
-```
+### Seeing the reason when it fails
 
-Suitable when: you have verified `0.9.0` in production, but one day `latest` jumps to `1.0.0` and you have not had time to run a regression — adding `--compat 0.9.0` amounts to "as soon as you hit a breaking change I have not verified, do not touch my container". Once you have finished verifying, change the number to the new version or remove it altogether.
+A DPanel scheduled task **keeps only stderr when the task fails** (and only stdout when it succeeds). That is why the script writes the failure reason (the `ERR` / `CRITICAL` lines and the indented continuation lines right after them) to **both** stdout and the real stderr — a design from v1.1.2, kept in v2.0.0. A failed task then shows the reason directly instead of a bare `exit status 1`.
 
-Boundary behaviour of `--compat`:
+> Side effect: when you merge stdout and stderr into one file by hand, the error lines appear twice.
 
-- An invalid value (for example `abc`) → exit code `3`
-- A value newer than the script (for example the script is `1.0.0` but you wrote `--compat 1.5.0`, which usually means the download URL is wrong) → exit code `3`
-- A value equal to or higher than the version with the change → let it pass
-- No breaking change is registered at all → let it pass without bothering you
+### Running one round manually
 
-> Maintainer view: breaking changes are registered in the script's `BREAKING_TABLE`. New capabilities, changes to the log wording and changes to the internal implementation must **not** be registered, otherwise every release bothers the user.
-
-## 3. Mainland China network: switch to a mirror prefix
-
-`raw.githubusercontent.com` often cannot be reached from mainland China (measured: repeated 8-second timeouts). The bootstrapper's default source already handles this (`CT_SOURCE=auto` tries **self-hosted mirror → gh-proxy → direct → ghproxy.net** in turn, and moves on to the next source whenever one fails).
-
-Default source order (measured 2026-11-03 inside the N1 dpanel container):
-
-| Order | Prefix | Measured |
-|---|---|---|
-| 1 | `https://github.mus.pp.ua/` | Self-hosted. Both the Range probe and the full download correctly forward Release assets (sha256 matches the official one); but it times out occasionally — 3 out of 5 attempts succeeded |
-| 2 | `https://gh-proxy.com/` | Public. 5 out of 5 succeeded, about 1 second on average — the most stable |
-| 3 | `https://github.com/` (no prefix) | A direct download of a Release asset is more stable than a raw file, but it does show occasional DNS failures (`curl: (6)`) and 12-second delays |
-| 4 | `https://ghproxy.net/` | Public (measured: repeated 15-second timeouts; only used as the last fallback) |
-
-The full form when you write the URL by hand:
+That is allowed, but it is only a **one-off run**:
 
 ```sh
-# Self-hosted mirror (the default first choice)
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
-
-# Public acceleration mirror (the default fallback)
-https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
-To make the bootstrapper use one specific source only: `CT_SOURCE=mus` (self-hosted), `CT_SOURCE=gh-proxy`, `CT_SOURCE=direct`, `CT_SOURCE=ghproxy`, or pass any custom prefix directly.
+### cron / systemd timer are not recommended
 
-> **Always pass `-L`** (or `--location`). `releases/latest/download/` first answers with a 302 redirect to the URL of the concrete tag; without `-L`, `curl -f` treats it as a failure (`curl: (22)`).
->
-> Mirror prefixes **occasionally** return `403` / `522` / timeouts for Release assets (measured: the same URL failed a few minutes ago and returned 200 a few minutes later). That is flakiness on the mirror side, not a wrong URL — a retry usually works. The bootstrapper tries each source twice by default (`CT_TRIES`) and falls back to the local cache when the probe fails.
->
-> Do **not** use `cdn.jsdelivr.net` for this repository: in practice it returns a cached old version (`@main` once served historical content with `VERSION=6.0.0`). jsdelivr suits static files at a fixed tag, not the "follow the latest release" scenario.
+The script contains no scheduling and takes no mutex lock. If you run it on a schedule with cron or a systemd timer, **you have to guarantee yourself that two rounds for the same target never run at the same time**. For scheduled updates, use a DPanel scheduled task.
+(If you really insist on cron, stagger the times in the crontab expression.)
 
-### How many bytes the version probe fetches
+### The script never touches the registry
 
-To keep the traffic small, the bootstrapper fetches only the head of the file (a `Range` request) when it looks for the version number. The size of that window is `--ct-probe-bytes` / `CT_PROBE_BYTES` (16KB by default).
+Every image pull is done by DPanel / the Docker daemon, using **the registry mirrors you and the daemon configured**. The script never touches a registry, so "racing several image mirror addresses in parallel" is no longer needed under v2.0.0 — and was never implemented (it was evaluated historically).
 
-> **The pitfall hit here**: the window used to be fixed at 4KB, but the `VERSION=` line moves further down as the header comments of the script grow (one release had already pushed it to byte 4012). As soon as the window no longer covers it, the probe fails silently — the log only shows `WARN 探测远端版本失败（网络问题）` while the network was perfectly fine.
->
-> The window is now 16KB, and **when the version number is not found, the whole file is fetched once and parsed again**. So as long as the network works, the probe no longer fails because the version line moved down.
->
-> When you see "probe failed", look at the `探测远端版本：<URL>` line right above it — it tells you which source and which address was being tried.
-
-## 4. Exit codes
+## 2. Exit codes
 
 | Exit code | Meaning | What to do |
 |---|---|---|
-| `0` | Successful update / nothing to update / safely skipped by the rules | Nothing to do |
-| `1` | A configuration or environment error, or the update did not finish this round (**the container is left as it was**) | Look at the `ERR` in the log; the container was not modified, so there is nothing to rescue |
-| `2` | **The rollback itself failed**, manual intervention is needed | Look at the `CRITICAL` in the log right away; the scene is preserved in `--state-dir` (default `/tmp/.container-autoupdate`) |
-| `3` | **A breaking change was detected**, your invocation no longer works (nothing was changed this round) | Change the command according to the "migration path" in the log; or pin a version; or add `--compat` |
+| `0` | Successful update / already up to date / `--dry-run` check only | Nothing to do |
+| `1` | Failure: DPanel reported an error, the Compose project is not registered in DPanel, not enough time was left, a dependency is missing, or an argument is wrong (**the target is left as it was**) | Look at the `ERR` in the log; the script has not modified the target |
+| `2` | **Reserved**: v2.0.0 does not produce it (rollback is DPanel's job; the script cannot see it) | — |
+| `3` | **A breaking change was detected** and your invocation no longer works (nothing was changed this round) | Change the command following the "migration path" in the log; or pin a version; or add `--compat` |
+| `130` | Interrupted by Ctrl-C (`SIGINT`) | You pressed Ctrl-C on a manual run; harmless |
+| `143` | Interrupted by `SIGTERM` / `SIGHUP` (the usual case is a scheduled task timing out) | The "execution timeout" is too short; raise it, or lower `T_HARD` |
 
-`2` is the only case where you have to step in and rescue things yourself. The script preserves the scene (the new container, the old container, the tag state), so do not rush to restart the machine or run `docker system prune`.
+## 3. Compatibility mechanisms
 
-## 5. Scheduled task details
+Breaking changes (arguments / environment variables / behaviour) are registered in the script's `BREAKING_TABLE`. Following `latest` is still safe, thanks to the three mechanisms below.
 
-### DPanel scheduled task (recommended)
+### An old form is matched: abort immediately (exit code 3)
 
-- You can write several lines of shell directly in the script box; `curl | sh` works there as well.
-- **Set the execution timeout to ≥ 600 seconds**. The script's own hard limit is 540 seconds (`T_HARD`), so this leaves some headroom.
-- When DPanel edits a task in the UI, it **drops the two fields you typed in by hand, "execution timeout" and "EntryShell"** (this is known DPanel behaviour). After changing the schedule, come back and check that the timeout is still there.
-- To pass environment variables to the script, use the Environment entry of the task panel (DPanel supports it natively and merges it with the Docker environment at run time).
-- Several tasks can coexist, each with a different target. **Put only one scheduled task on each target** (the script takes no mutex lock internally, so two tasks running at the same time will step on each other).
-
-### Run one round manually
-
-```sh
-container-autoupdate.sh --compose myapp
-```
-
-It ends when it is done, which suits "let me check right now whether there is a new version".
-
-### About cron / systemd timer
-
-It is **not recommended** to run this script on a schedule with cron or a systemd timer: the script no longer takes a mutex lock internally, so two rounds for the same target running at the same time will step on each other. For scheduled updates, use a DPanel scheduled task.
-
-(If you really want to use cron, make sure yourself that only one instance per target runs at any given moment, for example by staggering the times in the crontab expression.)
-
-## 6. Managing several targets on the same machine
-
-Different targets do not affect each other, so they can run at the same time:
-
-```sh
-container-autoupdate.sh --compose app1 &
-container-autoupdate.sh --compose app2 &
-wait
-```
-
-Do **not** run two rounds for the **same target** at the same time (the script no longer takes a lock to stop you), otherwise the two rounds will step on each other. Wait for the previous round to finish before starting the next one.
-
-If you want several copies of the script to be completely independent (each with its own state directory), give them different `--state-dir` values.
-
-## 7. Investigating leftover processes and old lock files
-
-Older versions (the ones that used a mutex lock) sometimes keep printing:
+An old argument or old environment variable still in use makes the script **abort immediately** with exit code `3`, stating which form no longer works, what it became and from which version, and how to change it:
 
 ```text
-[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
+[2026-11-01 03:47:12] ERR 这个环境变量已经不能用了：LOCK_PREFIX（当前值=/tmp/.container-autoupdate）
+[2026-11-01 03:47:12]     从 v1.0.0 起：LOCK_PREFIX 已移除
+[2026-11-01 03:47:12]     原因：1.0.0 起脚本不再使用互斥锁，并发由 DPanel 计划任务保证
+[2026-11-01 03:47:12]     迁移方式：删掉 LOCK_PREFIX 即可，不需要任何替代设置
+[2026-11-01 03:47:12]     或者把下载地址固定到旧版本（见 README「版本与升级」）
+[2026-11-01 03:47:12]     本次未做任何改动，退出码 3
 
-→ SKIP: another task for the same update target (compose-myapp) is still running; skipping this round
+→ ERR: this environment variable can no longer be used: LOCK_PREFIX (current value=/tmp/.container-autoupdate)
+→     as of v1.0.0: LOCK_PREFIX has been removed
+→     reason: since 1.0.0 the script no longer uses a mutex lock; concurrency is guaranteed by the DPanel scheduled task
+→     migration path: just delete LOCK_PREFIX, no replacement setting is needed
+→     or pin the download URL to an old version (see "Versions and upgrades" in the README)
+→     nothing was changed this round; exit code 3
 ```
 
-and **every round looks identical and nothing is ever updated**. The reason is not that some other task is really running, but that **a child process from a previous round did not exit cleanly**
-and kept holding the lock on behalf of the main script (see [How it works and safety boundaries](how-it-works.en.md)).
+The arguments and environment variables removed in v2.0.0 are listed in section 4.
 
-The repository ships a **read-only** investigation script `scripts/ct-stale-lock-check.sh`: it changes nothing and kills nothing,
-it only lists the following and ends with copy-pasteable cleanup commands:
+### Cross-version notice
 
-1. the old lock files (current versions do not use a lock any more, they are just leftover garbage);
+The script remembers **the version each target last ran with** (kept under `COMPAT_ROOT`, one `lastver` per target; `/tmp/.container-autoupdate/compat/compose-<project>/lastver` by default, or `container-<name>` in container mode). When it upgrades to a version with a breaking change, the log gets a `WARN` block explaining what changed and what to do, and then **carries on**:
+
+```text
+[2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.9.0)升级上来，v1.0.0 引入了破坏性变更
+[2026-11-01 03:52:03]      变更：1.0.0 起移除脚本内的互斥锁：v0.4.0 的锁会被残留的子进程长期占住，导致之后每一轮都跳过
+[2026-11-01 03:52:03]      应对：同一目标只挂一个 DPanel 计划任务
+[2026-11-01 03:52:03]      本次仍会继续执行。两条路选一条：
+[2026-11-01 03:52:03]        1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat 1.0.0）
+[2026-11-01 03:52:03]        2) 想继续用旧行为，把下载地址固定到 v0.9.0 那个 tag
+
+→ WARN: you upgraded from a version before 1.0.0 (0.9.0); v1.0.0 introduced a breaking change
+→       change: since 1.0.0 the mutex lock inside the script is gone: the v0.4.0 lock could be held for a long time by a leftover child process, so every later round was skipped
+→       how to deal with it: put only one DPanel scheduled task on each target
+→       this round still continues. Pick one of the two paths:
+→        1) accept the new behaviour above (to stop before the next breaking change, add --compat 1.0.0)
+→        2) keep the old behaviour and pin the download URL to the v0.9.0 tag
+```
+
+It does **not abort** (it cannot know whether you depend on the old behaviour), it only notifies. The same version is not announced twice, and a downgrade is not announced at all.
+
+> Note: **do not put the old version number from the notice into `--compat`** (in the example that is `0.9.0`) — `--compat` means "I have verified up to vX", so a version older than the change declares "I have not verified this change" on every single run and therefore **stops hard every time** (exit code `3`).
+> To "stop before the change" you should write **the current script version** (`sh container-autoupdate.sh --version` prints it; the log's first line `container-autoupdate v<version> 启动` carries it as well).
+
+### `--compat <version>`
+
+It declares "I have only verified up to this version". If the script is newer and a registered `behavior` change lies in between, it **stops hard** with exit code `3`:
+
+```sh
+container-autoupdate.sh --compose myapp --compat 1.2.3
+```
+
+(`1.2.3` is an example placeholder — replace it with the version you **verified**.)
+
+It suits the case where you verified a version in production, the script one day jumps to a release with a breaking change, and you have no time for a regression: `--compat` then means "do not touch my container when you hit a breaking change I have not verified". Once you have verified, change the number to the new version or drop the option.
+
+Boundary behaviour:
+
+| Case | Result |
+|---|---|
+| `--compat` is given no value | exit code `1` (argument error: missing value) |
+| An invalid value (`abc`, `1..2`), or an explicitly empty value | exit code `3` |
+| A value newer than the script (usually a wrong download URL) | exit code `3` |
+| A value equal to or higher than the change version | let it pass |
+| No breaking change is registered at all | let it pass, no bother |
+
+> The ordering is deliberate: the compatibility checks run **before** the dependency check (a machine without `docker` must still see the migration path first); the cross-version `WARN` is printed before the dependency check too, but `lastver` is written **after** it — a round that failed on a missing dependency does not count as "the user has been told".
+
+## 4. Migrating from v1.x
+
+### Removed arguments
+
+These four arguments are **gone** in v2.0.0: passing one makes the script abort at once with exit code `3` and print the migration path.
+
+| Removed argument | What it used to do | What to do now |
+|---|---|---|
+| `--compose-dir` | Told the script the Compose project directory | Not needed: DPanel handles the update by **project name** and knows the project directory itself |
+| `--state-dir` | Set the state directory | Not needed: the cross-version record moved to `COMPAT_ROOT` (`/tmp/.container-autoupdate/compat` by default) |
+| `--bad-ttl-days` | Bad-version pinning period | Not needed: there is no bad-version pinning any more; rollback is DPanel's job |
+| `--pull-retries` | Pull retry count | Not needed: DPanel performs the pull; the script no longer manages pulls or retries |
+
+### Removed environment variables
+
+These environment variables are gone in v2.0.0 (still setting one aborts with exit code `3`); the migration path is always to **delete it**, with no replacement:
+
+| Variable | What it used to do |
+|---|---|
+| `STATE_ROOT` | State directory |
+| `BAD_TTL_DAYS` | Bad-version pinning period (days) |
+| `PULL_RETRIES` | Pull retry count |
+| `DIGEST_RETRIES` | Retries when the remote digest could not be read |
+| `DIGEST_RETRY_WAIT` | Wait between remote digest retries |
+| `T_STALL` | Stall detection for the pull progress |
+| `T_STALL_FINISH` | Grace period while the pull finished |
+| `T_PULL_MAX` | Absolute limit for a single pull |
+| `T_UP` | Timeout for recreating / starting the container |
+| `T_HEALTH` | Wall-clock limit of the health gate |
+| `HEALTH_TRIES` | Poll-count limit of the health check |
+| `T_ROLLBACK` | Timeout of the rollback |
+| `PLAIN_BOOT` | Observation window for a container without a healthcheck |
+| `COMPOSE_DIR` | Compose project directory |
+| `COMPOSE_BASE` | Fallback root for the Compose directory |
+
+> One exception: `T_INSPECT` **is still accepted** and is equivalent to `DP_T_CHECK`, so old tasks keep working without a config change.
+
+### `LOCK_PREFIX` still aborts
+
+`LOCK_PREFIX` belongs to the earlier 1.0.0 breaking change (the mutex lock inside the script was removed) and is still in `BREAKING_TABLE`. A leftover `LOCK_PREFIX=...` in the start command still aborts the script with exit code `3`; just delete it.
+
+### New arguments and environment variables
+
+| Argument | Environment variable | Default | Notes |
+|---|---|---|---|
+| `--dpanel-container <name>` | `DPANEL_NAME` | `dpanel` | Name of the container DPanel runs in (used only when the script does not run inside the dpanel container) |
+| `--dpanel-bin <path>` | `DPANEL_BIN` | `/app/server/dpanel` | Path of the DPanel CLI |
+| `--dpanel-docker-env <name>` | `DPANEL_DOCKER_ENV` | `local` | `--docker-env` passed to the DPanel CLI |
+
+| Variable | Default | Notes |
+|---|---|---|
+| `COMPAT_ROOT` | `/tmp/.container-autoupdate/compat` | Directory of the cross-version records (one `lastver` per target) |
+| `T_HARD` | `540` | Hard limit for the whole round (seconds) |
+| `DP_T_CHECK` | `120` | Timeout of one "check" call (seconds); the old `T_INSPECT` is still accepted |
+| `DP_T_UPGRADE` | `420` | Timeout of one "upgrade / deploy" call (seconds) |
+| `DP_MIN_UPGRADE` | `90` | Below this much remaining budget the script does not act (seconds) |
+
+Retained arguments: `--compose`, `--container`, `--docker-sock`, `--compat`, `--dry-run`, `-h` / `--help`, `-V` / `--version`. See the [parameter reference](parameters.en.md) for all of them.
+
+### The dependencies changed
+
+v2.0.0 only needs `timeout` `sed` `awk` `grep` (busybox or coreutils, either is fine) — **`curl` and `flock` are no longer needed**; running outside the dpanel container additionally needs `docker`.
+
+## 5. Rollback in practice
+
+**This is the biggest difference from v1.x**: the rollback point is no longer the `:prev` image tag the script used to maintain. Container mode and Compose mode have **different** rollback abilities.
+
+### Container mode: the rollback point is DPanel's backup container
+
+Before upgrading a container, DPanel creates a backup container named `<container>-bak-<timestamp>` (for example `myapp-bak-20261103163808`). It runs the **image from before the upgrade** and is in the `Exited` state. The script never passes DPanel's `--disable-bak`, so the backup is the default behaviour — and it is your rollback point.
+
+To roll back:
+
+1. Find `<container>-bak-<timestamp>` in the container list of the DPanel web UI (`docker ps -a` shows it as well).
+2. Use DPanel's restore / rebuild action to turn it back into the original container (same name, same config, old image).
+3. The **equivalent operation at the `docker` level**: the backup container keeps the old image and the original container configuration, so you can rename it back and start it:
+
+```sh
+# Find the backup container and check that it runs the old image and is Exited
+docker ps -a --filter "name=^/<container>-bak-"
+docker inspect -f '{{.State.Status}} {{.Config.Image}}' <container>-bak-<timestamp>
+
+# Make the broken container step aside
+docker stop <container>
+docker rm <container>
+
+# Rename the backup container back and start it
+docker rename <container>-bak-<timestamp> <container>
+docker start <container>
+```
+
+> A backup container takes disk space. **Delete it only after you are sure the new version is fine** (`docker rm <container>-bak-<timestamp>`).
+> A rollback only restores the **container and the image**; it does not undo the data migrations the new version has already applied. Keep separate backups of production data.
+
+### Compose mode: no backup container, no `:prev`
+
+DPanel's compose deploy has **no backup mechanism**: Compose mode **does not create a backup container**, and the script **does not maintain `:prev`**. A rollback can only rely on **the old image still being available locally**:
+
+```sh
+# 1. Find the ID of the old image from before the deploy
+docker images --digests <repo>
+# 2. Point :latest back at it and force a rebuild
+docker tag <old image ID> <repo>:latest
+docker compose up -d --force-recreate
+```
+
+This is an **emergency measure**, not a regular way back:
+
+- If the old image is gone locally (cleaned up), there is no way back — **check that the old image is still there before you deploy**.
+- If a `<repo>:prev` tag from the v1.x era is still on the machine, you can use it as the old image (`docker tag <repo>:prev <repo>:latest` and rebuild), but v2.0.0 will not move or maintain that tag.
+- The long-term answer is to **rehearse in a test project first**: confirm the new version is fine, and only then let the same flow touch production.
+
+## 6. Investigating leftovers from before the upgrade
+
+v2.0.0 **no longer creates** mutex lock files, and it no longer creates `/tmp/.container-autoupdate/compose-*` / `plain-*` transaction directories. But **leftovers from before the upgrade are still there**: v1.x lock files, pull processes that never exited cleanly, and transaction directories.
+
+The repository ships a **read-only** investigation script `scripts/ct-stale-lock-check.sh`: it changes nothing and kills nothing; it only lists the following and ends with copy-pasteable cleanup commands:
+
+1. the old mutex lock files;
 2. who is holding those lock files open (PID / PPID / fd / command line);
-3. leftover image pull processes;
-4. the leftover transaction directories in the state directory, marking which ones may be deleted and which ones must be kept.
+3. leftover image pull processes (`images/create`);
+4. the leftover directories under `/tmp/.container-autoupdate` (marking which ones may be deleted and which ones must be kept).
 
 ### How to use it
 
@@ -294,54 +288,73 @@ curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-auto
 sh /tmp/ct-stale-lock-check.sh
 ```
 
-**Run it in the environment that runs the updates**: the script inspects that machine's `/proc`. With DPanel that means inside the container:
+**Run it in the environment that runs the updates**: it inspects that machine's `/proc`. With DPanel that means inside the container:
 
 ```sh
 docker cp /tmp/ct-stale-lock-check.sh dpanel:/tmp/ct-stale-lock-check.sh
 docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh
 ```
 
-Optional environment variables: `CT_LOCK_PREFIX` (lock file prefix, default `/tmp/.container-autoupdate`),
-`CT_STATE_ROOT` (state directory, default `/tmp/.container-autoupdate`).
+Optional environment variables: `CT_LOCK_PREFIX` (lock file prefix, `/tmp/.container-autoupdate` by default) and `CT_STATE_ROOT` (the directory to list, `/tmp/.container-autoupdate` by default).
 
-### After you look at the result
+### Clean up after reading the result
 
-| What you see | May it be deleted | Notes |
-|---|---|---|
-| Old `.lock` files | **yes** | Current versions do not use a lock any more, they are just garbage. Deleting them affects nothing. |
-| Processes holding a lock | **check first, then kill** | Look at the command line first: `cat /proc/<PID>/cmdline` (NUL separated). Only kill it once you are sure it is a leftover that did not exit cleanly. |
-| Leftover pull processes (`images/create`) | **yes, kill them** | The pull should have ended long ago; a process that is still alive is a leftover. |
-| The `compat/` directory | **may be left alone** | It only records "the version each target last ran with"; deleting it only means you get the notice once more on the next upgrade. |
-| Transaction directories (`compose-*` / `plain-*`) | **read the logs before deleting** | They mean that round ran into trouble. The `pull.log` / `create.json` inside are the only evidence of *why* it failed. |
+Once you have confirmed that nothing in the list is still needed, run the cleanup by hand:
 
-### The real fix
+```sh
+# 1) Old lock files (v2.0.0 no longer uses a lock, they are just garbage)
+rm -f /tmp/.container-autoupdate/*.lock
 
-Cleaning up is only a patch. **The actual fix is to upgrade to a version that no longer uses a mutex lock** — a new version has no lock, so there is no "held by a leftover process" situation in the first place.
-After upgrading, confirm two things: only one DPanel scheduled task per target, and no leftover `LOCK_PREFIX=...` in the start command
-(if there is one, the script treats it as a breaking change, aborts and exits with code `3`).
+# 2) A leftover pull process: look at its command line first and only kill it when you are sure
+cat /proc/<PID>/cmdline | tr '\0' ' '
+kill <PID>
 
-## 8. Common questions
+# 3) Transaction directories left by v1.x (read the logs inside first, confirm the problem is solved)
+rm -rf /tmp/.container-autoupdate/compose-<project>
+```
 
-**Q: The log says `已是最新`, but upstream clearly published a new version.**
-A: The message means "already up to date". The script compares the **remote digest** with **the image the container is actually running**. This happens when upstream published a release but the tag content did not change (rare), or when you use a fixed digest reference. Use `--dry-run` first to see which remote digest it recognises.
+Keep the `compat/` directory: it holds the cross-version records (`COMPAT_ROOT`), and deleting it only means one extra notice on the next upgrade.
 
-**Q: The log says `SKIP 容器 xxx 属于 Compose 项目 yyy`.**
-A: The message means "SKIP container xxx belongs to Compose project yyy". That container was started by compose, so you should use `--compose yyy` and let compose do the rebuild. Rebuilding it in container mode makes compose's metadata inconsistent.
+## 7. Common questions
 
-**Q: After the update the container came up but the service is not working, yet the script says it succeeded.**
-A: The script can only judge "container health", it cannot judge "business correctness". When the image ships a healthcheck the health gate is fairly reliable; without a healthcheck it only watches for 30 seconds whether the container is still running (`PLAIN_BOOT`), which is blind to a service that crashes right after start-up or is half-dead. For such services it is recommended to add a healthcheck in the Compose file.
+**Q: Compose reports `commonDataNotFoundOrDeleted`. What now?**
+A: The project is **not registered in DPanel**. The script recognises it and prints the migration path (exit code `1`; nothing was done to the project):
 
-**Q: After the rollback the data is wrong.**
-A: A rollback only restores the **container and the image**; it does not undo the migrations the new version has already applied to the data volume / the database. This is a design boundary, not a bug. Please make separate backups of production data.
+```text
+[2026-11-03 06:00:12] ERR DPanel 里没有登记名为 myapp 的 Compose 项目
+[2026-11-03 06:00:12]     compose:deploy 只能操作 DPanel「Compose」页面里登记过的项目
+[2026-11-03 06:00:12]     处理方式二选一：
+[2026-11-03 06:00:12]       1) 在 DPanel 网页里新建 Compose 项目，名称填 myapp（指向它的 docker-compose.yaml）
+[2026-11-03 06:00:12]       2) 改用容器模式：--container <该项目里的容器名>
+[2026-11-03 06:00:12]     项目未做任何改动
+
+→ ERR: there is no Compose project named myapp registered in DPanel
+→     compose:deploy can only operate on projects registered on DPanel's "Compose" page
+→     two ways to fix it:
+→       1) create a Compose project in the DPanel web UI named myapp (pointing at its docker-compose.yaml)
+→       2) switch to container mode: --container <the container name inside that project>
+→     the project was not modified
+```
+
+Pick one of the two ways: create or import the Compose project in the DPanel web UI (the name must match `--compose`), or switch to `--container`.
+
+**Q: The task failed with `这个参数已经不能用了：xxx` and exit code `3`.**
+A: Your start command still uses a v1.x form. Change it following the "migration path" in the log; the removal lists are in [section 4](#4-migrating-from-v1x). Do not just add `--compat` at random — the wrong version stops hard on every run (see [section 3](#3-compatibility-mechanisms)).
+
+**Q: The script runs on the host — how do I point it at the DPanel container?**
+A: Add `--dpanel-container <name>` (`dpanel` by default). The script then calls DPanel through `docker exec <name> /app/server/dpanel ...` and needs a working `docker` command on the machine (it probes with `docker version` first). Use `--dpanel-bin <path>` when the DPanel CLI is not at the default path, and `--dpanel-docker-env <name>` when the docker environment inside DPanel is not `local`.
+
+**Q: The scheduled task is killed halfway through and exits with `143`.**
+A: DPanel's "execution timeout" was reached. Look at three things together: the DPanel execution timeout (set it to ≥ 600 seconds), the script's hard limit for the whole round `T_HARD` (540 seconds by default), and the timeout of one upgrade / deploy `DP_T_UPGRADE` (420 seconds by default, and actually narrowed to the remaining budget). **The internal timeout must be clearly smaller than the external one**, otherwise a SIGKILLed round may leave only `signal: killed` in the log.
+
+**Q: `--dry-run` did nothing at all in Compose mode.**
+A: That is honest reporting: DPanel's `compose:deploy` is the deploy action itself and knows no "check only". In Compose mode `--dry-run` prints one line of explanation and exits (exit code `0`) without touching anything. To rehearse, run it for real in a **test project**, or check a single container with `--container`.
+
+**Q: The log says `OK DPanel 已部署 Compose 项目 X` — does that mean it is on the latest version?**
+A: Not necessarily. `OK` only means DPanel finished this deploy (the script explicitly passes `--pull-image dpanel` so that DPanel pulls the images before deploying), but a deploy does not guarantee the version changed. Take the actual version from DPanel's operation records, or from the image the container really runs.
 
 **Q: Can one run update several targets at once?**
-A: No, one process handles one target. To do it in bulk, wrap it in a loop or run things in parallel on the outside (see section 6).
+A: No, one process handles one target. Different targets can each have their own scheduled task; put only one on each target.
 
-**Q: Can the files in `--state-dir` be deleted?**
-A: There are three cases:
-
-- **Normal successful finish** (exit code `0`): the transaction directory is cleaned up automatically, nothing to do.
-- **Rollback succeeded** (exit code `1`, the container has been restored): the scene is **kept on purpose**, because `create.json` / the old and new specs / `pull.log` are the only evidence of why this round failed, and the end of the log prints `回滚现场已保留在 …` ("the rollback scene has been preserved in …"). Delete it by hand once you are done investigating.
-- **The rollback itself failed** (exit code `2`): the scene must be kept; it is all you have when taking over manually.
-
-The pre-existing `--state-dir` directory itself is not emptied; only the per-round transaction subdirectory is.
+**Q: Can the script race several image mirror addresses in parallel and take the fastest?**
+A: Not needed. Every image pull is done by DPanel / the Docker daemon using the registry mirrors you and the daemon configured; the script never touches a registry. That idea was evaluated historically and never implemented.

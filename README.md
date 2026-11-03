@@ -2,20 +2,32 @@
 
 > 语言：[中文](README.md) | [English](README.en.md)
 
-**DPanel 定时任务**用的容器自动更新脚本，单文件。
+**DPanel 计划任务**用的容器自动更新脚本，单文件。
 
-跑一次 = 检查一次：有新版本就更新并验证，没有就立刻退出。**脚本不含调度**，频率、启停、并发全交给 DPanel 的「计划任务」。
+跑一次 = 检查一次：脚本只做「判断该不该更新 → 把更新动作交给 DPanel → 如实报出结果」这三件事，自己不拉镜像、不重建容器。**脚本不含调度**，频率、启停、并发全交给 DPanel 的「计划任务」。
 
-> 手动运行也允许，那只是「跑一轮就结束」的单次更新。**不建议**再套 cron / systemd timer 之类的时间器——脚本内部不再加互斥锁，同一个目标同时跑两轮会互相踩。
+> v2.0.0 起，更新动作全部交给 DPanel 自己完成。理由很简单：重建一个容器要准确复刻网络、挂载（含匿名卷的真实名字）、资源限制、重启策略、Capabilities……漏一处就是生产事故；而这些正是 DPanel 已有的成熟能力，它留下的「备份容器」还顺带成了现成的回滚点。脚本因此从 1700 多行降到 700 行左右，逻辑面小、可控。
+
+> 手动运行也允许，那只是「跑一轮就结束」的单次更新。**不建议**再套 cron / systemd timer 之类的时间器——并发交给 DPanel 计划任务保证，同一目标只挂一个计划任务。
 
 ## 两种模式
 
-| 你的容器是怎么起的 | 用哪个参数 |
-|---|---|
-| `docker compose up -d` | `--compose <项目名>` |
-| `docker run ...` | `--container <容器名>` |
+| 你的容器是怎么起的 | 用哪个参数 | 脚本实际执行 |
+|---|---|---|
+| `docker compose up -d` | `--compose <项目名>` | `dpanel compose:deploy --name <项目名> --pull-image dpanel` |
+| `docker run ...` | `--container <容器名>` | `dpanel container:upgrade --name <容器名>`（先只检查，确认有新版本才加 `--upgrade` 升级） |
 
-镜像地址不用填，脚本自己从 Compose 文件或容器本身读出来。
+脚本既不读 Compose 文件、也不读镜像地址：两种模式都只是按名字把目标交给 DPanel。
+
+> 镜像（Registry）的拉取全部交给 DPanel / Docker daemon，用的是**你和 daemon 配置的镜像源**，脚本根本不碰 Registry —— 所以「多镜像地址并行竞速」这件事在 v2.0.0 下不再需要。
+
+## 前置条件
+
+- 目标机器上必须装了 **DPanel**：所有更新动作都靠 DPanel 自己的命令行（DPanel 1.11.x 自带的 `container:upgrade` / `compose:deploy`）。
+- **推荐在 dpanel 容器里跑**：DPanel 的「计划任务」默认就是在 dpanel 容器内执行，脚本直接调用 `/app/server/dpanel`。
+- 在宿主上跑也行，但需要宿主有 `docker` 命令：脚本会改用 `docker exec dpanel /app/server/dpanel ...` 进容器调用。DPanel 容器名不叫 `dpanel` 时用 `--dpanel-container <名字>` 指定。
+- **Compose 项目必须已经在 DPanel 网页里登记过**（DPanel 网页 → Compose → 新建 / 导入）。没登记时 DPanel 会返回错误，脚本识别后给出迁移指引，退出码 `1`。
+- 依赖命令：`timeout` `sed` `awk` `grep`（busybox / coreutils 都行）。不在 dpanel 容器内时额外需要 `docker`。主脚本**不再需要 `curl`、`flock`**（引导器仍需 `curl` 下载脚本）。
 
 ## 快速开始
 
@@ -34,7 +46,7 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 
 > 下载地址里的 `https://github.mus.pp.ua/` 是自建加速前缀，不想要就去掉它（直连 GitHub）。前缀坏了就换 `https://gh-proxy.com/`——引导器自己会按「自建站 → gh-proxy → 直连」的顺序逐个试。
 >
-> 执行超时请设 **≥ 600 秒**。
+> 执行超时请设 **≥ 600 秒**（脚本自身的硬上限是 540 秒）。
 >
 > **为什么不推荐 `curl ... | sh`**：管道写法在下载失败时会**静默成功**（任务日志看不出这轮没跑成）。引导器会把下载落到文件、校验通过才执行，失败时明确返回非 0。
 >
@@ -50,7 +62,7 @@ curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupd
 sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
-> 不建议用 cron / systemd timer 来定时跑：脚本内部不再加互斥锁，同一个目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务——同一目标只挂一个计划任务即可。
+> 不建议用 cron / systemd timer 来定时跑：同一个目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务——同一目标只挂一个计划任务即可。
 
 ## 引导器怎么工作
 
@@ -68,24 +80,49 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 ## 常用命令
 
 ```sh
-container-autoupdate.sh --compose myapp --dry-run    # 只看有没有新版本，不更新、不删镜像
-container-autoupdate.sh --compose myapp              # 正式更新 Compose 项目
-container-autoupdate.sh --container mycontainer      # 更新普通容器
-container-autoupdate.sh --compose myapp --pull-retries 2   # 拉取失败多试一次（默认 1 次）
+container-autoupdate.sh --container mycontainer --dry-run   # 容器模式：只问 DPanel 有没有新版本，不动手
+container-autoupdate.sh --container mycontainer             # 升级一个普通容器
+container-autoupdate.sh --compose myapp                     # 部署一个 Compose 项目（需已在 DPanel 里登记）
+container-autoupdate.sh --dpanel-container mydpanel --compose myapp   # DPanel 容器不叫 dpanel 时
 ```
 
-**第一次接入建议先跑 `--dry-run`**，确认日志里认到的目标和目录是对的，再去掉它。
-（演练只写状态目录，不动容器、不动镜像标签、也不清理旧镜像。）
+**`--dry-run` 在两种模式下不一样：**
 
-拉取失败（网络抖动、镜像源瞬时 5xx）默认**重试 1 次**，两次之间等 10 秒；
-`--pull-retries <次数>` 可以改次数，`0` = 不重试。
-但**拉取卡死**（60 秒没有任何新字节）和**镜像源明确报错**（镜像不存在、鉴权失败）不重试 —— 重试也不会成功。
+- **容器模式**：真的去问 DPanel 有没有新版本，但不执行升级。有新版本时报「发现新版本」，没有时报「已是最新」：
 
-查远端 digest（问镜像仓库「最新 digest 是多少」）同样默认**重试 2 次**、间隔 5 秒；
-`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` 可调，`DIGEST_RETRIES=0` = 不重试。
+```text
+[2026-11-03 06:00:12] 发现新版本（远端 digest=sha256:a5c10db1...）
+[2026-11-03 06:00:12] DRY 只检查不动手，本轮不升级
+```
+
+- **Compose 模式**：DPanel 的 `compose:deploy` 本身就是部署动作，没有「只检查」能力。脚本只打印一句说明，然后退出 `0`，**什么都不做**（也不会告诉你有没有新版本）：
+
+```text
+[2026-11-03 06:00:12] DRY Compose 模式没有「只检查」能力（DPanel 的 compose:deploy 会直接部署）
+[2026-11-03 06:00:12]     本轮未执行部署；要检查容器有没有新版本请用 --container 模式
+```
+
+要在 Compose 项目上预演，只能在测试项目上真跑，或者改用容器模式检查。
 
 > **计划任务里失败时能直接看到原因**：失败原因除了在完整日志里，还会额外写一份到 stderr。
 > 计划任务在任务失败时只保留 stderr，早期版本因为只写 stdout，任务里只剩一句 `exit status 1`，什么都排查不出来。
+
+## 回滚
+
+容器模式和 Compose 模式的回滚点不一样，这点必须分清。
+
+**容器模式**：回滚点是 DPanel 生成的**备份容器**，名字形如 `<容器名>-bak-<时间戳>`（例如 `myapp-bak-20261103163808`）。
+它跑着升级前的镜像、处于 `Exited` 状态，在 DPanel 网页里能直接看到；要回滚就把它改回来。
+
+**Compose 模式**：**不生成备份容器，也不维护 `:prev`** —— DPanel 的 compose 部署没有备份机制。
+回滚只能靠「旧镜像还在本地」：
+
+```sh
+docker tag <旧镜像ID> <repo>:latest
+docker compose up -d --force-recreate
+```
+
+> 升级前先记下容器当前用的镜像 ID（`docker inspect -f '{{.Image}}' <容器名>`），否则事后不一定找得到那个旧镜像。
 
 ## 版本与升级
 
@@ -108,25 +145,26 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 
 锁版本时引导器完全不联网，对生产环境最稳。tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)。
 
-### 升级到「不再带互斥锁」的版本要注意什么
+### 升级到 v2.0.0 要注意什么
 
-新版本已经**移除了脚本内部的互斥锁**（`LOCK_PREFIX` 环境变量也随之作废）——
-并发改由 DPanel 计划任务保证。
+v2.0.0 把更新动作整体交给了 DPanel：**脚本不再自己拉镜像、不再自己重建容器**，也不再维护 `:prev` 回滚点、状态目录和坏版本钉住。如果你是从更早的版本升上来的，先看清下面几条。
 
-怎么判断你踩没踩到过这个问题：旧版本日志里如果反复出现
+**四个参数作废**（传了会立即中止，退出码 `3`，日志里给迁移说明）：
 
-```sh
-[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
-```
+- `--compose-dir`：Compose 更新由 DPanel 按项目名处理，不再需要项目目录。
+- `--state-dir`：脚本不再维护状态目录，跨版本提示的记录改到 `COMPAT_ROOT`（默认 `/tmp/.container-autoupdate/compat`）。
+- `--bad-ttl-days`：不再有「坏版本钉住」，回滚由 DPanel 负责。
+- `--pull-retries`：拉取由 DPanel 完成，脚本不再管理拉取与重试。
 
-而且**每一轮都一样、什么都没更新**——那说明旧版的锁被一个没退干净的子进程长期占住了。
-升级之后这个现象自然消失。
+**一批环境变量同样作废**（设置了就会命中中止）。主要有：`STATE_ROOT`、`BAD_TTL_DAYS`、`PULL_RETRIES`、`DIGEST_RETRIES`、`DIGEST_RETRY_WAIT`、`T_STALL`、`T_STALL_FINISH`、`T_PULL_MAX`、`T_UP`、`T_HEALTH`、`HEALTH_TRIES`、`T_ROLLBACK`、`PLAIN_BOOT`、`COMPOSE_DIR`、`COMPOSE_BASE`（完整清单见 [全部参数与环境变量](docs/parameters.md)）。删掉它们即可，不需要任何替代设置。
 
-升级后请确认两件事：
+> 一个例外：`T_INSPECT` 仍然接受，等价于新的 `DP_T_CHECK`。
 
-1. **同一个目标只挂一个 DPanel 计划任务**（脚本不再帮你挡并发了）。
-2. 如果你的启动命令里还留着 `LOCK_PREFIX=...`，删掉它。留着的话脚本会按破坏性变更处理，
-   直接中止并给出提示（退出码 `3`），不会静默忽略。
+其他要注意的：
+
+- **旧的 `LOCK_PREFIX` 仍然会命中中止**：脚本内部不再加互斥锁（并发交给 DPanel 计划任务保证），启动命令里还留着 `LOCK_PREFIX=...` 就会按破坏性变更处理，直接中止（退出码 `3`）并给出提示。删掉它。
+- **Compose 项目必须已经在 DPanel 网页里登记过**，否则这一轮直接报错退出（退出码 `1`），不会更新。
+- 主脚本不再需要 `curl` 与 `flock`；`--pull-retries` 之类的拉取控制全部作废——拉取由 DPanel 负责。
 
 ### 排查残留进程和旧锁文件
 
@@ -140,10 +178,12 @@ curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-auto
 sh /tmp/ct-stale-lock-check.sh
 ```
 
+> v2.0.0 起，脚本**不再产生锁文件，也不再产生 `/tmp/.container-autoupdate/compose-*` 事务目录**（`:prev` 之类的旧回滚标签也不再生成了）。这个脚本仍然有用：升级前留下来的历史残留还是那副样子，用它排查、清掉即可。
+>
 > 要在**跑更新的那个环境里**跑它（用 DPanel 的话就是 dpanel 容器内部），因为它要看的是那台机器的 `/proc`：
 > `docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh`。
 >
-> 详细的清理步骤见 [进阶用法](docs/advanced-usage.md#7-排查残留进程与旧锁文件)。
+> 详细的清理步骤见 [进阶用法](docs/advanced-usage.md#6-排查升级前的残留)。
 
 ### 用 latest 也安全
 

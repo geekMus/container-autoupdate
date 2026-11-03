@@ -85,7 +85,29 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 
 以下行为是经过 40+ 项故障实测才定下来的。**改脚本时不许为了「简洁」删掉其中任何一条。**
 
-### MUST
+v2.0.0 起，脚本把「拉镜像、重建容器、判健康、留回滚点」全部交给 DPanel 的命令行（`container:upgrade` / `compose:deploy`）。所以本节分成两半：**上面是当前必须守住的**，**下面标着「历史」的是 v1.x 时代自己拉取/重建时期的教训**——那些代码已经删掉，但你要是重写同类逻辑，不许重犯。
+
+### MUST（v2.0.0 现行）
+
+- **更新动作只许交给 DPanel**：容器走 `container:upgrade`，Compose 走 `compose:deploy`。**不许在脚本里重新实现**「拉镜像 / 重建容器 / 复刻网络与挂载 / 健康门禁 / `:prev` 回滚点」——v1.x 为此写了一千多行，实测反复出事（拉取被误判卡死、失败原因打两遍、回滚点被清理逻辑误删）。要重建容器，先用**一次实验**证明你会比 DPanel 做得更对。
+- **DPanel 的成败只能解析 JSON 判**：`compose:deploy` 对未登记的项目返回 `rc=0`，JSON 却是 `{"code":500,...}`；成功时（`{"name":"<项目名>"}`）**根本没有 `code` 字段**。判定条件必须是「`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败」。
+- **`compose:deploy` 必须显式 `--pull-image dpanel`**：它的默认值是 `command`，实测那条路**不会去拉新镜像**（镜像标签已存在就不回源），结果是「部署成功但版本没变」——最容易被误当成没事。
+- **容器模式必须先检查、后升级**：先不带 `--upgrade` 调一次 `container:upgrade` 看 `upgrade` 是不是 `true`，是才真升级。跳过检查直接升级 = 每轮都重建容器。
+- **不许传 `--disable-bak`**：DPanel 的备份容器（`<容器名>-bak-<时间戳>`）就是容器模式的回滚点，关掉它等于没有回滚点。
+- **不许给 DPanel CLI 加 `-q` / `--quiet`**：它会把结果 JSON 一起吞掉（只剩 `[DEBUG]` 行），解析必然失败；`-q` 抑制的是命令结果，不是日志。
+- **取 DPanel 结果的规则是「stdout 里最后一个以 `{` 开头的行」**：stdout 混着大量 `[DEBUG]` / GORM 日志，结果 JSON 永远在最后一行。
+- **失败原因要透传，而且不能被截断**：把 DPanel 的 `error` 文本打进日志；取 JSON 字符串字段时**不能按逗号截断**（DPanel 的错误文本里就有逗号，实测会被切成半句，真实原因就丢了）。
+- **兼容防线（旧 flag/env、`--compat`）必须排在依赖检查之前**：缺 docker 的机器上也要先看到「这个写法不能用了、该怎么改」，而不是先报「缺少依赖命令」。跨版本 `WARN` 也在依赖检查之前打印，但 lastver 在依赖检查**之后**才写（依赖缺失的那轮不算「用户已知悉」，提示不会被永久吞掉）。
+- **失败原因必须同时落到真正的 stderr**（v1.1.2 起的设计，v2.0.0 保留）：计划任务（DPanel）在任务失败时**只保留 stderr、丢弃 stdout**；理由与实现要点见下面「历史 MUST」。
+
+### NEVER（v2.0.0 现行）
+
+- 不许用 DPanel CLI 的**退出码**判成败。实测三种失败（容器不存在、项目未登记、镜像清单读不到）退出码都是 `0`。
+- 不许把「JSON 里没有 `code` 字段」当成失败——成功的形状就没有它。
+- 不许自己写「有没有新版本」的 digest 比对：容器模式用 DPanel 返回的 `upgrade`；Compose 模式**本来就无法预知**（脚本只负责转交），别假装知道。
+- 不许把 `--pull-image` 留成默认值，也不许在日志里把「部署成功」写成「已更新到最新版」——部署成功只说明 DPanel 执行完了，不是版本变了。
+
+### 历史 MUST（v1.x：脚本自己拉取与重建容器）
 
 - **Compose 参数必须通过环境变量传**（`COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES`），保留原有的项目名、config 文件、env 文件。不许拼成命令行字符串（见下方 NEVER 第 3 条）。
 - **不使用 `--remove-orphans`**：它会删掉不在当前 compose 文件里的容器，属于数据事故。
@@ -115,7 +137,7 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 - **实际挂载（含匿名卷真实名称）转成显式 `Mounts`**，避免重复挂载和换卷。
 - **创建后、启动前先做完整规格校验**（签名比对），不一致就别启动。
 
-### NEVER
+### 历史 NEVER（v1.x）
 
 - 不许在 `docker compose pull` 之前就 `docker tag $CT_IMGID $PREV`（旧脚本这么干过：pull 失败时回滚点被搬走，原 N-1 失去最后一个 tag，下一轮清理把它当孤儿删掉，**回滚点消失**）。
 - 不许用「脚本开始时的远端 digest 快照」做拉取后的校验（见 §4.3）。
@@ -128,7 +150,7 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 - 不许在 `check_deps` 里漏掉 `docker buildx`。`remote_digest()` 靠它读 manifest；缺它时 digest 恒为空，脚本每轮都报「无法获取远端 digest」而不更新——那个错误信息会把排查引向网络，与真实原因无关。
 - 不许依赖 `sort -V`（GNU 扩展）。busybox/Alpine 没有它，换 runner 或换宿主会静默取错版本。版本比较用 awk 拆三段数字。
 
-### 必须跳过的形态（并说明原因，不许硬上）
+### 历史：v1.x 必须跳过的形态（并说明原因，不许硬上）
 
 | 形态 | 原因 |
 |---|---|
@@ -142,7 +164,9 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 
 ---
 
-## 4. 拉取与进度判定
+## 4. （历史）v1.x 的拉取与进度判定
+
+> v2.0.0 起脚本不再自己拉镜像（交给 DPanel），本节整节都是历史。留着是因为「怎么判断一次拉取到底成没成」这个问题不会消失，而下面每条都是实测踩出来的。
 
 ### 4.1 不许用 `docker pull` / `docker compose pull` 的 stdout 判断卡死
 
@@ -177,7 +201,9 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 
 - 全脚本硬上限 `T_HARD=540` 秒；DPanel 任务的 `scriptRunTimeout` 设 **600**。
 - **内部超时必须显著小于外部超时。** 被 DPanel SIGKILL 的那一轮，`ims_cron_log.value` 里的 message 是**空字符串**——进程被 KILL 前来不及 flush，日志里只剩一行 `signal: killed`，什么都查不到。
-- 健康门禁在剩余预算不足时要**提前跳出并回滚**，不许把时间耗光。
+- v2.0.0 的预算分给三次调用：`DP_T_CHECK`（查有没有新版本，默认 120 秒）、`DP_T_UPGRADE`（真正升级/部署，默认 420 秒）、`DP_MIN_UPGRADE`（低于这个剩余秒数就**不动手**，默认 90 秒）。
+  - **每一次调用都要按剩余预算重新收敛**（不许直接用配置值），否则最后一句话没说完就被 SIGKILL。
+  - 剩余时间不够时**提前收手并如实报错**，不许「试一把再说」——被 KILL 的那一轮在计划任务里什么都查不到。
 
 ---
 
@@ -187,23 +213,31 @@ kill 时必须打印「共收 N 字节后无新增、停滞 M 秒」，否则事
 
 | 场景 | 期望 |
 |---|---|
-| 正常更新（两种分支各一次） | 容器与 `:latest` 一致、`:prev` = 上一版 |
+| 容器模式：已是最新 | 只调一次 `container:upgrade`（**不带** `--upgrade`），`rc=0`，零改动 |
+| 容器模式：`--dry-run` | 同样只检查，报「发现新版本」但**不升级**，零改动 |
+| 容器模式：真升级 | 调两次（检查 + `--upgrade`），生成 `<容器名>-bak-<时间戳>` 备份容器，主容器 running、镜像焕新 |
+| 容器模式：DPanel 报失败（`status=failed`） | `rc=1`，日志里有 DPanel 的**原始错误文本** |
+| 容器模式：剩余预算 < `DP_MIN_UPGRADE` | `rc=1`，**不动手** |
+| 容器不存在 | `rc=1`，透传 `No such container`（不是「升级成功」） |
+| Compose 模式：部署成功 | JSON 是 `{"name":...}`（无 `code`）→ `rc=0`，且断言**确实传了 `--pull-image dpanel`** |
+| Compose 模式：项目未登记 | CLI `rc=0` 但 JSON `code:500` → 脚本 `rc=1` + 迁移指引 |
+| Compose 模式：`--dry-run` | 只提示「没有只检查能力」，`rc=0`，零改动 |
 | 配置二选一（都填 / 都不填 / 名字不存在） | `rc=1`，不动任何东西 |
-| 远端取不到 | 零变化 |
-| 拉取停滞 | kill + 零变化 |
-| 新版不健康 | 自动回滚，容器 ID 与旧镜像完全复原 |
-| 校验中止 | tag 已还原、`:prev` 未动、`rollback-pending` 已清 |
-| `--dry-run` | 什么都没改 |
+| 旧 flag / 旧 env | `rc=3`，点名是哪一项，并给出新写法 |
+| `--compat` 非法值 / 形态错 | `rc=3`，与「未知参数」的 `rc=1` 区分开 |
+| 跨版本升级（lastver 是更早的版本） | 打印 `WARN` 后**继续执行**；lastver 写成当前版本；同版本不再重复提示 |
 
 ### 6.2 制造「有新版本」的正确方法
 
-**必须让容器本身回落到旧镜像**，只移动 `:latest` 标签无效——脚本的「本地版本」以容器实际运行的 `.Image` 为准（这是正确行为，不是 bug）。正确做法：
+容器模式的判据是 **DPanel 说要不要升级**（比较容器镜像与远端），所以要让**容器跑一个 DPanel 认不出 digest 的旧镜像**：
 
 ```sh
-OLDID=$(docker image inspect -f '{{.Id}}' "$REPO:prev")
-docker tag "$OLDID" "$REPO:latest"
-docker compose up -d --force-recreate        # 让容器真的回到旧镜像
+docker create --name _seed busybox:1.36        # 拿一份真镜像当种子
+docker export _seed | docker import - ct_fake  # 导出再导入 ⇒ RepoDigests 为空
+docker tag ct_fake busybox:1.36                # 顶掉 tag，DPanel 就会认为该升
 ```
+
+测完必须把被顶掉的 tag 复原（重新 `docker pull` 并比对 digest），否则你留下的「假旧镜像」会污染后续每一轮判断。
 
 ### 6.3 打桩方式
 
@@ -216,9 +250,11 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
 
 ### 6.5 测完必须复原
 
-- 删掉所有测试容器（含 `__old_*` 副本）、测试镜像标签、测试状态目录。
-- 复原被测试动过的生产状态：容器镜像与 `:latest` 一致、`:prev` 指向正确版本、无残留 `rollback-pending`。
+- 删掉所有测试容器：包括 `__old_*` 副本、以及 **DPanel 在升级时生成的 `<容器名>-bak-<时间戳>` 备份容器**（它是回滚点，但测试留下的那份必须清掉，不许让它堆在生产上）。
+- 删掉测试镜像标签、测试状态目录；被测试顶掉的 tag 要重新 `docker pull` 复原并比对 digest。
+- 复原被测试动过的生产状态：容器镜像与 tag 一致、无残留 `rollback-pending`。
 - 确认生产容器仍 `healthy`。
+- 删掉上传到生产机的测试脚本（容器内 `/tmp/...`、宿主 `/tmp/...`）——调试文件不许留。
 
 ---
 
@@ -297,7 +333,7 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
   - 早先「自建源把请求转给 GitHub 网页前端、不是直转 Release 资产」这一结论**已被实测推翻**：自建站两种 URL 形式（长形式 `https://github.mus.pp.ua/https://github.com/...`、短形式 `https://github.mus.pp.ua/<owner>/<repo>/...`）都能正确直转 Release 资产（`content-type: application/octet-stream`，sha256 与官方一致）。它只是**偶发超时**，所以放第一位（快、且是自己控制的），公共站兜底。
   - 长形式与短形式在不同环境里快慢正好相反（宿主长形式超时短形式快，容器内反过来），所以两种形式都要能用，不能只押一种。
 - **固定版本模式（`--ct-version` / `CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。引导器自己的开关用 `--ct-*`（命令行优先于同名 `CT_*` 环境变量），其余参数原样透传给主脚本。
-- **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh` 和 `ct-bootstrap.sh` 两个资产；少传一个，`releases/latest/download/ct-bootstrap.sh` 就是 404。
+- **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh`、`ct-bootstrap.sh` 与 `scripts/ct-stale-lock-check.sh` 三个资产；少传一个，对应的 `releases/latest/download/...` 就是 404。
 
 ### 8.6 用户文档必须中英文同步
 
@@ -402,7 +438,16 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | 自建站 `github.mus.pp.ua` 优先、公共站 `gh-proxy.com` 兜底；API 会限流 |
 | 引导器「探测远端版本失败（网络问题）」但网络其实正常 | 探测窗口没盖住 `VERSION=` 那行（它会随脚本变长下移） | 窗口放大到 16KB；Range 成功却没解析出版本号时，把整文件取下来再解析一次 |
 | 拉取最后卡在「层都拉完了」被判卡死，daemon 报 `context canceled` | Docker 写镜像配置期间不吐字节，被当成停滞掐掉，已下载的层全作废 | 层拉完后进收尾宽限（`T_STALL_FINISH`）；放弃前先问 daemon 镜像是否已落盘 |
-| `releases/latest/download/ct-bootstrap.sh` 404 | Release 只传了主脚本 | 两个资产都要传 |
+| DPanel CLI 明明失败了，脚本却报成功 | 用 CLI 退出码判成败，而失败时退出码仍是 0（容器不存在、项目未登记、镜像清单读不到） | 解析 JSON：`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败 |
+| 反过来：DPanel 成功了却被判失败 | 成功的形状（`{"name":"..."}`、`{"containerId":"..."}`）**没有 `code` 字段** | 没有 `code` 不是失败信号 |
+| `compose:deploy` 跑完镜像没变，却报成功 | `--pull-image` 默认是 `command`，那条路不拉新镜像 | 显式 `--pull-image dpanel` |
+| DPanel 的结果 JSON 解析不到 | 要么加了 `-q`（结果被一起吞掉），要么取了第一行而不是最后一行 | 不加 `-q`；取 stdout 里**最后一个**以 `{` 开头的行 |
+| DPanel 的报错只剩半句话 | 用「到逗号为止」的方式取值，而错误文本里就有逗号 | 字符串值先按 `"key":"..."` 整串匹配，匹配不到再退数字/布尔 |
+| 首轮只看到「缺少依赖命令」，看不到迁移说明 | 兼容防线排在了依赖检查之后 | 旧 flag/env 与 `--compat` 必须排在 `check_deps` 之前 |
+| 计划任务里只有一句 `exit status 1` | 失败原因只写了 stdout，而 DPanel 失败时只保留 stderr | 把 `ERR`/`CRITICAL` 行与紧随的缩进补充行写进真 stderr |
+| 每轮都重建容器 | 跳过了「先检查后升级」 | 先不带 `--upgrade` 调一次，`upgrade` 为 true 才真升级 |
+| 升级后没有回滚点 | 传了 `--disable-bak` | 不许传它：`<容器名>-bak-<时间戳>` 就是回滚点 |
+| `releases/latest/download/ct-stale-lock-check.sh` 404 | Release 只传了主脚本 | 三个资产都要传 |
 
 ---
 
@@ -432,3 +477,19 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 新增的「会失败的关键查询」（如查远端 digest）→ 有重试，且重试次数在日志里写明
 - [ ] 改过拉取的停滞/收尾判定 → 复跑「层拉完后长时间静默」场景（不进普通卡死判定），且**放弃之前**问过 daemon 镜像是否已落盘
 - [ ] 改过失败原因的打印位置 → 同一句失败原因在 stdout 与 stderr 里**各只出现一次**（stdout 完整日志 + stderr 给计划任务看是两回事，不许当成重复）
+
+v2.0.0 起另外还要过这几条：
+
+- [ ] 更新动作**没有**在脚本里重新实现（仍全部交给 `container:upgrade` / `compose:deploy`；没有新的 pull / create / 健康门禁 / `:prev` 代码）
+- [ ] 判 DPanel 成败是**解析 JSON**，不是看退出码；「没有 `code` 字段」没有被当成失败
+- [ ] `compose:deploy` 仍然显式带着 `--pull-image dpanel`（测试里有断言，不是靠人眼）
+- [ ] 容器模式仍然**先检查后升级**（不带上 `--upgrade` 的调用没被删掉或合并）
+- [ ] 调用 DPanel CLI 时**没有** `-q` / `--quiet`
+- [ ] 取结果用的是「stdout 最后一个以 `{` 开头的行」
+- [ ] 取 JSON 字符串字段**不会**被逗号截断（拿一条带逗号的 `error` 文本实测过）
+- [ ] 兼容防线（旧 flag/env、`--compat`）仍排在依赖检查之前
+- [ ] 三种 DPanel 失败（容器不存在 / 项目未登记 / 镜像清单读不到）**各自**实测过：脚本 `rc=1` 且日志里有 DPanel 的原始错误文本
+- [ ] N1 真机跑过两条路径（容器模式；容器内直执 + `docker exec` 两种调用方式各一次），并贴出真实输出
+- [ ] 测试留下的 `<容器名>-bak-<时间戳>` 备份容器已删干净（生产上不许堆）
+- [ ] N1 上的测试脚本与临时文件（容器内 `/tmp/...`、宿主 `/tmp/...`）已删
+- [ ] 提醒用户：`compose:deploy` 只认 DPanel 里**已登记**的项目，没登记的要么先在 DPanel 里加，要么继续用旧版本

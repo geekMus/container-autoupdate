@@ -4,177 +4,234 @@
 
 > This page explains **how** the script works, **when it refuses to act**, and **what it cannot protect**. It is worth three minutes of reading before you use it.
 
-## 1. What one round does
+## 1. What it does in one sentence
+
+Since v2.0.0 the script **no longer pulls images and no longer rebuilds containers itself**: it does exactly three things —
+
+1. **Decide whether an update is due** (ask DPanel "does this target have a new version");
+2. **Hand the update action over to DPanel**;
+3. **Report DPanel's result truthfully** (success / failure / nothing to update).
+
+Every update capability comes from DPanel's own command line: containers go through `container:upgrade`, Compose projects through `compose:deploy`.
+
+Why it was changed:
+
+- Rebuilding a container yourself means **faithfully reproducing** networks, mounts (including real names of anonymous volumes), resource limits, restart policies, capabilities… and missing one of them is a production incident. v1.x spent more than a thousand lines on that and still hit problems such as "a stalled pull judged wrongly" and "the failure reason printed twice".
+- DPanel already has mature implementations of both jobs, and its backup container is a ready-made rollback point.
+- The script therefore shrank from 1700+ lines to roughly 700 lines: a smaller surface, easier to keep under control.
+
+## 2. Prerequisites
+
+- **It must run on a machine with DPanel installed**: the update actions rely on DPanel's CLI.
+- **Running it inside the DPanel container is recommended** (a DPanel scheduled task runs inside the `dpanel` container by default): the script calls `/app/server/dpanel` directly.
+- If it runs on the host (not inside the dpanel container): the host needs the `docker` command, and the script calls it via `docker exec dpanel /app/server/dpanel ...`. Use `--dpanel-container` to name the container (default `dpanel`).
+- **Compose mode requires the project to be already registered in DPanel** (DPanel web UI → Compose → create/import). When it is not registered DPanel returns `{"code":500,"error":"...commonDataNotFoundOrDeleted..."}`; the script recognises that and prints a migration path, exit code `1`.
+- Required commands: `timeout` `sed` `awk` `grep` (busybox or coreutils both work). **`curl` and `flock` are no longer needed**. Outside the dpanel container, `docker` is needed as well.
+
+For the parameters and environment variables see [the parameter docs](parameters.en.md#all-command-line-parameters).
+
+## 3. What one round does
 
 ```
-0. Dependency self-check → connect to Docker
-1. Read the image reference from the Compose file / from the container itself
-2. Ask the remote "what is the latest digest" and compare it with the image
-   the container is actually running
-     if it cannot be fetched, retry (twice by default, 5 seconds apart;
-     DIGEST_RETRIES / DIGEST_RETRY_WAIT are tunable)
-     still unavailable → abandon this round (the container stays untouched)
-     same → print "already up to date" and exit (usually 2~4 seconds)
-3. Tag the current image as <repo>:rollback-pending as a placeholder (does not touch :prev)
-4. Pull the new version through the Docker Engine API, watching the byte counters
-     no new bytes for 60 seconds → judged stalled, kill -9, abandon this round (the container stays untouched)
-     but after all layers are pulled there is a separate grace period (180 seconds by
-     default, T_STALL_FINISH) — that is the time Docker spends writing the image
-     configuration and fetching the signature, and it does not emit a single byte then
-     before giving up, the script first asks the daemon whether the image actually
-     landed → if it did, the round counts as successful
-     the pull fails → retried once by default (--pull-retries is tunable; 0 = no retry)
-5. Verify: the digest that landed on disk must equal the digest reported by the pull stream itself
-6. Switch over (see the next two sections)
-7. Health gate
-     success → only then is the rollback point :prev moved to the previous version, old images are cleaned up
-     failure → roll back, the bad version is pinned as <repo>:bad (released automatically after 7 days)
+1. Parse the arguments
+2. Compatibility check: an old flag / old environment variable that matches is aborted with a migration path (exit code 3)
+   --compat <version> declares "I only verified up to some version" → a newer breaking change stops it hard
+3. Dependency self-check: timeout / sed / awk / grep; plus docker when not inside the dpanel container
+   then call the DPanel CLI (dp_cli version) to confirm it really is available
+4. Hand the update over according to the mode:
+     container      → container:upgrade (first without --upgrade, check only)
+     Compose project → compose:deploy --name <project> --pull-image dpanel
+5. Report the result (OK / ERR / WARN / DRY)
+6. Write lastver (the "this target has seen the current version" record used for cross-version notices)
+7. Exit
 ```
 
-**A failed pull is retried, once by default.** When the pull fails (network hiccup, transient 5xx from the registry, the pull stream dropping halfway) it is retried once, with 10 seconds between the two attempts; use `--pull-retries <count>` to change the number, `0` = no retry (equivalent to the old behaviour).
+Two orderings are deliberate:
 
-Not every failure is retried:
+- **The compatibility check comes before the dependency self-check** — when your invocation is no longer valid you should see the migration instructions first, rather than being sent off by a "cannot find docker / cannot find the DPanel CLI" message that points in an unrelated direction.
+- **The cross-version `WARN` is printed before the dependency self-check, but `lastver` is written only after it** — a round that fails the dependency self-check does not count as "the user has been told", so the notice appears again next time.
 
-- **An explicit error from the registry** (the image does not exist, the repository name is wrong, authentication failed) is not retried — retrying would not succeed either, it would only waste time.
-- **Not enough time budget left** means no retry — the remaining time has to be reserved for the health gate and the rollback. Better to fail this round than to let the scheduled task be killed by its execution timeout and time out again on the next round.
-- **A retry has its own share of the time budget** — it must not eat into the share reserved for the images after it.
+## 4. The full flow of container mode (`--container`)
 
-The original "never retry anything" was deliberate (back then the judgement was: stalls happen during the "connect / fetch the manifest" phase, so a retry would only burn the time budget). The two cases are now separated: a **stall** (60 seconds without bytes) is still abandoned right away, while a **failure** (the stream ended but the result is not right) is retried — the latter is usually a transient fault, and one retry normally succeeds.
+1. `container:upgrade --name <container> --docker-env local` (**without** `--upgrade`) = **check only**. DPanel compares the remote and local digests itself and returns JSON:
 
-**Querying the remote digest is retried too.** Asking the registry "what is the latest digest" is just as prone to transient faults, so it is retried twice by default with 5 seconds in between (`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` are tunable, `DIGEST_RETRIES=0` = no retry).
-When the digest cannot be fetched the script does not guess "probably not updated" — it abandons the round and writes how many attempts it made into the log.
+   ```json
+   {"upgrade":true,"digest":"sha256:a5c10db1...","digestLocal":["ghcr.1ms.run/yetone/magpie@sha256:d9d64cc1..."],"error":"","message":"","status":"upgrade"}
+   ```
 
-**The "finishing phase" of a pull has its own grace period.** After Docker has pulled every layer it still has to write the image configuration
-(fetching the signature from the registry), and during that time the pull stream **does not emit a single byte**.
-Judging that with "60 seconds without bytes = stalled" kills a pull that was about to succeed,
-and the daemon then reports `context canceled`, so **all the layers that were already downloaded are thrown away**
-(this really happened in production: every layer was `Pull complete`, only the image configuration was missing, the script cut the stream off
-and the whole round was wasted). So the script does two things: once all layers are pulled it enters a separate finishing grace period
-(`T_STALL_FINISH`, 180 seconds by default); and when that grace period expires without a digest it **first asks the daemon whether the image actually landed** —
-if it really did (the tag points at the new image and RepoDigests has a value) the round ends as a success instead of wasting the work.
+2. `upgrade` is **not** `true` → it is "already up to date". The script prints `OK 容器 <名> 已是最新（DPanel 报告 status=latest）`, exit code `0`, and **the container was not touched at all**.
 
-**The failure reason is written to stderr as well.** A scheduled task keeps only stderr and discards stdout when the task fails;
-so the `ERR` / `CRITICAL` lines (and the indented follow-up lines right after them) are **also** written to stderr, on top of being part of the complete log.
-That way the scheduled task is not left with nothing but a bare `exit status 1`. See [the parameter docs](parameters.en.md#where-the-failure-reason-is-written).
+   ```text
+   [2026-11-03 16:38:08] OK 容器 myapp 已是最新（DPanel 报告 status=latest）
+       → OK: container myapp is already up to date (DPanel reports status=latest)
+   ```
 
-**Concurrency is the DPanel scheduled task's job.** The script has **no** mutex lock inside: one scheduled task per target is enough.
-(Older versions of the script did have a lock, but that lock could be held for a long time by a leftover child process, which made every later round print "SKIP another task for the same update target is still running" and exit — it has been removed, see [Versions and upgrades](../README.en.md#versions-and-upgrades).)
+3. `--dry-run` → it prints `发现新版本（远端 digest=sha256:...）` + `DRY 只检查不动手，本轮不升级`, exit code `0`.
 
-## 2. How the compose mode updates
+   ```text
+   [2026-11-03 16:38:08] 发现新版本（远端 digest=sha256:a5c10db1...）
+   [2026-11-03 16:38:08] DRY 只检查不动手，本轮不升级
+       → DRY: check only, no action taken; this round does not upgrade
+   ```
 
-In essence it is "redeploy it with compose":
+4. Not enough time left (`< DP_MIN_UPGRADE`, 90 seconds by default) → **no action**, exit code `1`:
+
+   ```text
+   [2026-11-03 16:38:08] WARN 剩余时间不足（40s < 90s），本轮不启动升级，容器保持原样
+   [2026-11-03 16:38:08]      下一轮计划任务会重新检查；也可以把 T_HARD 或计划任务的超时调大
+       → WARN: not enough time left (40s < 90s); the upgrade is not started this round and the container is left as is
+       →      the next scheduled task will check again; you can also raise T_HARD or the timeout of the scheduled task
+   ```
+
+5. A real upgrade adds `--upgrade`: `container:upgrade --name <container> --upgrade --docker-env local`. On success it returns `{"containerId":"..."}` and the script prints `OK DPanel 已完成升级（containerId=...）`, exit code `0`.
+
+6. **The rollback point is the backup container DPanel creates**, named like `<container name>-bak-<timestamp>` (for example `myapp-bak-20261103163808`): it runs the image from before the upgrade and is in the Exited state. To roll back, turn it back into the real one (the backup container is visible directly in the DPanel web UI).
+
+7. **On a failed upgrade DPanel rolls back itself** (measured: when the image is broken the container keeps the old image and a backup container is left behind). The script reports an error with exit code `1`, and the log carries DPanel's error text.
+
+> This is **the biggest difference** between v2.0.0 and v1.x: the rollback point is no longer the `:prev` image tag but DPanel's backup container.
+
+## 5. The full flow of Compose mode (`--compose`)
+
+1. **It can only deploy; there is no "check only"**: DPanel's `compose:deploy` is the deployment action.
+2. **`--dry-run` does nothing at all in Compose mode**, it only says so, exit code `0`:
+
+   ```text
+   [2026-11-03 16:38:08] DRY Compose 模式没有「只检查」能力（DPanel 的 compose:deploy 会直接部署）
+   [2026-11-03 16:38:08]     本轮未执行部署；要检查容器有没有新版本请用 --container 模式
+       → DRY: Compose mode has no "check only" capability (DPanel's compose:deploy deploys directly)
+       →     nothing was deployed this round; to check whether a container has a new version, use --container mode
+   ```
+
+   A rehearsal is only possible through container mode, or by running it on a test project first.
+3. A real deployment: `compose:deploy --name <project> --pull-image dpanel --docker-env local`.
+4. Not enough time left (`< DP_MIN_UPGRADE`) → no deployment, exit code `1`: `WARN 剩余时间不足（40s < 90s），本轮不部署，项目保持原样`.
+5. On success → it prints `OK DPanel 已部署 Compose 项目 <项目名>`, exit code `0`.
+
+### Why `--pull-image dpanel` must be given explicitly
+
+`--pull-image` takes `dpanel` or `command`, and **the default is `command`**. The `command` path was measured to **not pull a new image at all** (a tag that is already up to date is never fetched again), which results in "the deployment succeeded but the version did not change". So the script passes `--pull-image dpanel` explicitly, letting DPanel pull every service's image with its own pull logic before deploying.
+
+### Both success and failure hide inside the JSON
+
+- On success DPanel returns `{"name":"<project>"}` — **note: there is no `code` field on success**.
+- A failure can be `{"code":500,...,"error":"..."}` while the **CLI exit code is still `0`** — the exit code cannot be trusted, so **success and failure must be decided by parsing the JSON**.
+- The script counts it as a failure when "`code` ≥ 400, or `status=failed`, or the `error` field is non-empty", and **not** when "`code` is not 200". Writing the latter would misjudge a successful call that has no `code` as a failure.
+- The project is not registered in DPanel → `commonDataNotFoundOrDeleted` → the script prints a migration path and exits `1`:
+
+  ```text
+  [2026-11-03 16:38:08] ERR DPanel 里没有登记名为 myapp 的 Compose 项目
+  [2026-11-03 16:38:08]     compose:deploy 只能操作 DPanel「Compose」页面里登记过的项目
+  [2026-11-03 16:38:08]     处理方式二选一：
+  [2026-11-03 16:38:08]       1) 在 DPanel 网页里新建 Compose 项目，名称填 myapp（指向它的 docker-compose.yaml）
+  [2026-11-03 16:38:08]       2) 改用容器模式：--container <该项目里的容器名>
+  [2026-11-03 16:38:08]     项目未做任何改动
+      → ERR: DPanel has no Compose project registered under the name myapp
+      →      compose:deploy can only act on projects registered on DPanel's "Compose" page
+      →      two ways out:
+      →        1) create a Compose project in the DPanel web UI named myapp (pointing at its docker-compose.yaml)
+      →        2) switch to container mode: --container <a container name of that project>
+      →      the project was left untouched
+  ```
+
+## 6. When it skips / does nothing
+
+None of these are failures: it is the script (or DPanel) deliberately not acting. The log states the exact reason.
+
+| Situation | Result |
+|---|---|
+| Container mode: DPanel reports `status=latest` (`upgrade` is not `true`) | It prints `OK 容器 <名> 已是最新…`, exit code `0`, the container is not touched at all |
+| `--dry-run` (container mode) | Check only and print the new version it found, exit code `0`, no upgrade |
+| `--dry-run` (Compose mode) | **Does nothing at all**, exit code `0` (`compose:deploy` has no "check only" capability) |
+| Not enough time left (`< DP_MIN_UPGRADE`, 90 seconds by default) | No action, exit code `1`, the target is left as it was |
+| The Compose project is not registered in DPanel | It prints `ERR DPanel 里没有登记名为 <名> 的 Compose 项目` plus a migration path, exit code `1` |
+| An old parameter / old environment variable matches `BREAKING_TABLE` | Aborted immediately, exit code `3`, nothing changed, the log carries the new form |
+| A required command is missing (`timeout` `sed` `awk` `grep`, or `docker` when not inside the dpanel container) | It prints `ERR 缺少依赖命令：…`, exit code `1` |
+
+Removed parameters: `--compose-dir`, `--state-dir`, `--bad-ttl-days`, `--pull-retries`; for the removed environment variables see [the parameter docs](parameters.en.md#all-environment-variables).
+
+## 7. What it cannot protect (important)
+
+### Compose mode has no "check only"
+
+`compose:deploy` is the deployment action, and DPanel offers no "check without deploying" interface for Compose. So in Compose mode `--dry-run` does nothing, and there is no way to rehearse in advance; a rehearsal is only possible through container mode or on a test project.
+
+### Compose mode creates no backup container and maintains no `:prev`
+
+DPanel's compose deployment has no backup mechanism, and the script no longer tags `:prev` itself. So:
+
+- **A rollback can only rely on the old image still being on the local disk**;
+- **Compose mode cannot know in advance whether there is a new version**: the script does no image digest comparison (that was v1.x's job); it simply hands the deployment to DPanel and lets DPanel decide whether to rebuild. The log therefore contains no "already up to date" judgement (unless DPanel itself says so in its output).
+
+A manual rollback in Compose mode:
 
 ```sh
-COMPOSE_PROJECT_NAME=<project> \
-COMPOSE_FILE=<the original config> \
-COMPOSE_ENV_FILES=<the original env> \
+# while the old image is still on the local disk (find its ID with docker images first)
+docker tag <old image ID> <image repository>:latest
 docker compose up -d --force-recreate
 ```
 
-- **The project name, the config file and the env file are all read from the labels of the running container**, so the redeployment is exactly the same as the original one.
-- Those parameters are passed through **environment variables** instead of the `-p` / `-f` / `--env-file` command line arguments. Reason: when the command line is assembled as a string, a path containing a space makes compose **print the Usage help and still return `rc=0`** (a silent failure, hit in practice). Passing them via environment variables does not have that problem, and it also does not rely on the current directory to guess the project name.
-- With several compose files, `COMPOSE_PATH_SEPARATOR=,` declares the separator explicitly, so that a path containing a colon is not split apart.
-- **`--remove-orphans` is not used**: it would delete containers of the same project that are not in the compose file but are still running.
-- The health gate checks **all the containers in the project** (those with a healthcheck must report `healthy`; those without one must still be running 30 seconds after start).
-- Rollback = restore the tag to the version from before the update and `up` once more; after the rollback it also re-checks that the containers really run the old image.
+Container mode is the opposite: DPanel leaves a `<container name>-bak-<timestamp>` backup container. DPanel's `--disable-bak` is **not** passed by us, so backing up is the default.
 
-## 3. How the container mode updates
+### Container health and business correctness are no longer judged by the script
 
-Instead of assembling arguments for `docker run`, it **rebuilds the container from the old one's declarative configuration**:
-
-1. Rename the old container to `<name>__old_<timestamp>` (**it keeps running at this point, so the service is not interrupted**)
-2. Stop the old one
-3. Take the old container's `Config` + `HostConfig` + the actual mounts + the network declarations and create a new container through the Docker API **under the original name**
-4. **Before starting it**, verify item by item that the new container's specification matches the old one (image, command, environment, ports, mounts, networks, restart policy, resource limits…)
-5. Start it → health gate (containers without a healthcheck get a 30 second observation window)
-6. On success → record the rollback point and delete the older `__old_*` copy (only one copy is kept)
-
-A few deliberate choices:
-
-- **The runtime `NetworkSettings` as a whole is not fed back** (it contains the container ID and the auto-assigned MAC/IP; feeding it back causes conflicts). The network is rebuilt from the declarations, and the auto-generated MAC/IP is reassigned.
-- **The actual mounts are turned into explicit `Mounts`**, using the real name of an anonymous volume. That way the rebuilt container mounts the same volume instead of getting a new one and losing the data.
-- **Everything is done by container ID, not by name.** The name is briefly taken during the rename, so working by ID is the only way to be sure you are not touching the wrong object.
-- A rollback is "rename the old container back to its original name and start it"; the old container is kept around the whole time, so the rollback is fast.
-
-## 4. What is skipped outright (`SKIP`)
-
-These are not failures, they are the script deliberately refusing to act. The log says exactly why.
-
-| Situation | Why it is skipped |
-|---|---|
-| The container belongs to a Compose project | You should use `--compose` and let compose do the rebuild, otherwise compose's metadata ends up inconsistent |
-| The container has `AutoRemove=true` | Stopping the old container would delete it, and then the rollback copy would be gone |
-| The container has `NetworkMode=container:<another container>` | It shares another container's network stack, and rebuilding it alone would break the chain |
-| Another container depends on it via `--network container:` or a legacy link | Same reason: rebuilding would break those dependencies |
-| It uses `VolumesFrom` | The mount semantics cannot be reproduced reliably |
-| A mount carries an SELinux `z/Z` (and is not a volume) or another Mode that cannot be preserved | The permission semantics would change after the rebuild |
-| A volume uses a custom driver | The behaviour of a non-local driver cannot be guaranteed |
-| The network driver is not bridge/host/null | Rebuilding an unusual network (such as macvlan) is risky |
-| The network has a MAC but no IPv4 | You cannot tell an auto-generated MAC from a user-specified one |
-| The container is not `running` right now | There is no point in messing with a container that is stopping |
-| The image reference is a digest (`repo@sha256:…`) | A pinned digest means "this must not change", so there is no such thing as "a new version" |
-| The target is the container the script itself runs in | Updating itself would kill the executing process |
-| The remote version is still within its `:bad` pinning period | This version is known to be broken, so it is left alone for now |
-
-Two extra rules in compose mode:
-
-- **Some container in the project is not running** → the whole round is skipped. That avoids treating "a one-off / deliberately stopped service" as a normal state and rebuilding it.
-- **The same image runs at different versions inside the project** (some containers on the new version, some on the old one) → skipped, with a hint to unify them by hand first.
-
-## 5. What it cannot protect (important)
+v1.x watched the container itself: whether the healthcheck passed and whether it was still running after start-up. Since v2.0.0 that job belongs to DPanel; the script only reports what DPanel says.
 
 ### Data is not rolled back
 
 A rollback only restores the **container and the image**. Migrations, writes and schema changes that the new version has already applied to a data volume or a database are **not** undone by the rollback.
 
-> For containers running a database or any other stateful service, keep a separate backup. The script can guarantee "the container is back on the old image"; it cannot guarantee "the data is back in the old state".
-
-### Healthy ≠ business correct
-
-The script can only judge "the container is healthy". When the image ships a healthcheck that judgement is fairly reliable; **without a healthcheck it only watches for 30 seconds whether the container is still running**, which is blind to:
-
-- a container that crashes 40 seconds after start-up
-- a container that starts but cannot reach its database and returns 500
-- a container that starts but begins writing bad data
-
-For such services it is recommended to add a healthcheck in the Compose file, otherwise the gate means very little.
-
-### It only recognises "did the tag change"
-
-The decision is based on comparing the remote digest with the running image. If upstream **reuses the same tag without changing the content**, or if you reference a pinned digest, the script considers itself up to date — that is correct behaviour, not a missed update.
+> For containers running a database or any other stateful service, keep a separate backup. The script and DPanel can guarantee "the container is back on the old image"; they cannot guarantee "the data is back in the old state".
 
 ### It only handles "one new version"
 
-If upstream jumps several versions at once, the script only pulls the newest one and does not step through them one by one. Upgrades across major versions (for example a database schema that requires a migration per version) have to be arranged by you.
+If upstream jumps several versions at once, this round only reaches the newest one and does not step through them one by one. Upgrades across major versions (for example a database schema that requires a migration per version) have to be arranged by you.
 
-## 6. What the scene looks like after a failure
+### Where the images come from is not the script's business
+
+The script **does not touch the registry**: the registry is decided by the Docker daemon, DPanel and your own configuration. That is why mechanisms such as "several GitHub mirror sites racing in parallel" are neither needed nor implemented under the v2.0.0 architecture.
+
+## 8. What the scene looks like after a failure
+
+### Error lines go to stdout and to the real stderr
+
+When a scheduled task (DPanel) **fails** it keeps only stderr and discards stdout. So the `ERR` / `CRITICAL` lines (and the indented follow-up lines right after them) are written **twice**: the complete log goes to stdout, and the failure reason additionally goes to the real stderr. That way the scheduled task is not left with nothing but a bare `exit status 1`, and **the log always carries the reason** (which is also the first thing to look at when investigating a failure).
+
+DPanel's original error text is **passed through** into the log; the script does not rewrite it. See [the parameter docs](parameters.en.md#where-the-failure-reason-is-written).
+
+### Exit codes
 
 | Exit code | The scene |
 |---|---|
-| `0` | Clean. The temporary `:rollback-pending` is removed and orphan images are cleaned up (`--dry-run` is the exception: a dry run changes nothing, so it cleans up nothing) |
-| `1` | **Neither the container nor the images were touched**, everything is exactly as it was, so you can just run it again. This covers two situations: it stopped before doing anything (the pull failed, the remote could not be reached, the budget was not enough), and **the new version was unhealthy but the automatic rollback succeeded** — the latter leaves the scene in the state directory (`create.json`, the old and new specs, `pull.log`) for you to investigate, and the end of the log says `回滚现场已保留在 …` ("the rollback scene has been preserved in …") |
-| `2` | The rollback itself failed. The state directory (by default `/tmp/.container-autoupdate`) is **kept on purpose**; it holds the old and new container IDs, the original image ID and the rename record, so a human can take over |
-| `3` | **A breaking change**: your invocation is no longer valid. The script stopped before doing anything and changed nothing. Just follow the "migration path" in the log and fix the command |
+| `0` | Success (including "already up to date" and `--dry-run`) |
+| `1` | Failure: DPanel reported an error, the project is not registered, the remaining budget is not enough, a dependency is missing, a parameter is wrong. The target is left as it was |
+| `2` | Reserved. Not produced in v2.0.0 for now (DPanel owns the rollback, the script does not see it) |
+| `3` | **A breaking change**: your invocation is no longer valid. The script stopped before doing anything and changed nothing; just follow the migration path in the log and fix the command |
+| `130` | Interrupted by Ctrl-C (SIGINT) |
+| `143` | Killed by `timeout` / SIGTERM (common when a DPanel scheduled task hits its execution timeout) |
 
-`2` is the only case that really requires a human to take over (`3` also needs you to act, but you only have to edit the command — the container itself was never touched). Typical causes: Docker itself is unresponsive, the disk is full, the old container was deleted by someone else. Do not rush to reboot the machine and do not run `docker system prune` — the information you need is in the state directory.
+## 9. Differences from v1.x
 
-## 7. Rollback point and bad-version pinning
+| Aspect | v1.x | v2.0.0 |
+|---|---|---|
+| Who pulls the image | The script itself through the Docker Engine API, watching byte counters, judging stalls and retrying | DPanel and the Docker daemon (the script does not touch the registry) |
+| Who rebuilds the container | The script itself, from the declarative configuration, verifying the specification item by item | DPanel's `container:upgrade` |
+| Who rebuilds the Compose project | The script itself: `docker compose up -d --force-recreate` | DPanel's `compose:deploy` |
+| Rollback point | The tag `<image repository>:prev` (one copy kept) | DPanel's backup container `<container name>-bak-<timestamp>` (container mode) |
+| Health gate | The script judged it itself (healthcheck / a 30 second observation window) | DPanel's upgrade flow owns it, the script no longer judges |
+| Bad-version pinning | `<image repository>:bad`, 7 days by default | Removed |
+| Failure reason | stdout + the real stderr | Unchanged (stdout + the real stderr) |
+| Transaction directory | `--state-dir` / `STATE_ROOT`, keeping the rollback scene | Removed |
+| Mutex lock | Already removed (concurrency is left to the DPanel scheduled task) | Unchanged: there is no lock inside the script |
+| Pull control parameters | `--pull-retries`, `PULL_RETRIES`, `DIGEST_RETRIES`, `T_STALL`, `T_STALL_FINISH` and more | All obsolete (DPanel owns the pull) |
+| Cross-version notice | `lastver` under `COMPAT_ROOT` | Unchanged |
 
-- The rollback point is the tag `<image repository>:prev`, and **only one copy is kept**; it always points at "the last version known to run healthily".
-- It is moved only after a successful update; when an update fails it stays where it is, so you can go back to the previous version at any time.
-- A failed new version is pinned as `<image repository>:bad` and is not attempted again for 7 days by default (change it with `--bad-ttl-days`). That way, when upstream publishes a broken version, you do not retry it every hour and keep taking the service down.
-- To release the pin immediately: `docker rmi <image repository>:bad`.
+Removed parameters and environment variables (matching one aborts with exit code `3`):
 
-Manual rollback:
+- Parameters: `--compose-dir`, `--state-dir`, `--bad-ttl-days`, `--pull-retries`.
+- Environment variables: `STATE_ROOT`, `BAD_TTL_DAYS`, `PULL_RETRIES`, `DIGEST_RETRIES`, `DIGEST_RETRY_WAIT`, `T_STALL`, `T_STALL_FINISH`, `T_PULL_MAX`, `T_UP`, `T_HEALTH`, `HEALTH_TRIES`, `T_ROLLBACK`, `PLAIN_BOOT`, `COMPOSE_DIR`, `COMPOSE_BASE`.
+- Exception: `T_INSPECT` is still accepted, equivalent to `DP_T_CHECK`.
 
-```sh
-# Compose mode (enter the project directory; the project name can be read from the docker inspect label)
-cd /path/to/project-dir
-docker tag <image repository>:prev <image repository>:latest
-docker compose up -d --force-recreate
+In addition, v2.0.0 **no longer produces** the `<image repository>:prev` tag or the `/tmp/.container-autoupdate/compose-*` transaction directories; you can clean them up by hand after upgrading (the diagnostic script `scripts/ct-stale-lock-check.sh` lists them).
 
-# Container mode
-docker rm -f <container name>
-docker rename <container name>__old_<timestamp> <container name>
-docker start <container name>
-```
+For migration and version policy see [README](../README.en.md#versions-and-upgrades).

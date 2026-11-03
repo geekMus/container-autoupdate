@@ -2,279 +2,269 @@
 
 > 语言：[中文](advanced-usage.md) | [English](advanced-usage.en.md)
 
-> 基础用法看 [README](../README.md)。这里讲的是**下载方式、退出码、计划任务细节，以及几个容易踩的坑**。
+> 基础用法看 [README](../README.md)，全部参数见 [参数文档](parameters.md)。
 >
-> 脚本是给 **DPanel 计划任务**用的：跑一轮就结束，频率与并发交给 DPanel。
-> 同一目标只挂一个计划任务即可（脚本内部没有互斥锁）。手动跑是单次运行，
-> 不建议再套 cron / systemd timer。
+> v2.0.0 起，脚本**不再自己拉镜像、不再自己重建容器**：它只判断「该不该更新」，把更新动作交给 DPanel 的命令行
+> （容器走 `container:upgrade`，Compose 项目走 `compose:deploy`），再如实报结果。原理与安全边界见 [工作方式与安全边界](how-it-works.md)。
+>
+> 所以本文讲的是：DPanel 计划任务怎么配、退出码、破坏性变更与迁移、回滚怎么回、升级前的残留怎么清。
 
-## 1. 怎么把脚本弄到机器上
+## 1. DPanel 计划任务
 
-**生产环境推荐用引导器**（`ct-bootstrap.sh`）：它负责下载与缓存，你只维护一行命令。
+### 脚本框里写两行
 
-### 推荐：用引导器（自带缓存，不必每轮联网）
+新建计划任务，脚本框里填**两行**：
 
 ```sh
+# 第一行：把引导器落到本地（自带缓存，同版本不重复下载）
 curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /usr/local/bin/ct-bootstrap.sh
-chmod +x /usr/local/bin/ct-bootstrap.sh
-/usr/local/bin/ct-bootstrap.sh --compose myapp
+  -o /tmp/ct-bootstrap.sh
+# 第二行：跑一轮。--compose 换成你的项目名；普通容器写 --container <容器名>
+sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
-引导器每次运行的行为：
+- 不要写成 `curl ... | sh`：管道写法在下载失败时会**静默成功**（任务日志里看不出这一轮没跑成）。引导器先落地、校验通过才执行，失败时明确返回非 0。
+- 生产环境想锁死版本：给引导器加 `--ct-version <版本号>`（或设 `CT_VERSION`；版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、完全不联网。引导器的全部开关见 [参数文档](parameters.md)。
+- 两种模式的对应关系：
 
-| 情形 | 网络开销 |
-|---|---|
-| 设了 `--ct-version <版本号>`（或 `CT_VERSION`），本地已有 | **零**（完全不联网） |
-| 默认（跟 latest），本地同版本 | 一次 Range 探测（取文件头 16KB，约 1 秒），不下载 |
-| 默认，远端有新版本 | 探测 + 一次完整下载，然后缓存 |
-| 探测失败但本地有缓存 | 零（用缓存，打 `WARN`） |
-| 探测失败且无缓存 | 零，但**明确报错退出**（不会静默成功） |
-
-好处有三个：下载失败会明确返回非 0；缓存命中时不必联网（镜像源抖动不影响脚本启动）；缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当脚本执行。
-
-全部配置项见 [参数文档](parameters.md#引导器ct-bootstrapsh的参数与环境变量)。
-
-### 备选：直接下载主脚本到文件，再执行（不缓存）
-
-如果你不想用引导器，就直接跑主脚本。注意此时**脚本不会自己升级**，你得自己定期重下：
-
-```sh
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
-  -o /usr/local/bin/container-autoupdate.sh
-chmod +x /usr/local/bin/container-autoupdate.sh
-/usr/local/bin/container-autoupdate.sh --compose myapp
-```
-
-### 仅用于验证：落到临时文件再执行（不污染磁盘）
-
-想快速验证网络与参数、又不留文件时用这个：
-
-```sh
-URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
-_t=$(mktemp)
-if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
-  sh "$_t" --compose myapp
-else
-  echo "下载失败" >&2; rm -f "$_t"; exit 1
-fi
-rm -f "$_t"
-```
-
-下载失败时 `exit 1` 会出现在任务日志里，而不是静默当成成功。**但它每轮都要下载**，不建议用于生产。
-
-### 不建议：直接管道执行
-
-```sh
-curl -fsSL "$URL" | sh -s -- --compose myapp
-```
-
-能跑，但有三个必须知道的限制：
-
-1. **下载失败会被吞掉。** `curl -f` 失败时管道仍然是「成功」的（`sh` 拿到空输入，什么都不执行，退出码 0）。定时任务看到的是「这轮正常结束」，而实际上什么都没做。
-2. **每轮都要联网下载**，镜像源抖动（403/522/`Recv failure`）就会让这一轮跑不起来。
-3. **不要在管道里做兜底。** `curl A || curl B | sh` 这种写法有两个坑：
-   - A 成功时，它的输出被**丢弃**，实际执行的是 `curl B | sh` —— 你以为是 A 的版本，其实跑的是 B；
-   - 两个都失败时，`sh` 拿到空输入，静默成功退出 0。
-
-   要兜底就把它们括起来：`( curl A || curl B ) | sh`，或者干脆落到临时文件（见上）。
-
-> 想让管道写法也暴露失败，可以在你自己的外层包一层 `set -o pipefail`（busybox sh 也支持）：
-> ```sh
-> set -o pipefail
-> curl -fsSL "$URL" | sh -s -- --compose myapp
-> ```
-> 这样 `curl` 失败时整条命令返回非 0。
->
-> **但它有一个副作用**：如果脚本在读完输入之前就退出了（`--version`、`--help`、参数错误这类秒退场景），`curl` 会拿到 `curl: (23) Failure writing output to destination`，整条管道于是返回 `23`——即使脚本本身是成功的。实测：`--version` 带 pipefail 返回 `23`，`--compose ... --dry-run` 跑到末尾返回 `0`。
->
-> 所以 **pipefail 只适合固定参数、会跑完整个流程的场景**（比如写死在 DPanel 计划任务里的 `--compose myapp`）。要用 `--version`/`--help` 或参数可能出错时，改用上面的临时文件写法。
-
-## 2. 版本：默认跟最新发布版，也可以锁死
-
-**默认用法**：引导器的地址用 `releases/latest/download/ct-bootstrap.sh`，它每次运行会自己判断要不要更新主脚本。
-
-它和 `/main/` 不一样：`/main/` 指向分支最新提交，包含还没发布的中间状态（包括改文档的提交）；`releases/latest/` 只指向**已经通过校验并正式发布**的版本。
-
-**想锁死版本**：给引导器加 `--ct-version`（不用改下载地址；也可用环境变量 `CT_VERSION`）：
-
-```sh
-/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
-```
-
-锁死后引导器**完全不联网取新版本**——本地有该版本就直接跑。这是生产环境最稳的形态。
-
-如果你不用引导器、直接跑主脚本，那就把地址里的 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）：
-
-```sh
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
-```
-
-什么时候该锁死：你不想在无人值守的生产环境上突然换行为。锁死之后，升级变成一次显式的版本号替换。
-
-查看当前用的是哪个版本：
-
-```sh
-sh container-autoupdate.sh --version
-```
-
-> **发版机制**：仓库里的 `VERSION` 字段（脚本顶部 `VERSION` 字段，形如 `VERSION="1.2.3"`）是唯一版本来源。推到 `main` 时，GitHub Actions 会读它，若对应 tag 不存在就自动打 tag 并发布 Release，并把脚本作为 Release 资产上传。所以升级只需要改 `VERSION` 一个地方，README 和下载地址都不用动。
-
-> 注意：**`refs/tags/<tag>` 这种形式不要用**。某些加速服务（含自建的那套）对它超时。用 `/releases/download/<tag>/` 或短 tag 路径。
-
-### 用 latest 时，破坏性变更会怎么表现
-
-这是「用 latest 也安全」的机制说明。上游改坏了你的调用方式时，脚本分三类处理：
-
-| 变更类型 | 例子 | 脚本怎么办 |
+| 你的容器是怎么起的 | 用哪个参数 | 脚本实际执行 |
 |---|---|---|
-| 参数被移除/改名 | `--target` 拆成 `--compose` / `--container` | **立刻中止**，退出码 `3`，日志写明「哪个参数不能用了、从哪个版本起改成什么、怎么改」 |
-| 环境变量被移除/改名 | `UPD_TARGET` 拆成 `UPD_COMPOSE` / `UPD_CONTAINER` | 同上 |
-| 默认行为/语义变化 | 回滚副本默认从 1 份变 2 份 | 无法从输入判断，用下面两个机制兜住 |
+| `docker compose up -d` | `--compose <项目名>` | `dpanel compose:deploy --name <项目名> --pull-image dpanel` |
+| `docker run ...` | `--container <容器名>` | `dpanel container:upgrade --name <容器名>`（先不带 `--upgrade` 检查，确实有新版本才真升级） |
 
-后一类靠这两个机制：
+Compose 项目必须**已经在 DPanel 里登记过**（DPanel 网页 → Compose → 新建 / 导入）。没登记会报 `commonDataNotFoundOrDeleted`，见第 7 节。
 
-**① 跨版本提示。** 脚本会在 `--state-dir` 下记住每个目标上次跑过的版本（`compat/compose-<名>/lastver`、`compat/plain-<名>/lastver`）。当本次版本更高、且两者之间存在破坏性变更时，日志开头会多一段：
+### 执行超时设 ≥ 600 秒
+
+- 脚本自己的整轮硬上限是 `T_HARD`（默认 540 秒）。DPanel 的「执行超时」必须**明显大于**它，建议 **≥ 600 秒**。
+- 单次调用的超时另有控制：`DP_T_CHECK`（检查，默认 120 秒）、`DP_T_UPGRADE`（升级 / 部署，默认 420 秒）；每一次调用还会按剩余预算再收敛一次。
+- 超时太短的后果：这一轮被 DPanel 杀掉，退出码 `143`；被 SIGKILL 的那一轮日志里可能只剩一行 `signal: killed`，什么原因都看不到。
+- DPanel 在 UI 里编辑任务时会重写任务的设置 JSON，手填的「执行超时」可能被抹掉（实测发生过）。改完排期回来确认一次。
+- 剩余预算不足 `DP_MIN_UPGRADE`（默认 90 秒）时脚本**不动手**，如实报错退出码 `1`，下一轮再试。
+
+### 同一目标只挂一个计划任务
+
+脚本内部**不加互斥锁**，并发由 DPanel 计划任务保证。同一个目标同时跑两轮会互相踩；**同一目标只挂一个计划任务**。
+
+不同目标互不影响，可以各自挂一个任务（见第 7 节）。
+
+### 失败时能看到原因
+
+DPanel 计划任务在**失败时只保留 stderr**（成功时只保留 stdout）。所以脚本把失败原因（`ERR` / `CRITICAL` 行，以及紧随其后的缩进补充行）**同时**写 stdout 和真正的 stderr——这是 v1.1.2 起的设计，v2.0.0 保留。计划任务失败时直接就能看到原因，而不是只有一句 `exit status 1`。
+
+> 副作用：手动把 stdout / stderr 合并到同一个文件时，错误行会各出现两次。
+
+### 手动跑一轮
+
+允许，但那只是**单次运行**：
 
 ```sh
+sh /tmp/ct-bootstrap.sh --compose myapp
+```
+
+### 不推荐 cron / systemd timer
+
+脚本不含调度、也不加互斥锁。用 cron / systemd timer 定时跑，你得**自己保证同一目标不会同时跑两轮**。要定时更新就用 DPanel 计划任务。
+（确实要用 cron，请在 crontab 表达式里错开时间点。）
+
+### 脚本不碰镜像仓库
+
+镜像的拉取全部由 DPanel / Docker daemon 完成，用的是**你和 daemon 配置的镜像源**。脚本不碰 Registry，所以「多个镜像地址并行竞速」在 v2.0.0 下不再需要、也没有实施（历史上评估过）。
+
+## 2. 退出码
+
+| 退出码 | 含义 | 该做什么 |
+|---|---|---|
+| `0` | 成功更新 / 已是最新 / `--dry-run` 只检查 | 不用管 |
+| `1` | 失败：DPanel 报错、Compose 项目没在 DPanel 登记、剩余时间不足、缺依赖、参数错误（**目标保持原样**） | 看日志里的 `ERR`；脚本不会改动目标 |
+| `2` | **保留位**：v2.0.0 目前不产生（回滚由 DPanel 负责，脚本不感知） | — |
+| `3` | **检测到破坏性变更**，你的调用方式已失效（本次未做任何改动） | 按日志里的「迁移方式」改命令；或锁版本；或加 `--compat` |
+| `130` | 被 `Ctrl-C`（`SIGINT`）中断 | 手动跑时按的，无妨 |
+| `143` | 被 `SIGTERM` / `SIGHUP` 中断（计划任务执行超时最常见） | 说明「执行超时」太短；调大它，或调小 `T_HARD` |
+
+## 3. 兼容机制
+
+破坏性变更（参数 / 环境变量 / 行为）登记在脚本的 `BREAKING_TABLE` 里。用 `latest` 也安全，靠的是下面三件事。
+
+### 旧写法命中，立刻中止（退出码 3）
+
+旧参数 / 旧环境变量还在用 → 脚本**立刻中止**，退出码 `3`，日志写明「哪个写法不能用了 / 从哪个版本起改成什么 / 怎么改 / 或者固定旧版本」：
+
+```text
+[2026-11-01 03:47:12] ERR 这个环境变量已经不能用了：LOCK_PREFIX（当前值=/tmp/.container-autoupdate）
+[2026-11-01 03:47:12]     从 v1.0.0 起：LOCK_PREFIX 已移除
+[2026-11-01 03:47:12]     原因：1.0.0 起脚本不再使用互斥锁，并发由 DPanel 计划任务保证
+[2026-11-01 03:47:12]     迁移方式：删掉 LOCK_PREFIX 即可，不需要任何替代设置
+[2026-11-01 03:47:12]     或者把下载地址固定到旧版本（见 README「版本与升级」）
+[2026-11-01 03:47:12]     本次未做任何改动，退出码 3
+```
+
+v2.0.0 作废的参数与环境变量见第 4 节。
+
+### 跨版本 WARN
+
+脚本记住**每个目标上次跑过的版本**（记在 `COMPAT_ROOT` 下，每个目标一个 `lastver`；默认是 `/tmp/.container-autoupdate/compat/compose-<项目名>/lastver`，容器模式是 `container-<容器名>`）。升级到含破坏性变更的新版时，日志开头会多一段 `WARN`，说明改了什么、该怎么应对，**然后照常执行**：
+
+```text
 [2026-11-01 03:52:03] WARN 你从 1.0.0 之前的版本(0.9.0)升级上来，v1.0.0 引入了破坏性变更
-[2026-11-01 03:52:03]      变更：默认保留 2 份回滚副本
-[2026-11-01 03:52:03]      应对：如只想保留 1 份，加 --keep 1
+[2026-11-01 03:52:03]      变更：1.0.0 起移除脚本内的互斥锁：v0.4.0 的锁会被残留的子进程长期占住，导致之后每一轮都跳过
+[2026-11-01 03:52:03]      应对：同一目标只挂一个 DPanel 计划任务
 [2026-11-01 03:52:03]      本次仍会继续执行。两条路选一条：
 [2026-11-01 03:52:03]        1) 接受上面的新做法（想让下一次破坏性变更前先停住，可加 --compat 1.0.0）
 [2026-11-01 03:52:03]        2) 想继续用旧行为，把下载地址固定到 v0.9.0 那个 tag
 ```
 
-它**不中止**（因为不确定你是否依赖旧行为），只提示。同一版本不会重复提示；降级也不会提示。
+它**不中止**（因为不确定你是否依赖旧行为），只提示。同一版本不重复提示；降级不提示。
 
-> 注意别照着提示去加 `--compat 0.9.0`：那个值会让下面的 `--compat` 机制**硬停**（退出码 `3`），
-> 等于每次跑都停。想要「先停住」应该写 `--compat 1.0.0`（= 当前脚本版本）。
+> 注意：**别把提示里的旧版本号填进 `--compat`**（例子里是 `0.9.0`）——`--compat` 的语义是「我已经验证到 vX」，填一个比变更版本还旧的版本，等于每次都声明「这个变更我没验证过」，于是**每次运行都硬停**（退出码 `3`）。
+> 想「先停住」应该写**当前脚本的版本**（`sh container-autoupdate.sh --version` 可以查；日志首行的 `container-autoupdate v<版本> 启动` 也是它）。
 
-**② `--compat <版本>`。** 你可以声明「我只验证到某个版本」。如果脚本版本更高、且中间有破坏性变更，它会硬停（退出码 `3`）而不是冒险执行：
+### `--compat <版本>`
+
+声明「我只验证到某个版本」。脚本比它新、且中间有登记在案的 `behavior` 级变更 → **硬停**，退出码 `3`：
 
 ```sh
-container-autoupdate.sh --compose myapp --compat 0.9.0
+container-autoupdate.sh --compose myapp --compat 1.2.3
 ```
 
-适合的场景：你在生产上验证过 `0.9.0`，但某天 `latest` 跳到 `1.0.0`，你还没时间做回归——加上 `--compat 0.9.0` 就等于「只要碰到我没验证过的破坏性变更就别动我的容器」。等你验证完了，把数字改成新版本或直接去掉。
+（`1.2.3` 是示例占位，换成你**验证过**的版本。）
 
-`--compat` 的边界行为：
+适合：你在生产上验证过某个版本，某天脚本跳到含破坏性变更的新版，你还没时间回归——`--compat` 等于「碰到我没验证过的破坏性变更就别动我的容器」。验证完把数字改成新版本，或直接去掉。
 
-- 值不合法（如 `abc`）→ 退出码 `3`
-- 值比脚本还新（例如脚本 `1.0.0` 但你写 `--compat 1.5.0`，通常是下载地址写错了）→ 退出码 `3`
-- 值等于或高于变更版本 → 放行
-- 没有任何登记在案的破坏性变更 → 直接放行，不打扰
+边界行为：
 
-> 维护者视角：破坏性变更登记在脚本里的 `BREAKING_TABLE`。新增能力、改日志措辞、改内部实现都**不要**登记，否则每次发版都在打扰用户。
+| 情况 | 结果 |
+|---|---|
+| `--compat` 后面没跟值 | 退出码 `1`（参数错误：缺少参数） |
+| 值不合法（如 `abc`、`1..2`），或显式给了空值 | 退出码 `3` |
+| 值比脚本还新（通常是下载地址写错了） | 退出码 `3` |
+| 值等于或高于变更版本 | 放行 |
+| 没有任何登记在案的破坏性变更 | 直接放行，不打扰 |
 
-## 3. 国内网络：换镜像源
+> 顺序是刻意的：兼容检查在依赖检查**之前**（缺 `docker` 的机器上也要先看到迁移说明）；跨版本 `WARN` 也在依赖检查前打印，但 `lastver` 在依赖检查**之后**才写——依赖缺失的那一轮不算「用户已知悉」。
 
-`raw.githubusercontent.com` 在国内经常连不上（实测多次 8 秒超时）。引导器的默认源已经处理了这件事（`CT_SOURCE=auto` 会依次试 **自建站 → gh-proxy → 直连 → ghproxy.net**），哪个源失败就换下一个。
+## 4. 从 v1.x 迁移
 
-默认源顺序（2026-11-03 实测，N1 dpanel 容器内）：
+### 作废的参数
 
-| 顺序 | 前缀 | 实测 |
+下面四个参数在 v2.0.0 里**作废**：传了它们，脚本立刻中止、退出码 `3`，日志给出迁移方式。
+
+| 作废的参数 | 原来干什么 | 现在怎么办 |
 |---|---|---|
-| 1 | `https://github.mus.pp.ua/` | 自建站。Range 探测与完整下载都正确转 Release 资产（sha256 与官方一致）；但偶发 40 秒超时，5 次里成功 3 次 |
-| 2 | `https://gh-proxy.com/` | 公共站。5 次全成功，平均 1 秒，最稳 |
-| 3 | `https://github.com/`（不加前缀） | 直连 Release 资产比 raw 文件稳，但实测会偶发 DNS 失败（`curl: (6)`）和 12 秒延迟 |
-| 4 | `https://ghproxy.net/` | 公共（实测多次 15 秒超时，只作为最后兜底） |
+| `--compose-dir` | 告诉脚本 Compose 项目目录 | 不需要了：更新由 DPanel 按**项目名**处理，DPanel 自己知道项目目录 |
+| `--state-dir` | 指定状态目录 | 不需要了：跨版本提示的记录改用 `COMPAT_ROOT`（默认 `/tmp/.container-autoupdate/compat`） |
+| `--bad-ttl-days` | 坏版本钉住期 | 不需要了：不再有「坏版本钉住」，回滚由 DPanel 负责 |
+| `--pull-retries` | 拉取失败重试次数 | 不需要了：拉取由 DPanel 完成，脚本不再管理拉取与重试 |
 
-手写地址时的完整形式：
+### 作废的环境变量
 
-```sh
-# 自建站（默认首选）
-https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+下面这些环境变量在 v2.0.0 里作废（仍被设置就中止，退出码 `3`），迁移方式一律是**删掉它**、不需要替代设置：
 
-# 公共加速站（默认兜底）
-https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
-```
+| 变量 | 原来的用途 |
+|---|---|
+| `STATE_ROOT` | 状态目录 |
+| `BAD_TTL_DAYS` | 坏版本钉住期（天） |
+| `PULL_RETRIES` | 拉取失败重试次数 |
+| `DIGEST_RETRIES` | 查远端 digest 的重试次数 |
+| `DIGEST_RETRY_WAIT` | 查远端 digest 的重试间隔 |
+| `T_STALL` | 拉取进度停滞判定 |
+| `T_STALL_FINISH` | 拉取收尾宽限 |
+| `T_PULL_MAX` | 单次拉取的绝对上限 |
+| `T_UP` | 重建 / 启动容器的超时 |
+| `T_HEALTH` | 健康门禁的墙钟上限 |
+| `HEALTH_TRIES` | 健康检查的轮询次数上限 |
+| `T_ROLLBACK` | 回滚操作的超时 |
+| `PLAIN_BOOT` | 无 healthcheck 容器的启动观察时长 |
+| `COMPOSE_DIR` | Compose 项目目录 |
+| `COMPOSE_BASE` | Compose 目录的回退根路径 |
 
-想让引导器只走某一个源：`CT_SOURCE=mus`（自建站）、`CT_SOURCE=gh-proxy`、`CT_SOURCE=direct`（直连）、`CT_SOURCE=ghproxy`，也可以直接给一个自定义前缀。
+> 例外：`T_INSPECT` **仍然认**，等价于 `DP_T_CHECK`——老任务不改配置也能跑。
 
-> **一定要带 `-L`**（或 `--location`）。`releases/latest/download/` 会先返回 302 跳到具体 tag 的地址，不带 `-L` 时 `curl -f` 会把它当失败（`curl: (22)`）。
->
-> 加速源对 Release 资产**偶发** `403` / `522` / 超时（实测同一地址几分钟前失败、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。引导器对每个源默认试 2 次（`CT_TRIES`），并在探测失败时回退到本地缓存。
->
-> `cdn.jsdelivr.net` **不要用于本仓库**：实测它返回的是缓存旧版本（`@main` 拿到过 `VERSION=6.0.0` 的历史内容）。jsdelivr 适合固定 tag 的静态文件，不适合「跟最新发布版」的场景。
+### `LOCK_PREFIX` 仍会命中中止
 
-### 探测远端版本会取多少字节
+`LOCK_PREFIX` 属于 1.0.0 那次破坏性变更（脚本内部的互斥锁已移除），仍在 `BREAKING_TABLE` 里。启动命令里留着 `LOCK_PREFIX=...` 一样会让脚本中止、退出码 `3`；删掉即可。
 
-引导器为了少下载流量，探测版本号时只取文件头一段（`Range` 请求）。这个窗口是 `--ct-probe-bytes` / `CT_PROBE_BYTES`（默认 16KB）。
+### 新的参数与环境变量
 
-> **踩过的坑**：早先这个窗口固定是 4KB，而 `VERSION=` 那一行会随着脚本头部注释变长往下挪（某一版已经挪到第 4012 字节）。窗口一盖不到，探测就静默失败——日志里只会看到 `WARN 探测远端版本失败（网络问题）`，可网络其实好得很。
->
-> 现在窗口放大到 16KB，而且**探不到版本号时会自动把整个文件取下来再解析一次**。所以只要网络通，探测就不会再因为版本行下移而失败。
->
-> 看到「探测远端版本失败」时，先看它上面那行 `探测远端版本：<URL>`——那行告诉你当时试的是哪个源、哪个地址。
+| 参数 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `--dpanel-container <名字>` | `DPANEL_NAME` | `dpanel` | DPanel 所在容器名（只在「不在 dpanel 容器内跑」时用到） |
+| `--dpanel-bin <路径>` | `DPANEL_BIN` | `/app/server/dpanel` | DPanel CLI 路径 |
+| `--dpanel-docker-env <名字>` | `DPANEL_DOCKER_ENV` | `local` | 传给 DPanel CLI 的 `--docker-env` |
 
-## 4. 退出码
-
-| 退出码 | 含义 | 该做什么 |
+| 变量 | 默认 | 说明 |
 |---|---|---|
-| `0` | 成功更新 / 无需更新 / 按规则安全跳过 | 不用管 |
-| `1` | 配置或环境错误，或本轮更新没完成（**容器保持原样**） | 看日志里的 `ERR`；容器没被改动，不需要救 |
-| `2` | **回滚本身失败了**，需要人工介入 | 立刻看日志里的 `CRITICAL`；现场保留在 `--state-dir`（默认 `/tmp/.container-autoupdate`） |
-| `3` | **检测到破坏性变更**，你的调用方式已失效（本次未做任何改动） | 按日志里的「迁移方式」改命令；或锁版本；或加 `--compat` |
+| `COMPAT_ROOT` | `/tmp/.container-autoupdate/compat` | 跨版本提示的记录目录（每目标一个 `lastver`） |
+| `T_HARD` | `540` | 整轮时间硬上限（秒） |
+| `DP_T_CHECK` | `120` | 单次「检查」调用超时（秒）；旧的 `T_INSPECT` 仍被接受 |
+| `DP_T_UPGRADE` | `420` | 单次「升级 / 部署」调用超时（秒） |
+| `DP_MIN_UPGRADE` | `90` | 剩余预算低于它就不动手（秒） |
 
-`2` 是唯一需要你动手抢救的情况。脚本会保留现场（新容器、旧容器、tag 状态），不要急着重启机器或 `docker system prune`。
+保留的参数：`--compose`、`--container`、`--docker-sock`、`--compat`、`--dry-run`、`-h` / `--help`、`-V` / `--version`。全部参数见 [参数文档](parameters.md)。
 
-## 5. 计划任务细节
+### 依赖变了
 
-### DPanel 计划任务（推荐）
+v2.0.0 只需要 `timeout` `sed` `awk` `grep`（busybox / coreutils 都行），**不再需要 `curl`、`flock`**；不在 dpanel 容器内跑时额外需要 `docker`。
 
-- 脚本框里可以直接写多行 shell，`curl | sh` 也可以。
-- **执行超时设 ≥ 600 秒**。脚本自身硬上限是 540 秒（`T_HARD`），留出余量。
-- DPanel 在 UI 里编辑任务时，**会把你手填的「执行超时」和「EntryShell」两个字段丢掉**（这是 DPanel 的已知行为）。改完排期后回来确认一下超时还在。
-- 想给脚本传环境变量，用任务面板的 Environment 项（DPanel 原生支持，执行时会和 Docker 环境合并）。
-- 多个任务可以并存，各自填不同的目标。**同一目标只挂一个计划任务**（脚本内部没有互斥锁，两个任务同时跑会互相踩）。
+## 5. 回滚实操
 
-### 手动跑一轮
+**这是 v2.0.0 与 v1.x 最大的不同**：回滚点不再是脚本维护的 `:prev` 镜像标签。容器模式和 Compose 模式的回滚能力**不一样**。
 
-```sh
-container-autoupdate.sh --compose myapp
-```
+### 容器模式：回滚点 = DPanel 的备份容器
 
-跑完就结束，适合「现在查一下有没有新版」。
+DPanel 升级容器时会先生成一个备份容器，名字形如 `<容器名>-bak-<时间戳>`（例如 `myapp-bak-20261103163808`）。它跑着**升级前的镜像**、处于 `Exited` 状态。脚本没有传 DPanel 的 `--disable-bak`，所以备份是默认行为——它就是你的回滚点。
 
-### 关于 cron / systemd timer
+要回滚：
 
-**不推荐**用 cron 或 systemd timer 定时跑这个脚本：脚本内部不再加互斥锁，同一目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务。
-
-（如果你确实要用 cron，请自行保证同一目标同一时刻只有一个实例在跑，例如在 crontab 表达式里错开时间点。）
-
-## 6. 同一台机器管多个目标
-
-不同目标互不影响，可以同时跑：
+1. 在 DPanel 网页的容器列表里找到 `<容器名>-bak-<时间戳>`（`docker ps -a` 也能看到）。
+2. 用 DPanel 的恢复 / 重建功能把它变回原来的容器（原名、原配置、旧镜像）。
+3. `docker` 层面的**等价操作**：备份容器保存着旧镜像与原容器配置，可以直接把它改回原名后启动：
 
 ```sh
-container-autoupdate.sh --compose app1 &
-container-autoupdate.sh --compose app2 &
-wait
+# 找到备份容器，并核对它跑的是旧镜像、处于 Exited
+docker ps -a --filter "name=^/<容器名>-bak-"
+docker inspect -f '{{.State.Status}} {{.Config.Image}}' <容器名>-bak-<时间戳>
+
+# 让出错的那个容器让位
+docker stop <容器名>
+docker rm <容器名>
+
+# 把备份容器改回原名并启动
+docker rename <容器名>-bak-<时间戳> <容器名>
+docker start <容器名>
 ```
 
-**同一目标**不要同时跑两个（脚本不再加锁挡你），否则两轮会互相踩。等前一轮结束再跑下一轮。
+> 备份容器会占磁盘。**确认新版本没问题后再删**（`docker rm <容器名>-bak-<时间戳>`）。
+> 回滚只恢复**容器与镜像**，不会撤销新版本已经做过的数据迁移；生产数据库仍应另有备份。
 
-如果想让多份脚本副本完全独立（各自的状态目录），给它们不同的 `--state-dir`。
+### Compose 模式：没有备份容器，也不维护 `:prev`
 
-## 7. 排查残留进程与旧锁文件
-
-旧版本（用互斥锁的那些）有时会反复打出：
+DPanel 的 compose 部署**没有备份机制**：Compose 模式**不生成备份容器**，脚本也**不维护 `:prev`**。回滚只能靠**本地还在的旧镜像**：
 
 ```sh
-[2026-11-02 19:00:05] SKIP 同一更新目标（compose-myapp）的另一个任务仍在执行，本轮跳过
+# 1. 找到部署前的那个旧镜像 ID
+docker images --digests <仓库>
+# 2. 把它贴回 :latest，再强制重建
+docker tag <旧镜像ID> <仓库>:latest
+docker compose up -d --force-recreate
 ```
 
-而且**每一轮一模一样、什么都没更新**。原因不是真的有别的任务在跑，而是**上一轮有个子进程没退干净**，
-它替主脚本一直占着锁（详见 [工作方式与安全边界](how-it-works.md)）。
+这是**应急手段**，别当常规退路：
 
-仓库里带了一个**只读**排查脚本 `scripts/ct-stale-lock-check.sh`：它不改任何东西、不杀任何进程，
-只把下面这些列出来，最后给出可复制的清理命令：
+- 本地没有旧镜像（被清理过）就回不去了——**部署前先确认旧镜像还在**。
+- 如果本机还留着 v1.x 时代的 `<仓库>:prev` 标签，也可以直接拿它当旧镜像（`docker tag <仓库>:prev <仓库>:latest` 再重建），但 v2.0.0 不会再移动或维护这个标签。
+- 长远做法是**先在一个测试项目上演练**：确认新版本没问题，再让同样的流程作用到生产。
 
-1. 旧的锁文件（当前版本已不使用锁，它们只是残留垃圾）；
+## 6. 排查升级前的残留
+
+v2.0.0 **自己不再产生**互斥锁文件，也不再产生 `/tmp/.container-autoupdate/compose-*` / `plain-*` 事务目录。但**升级前的残留还在**：v1.x 的锁文件、没退干净的拉取进程、事务目录都留在原地。
+
+仓库里带了一个**只读**排查脚本 `scripts/ct-stale-lock-check.sh`：它不改任何东西、不杀任何进程，只把下面这些列出来，末尾给出可复制的清理命令：
+
+1. 旧的互斥锁文件；
 2. 谁正开着这些锁文件（PID / PPID / fd / 命令行）；
-3. 残留的镜像拉取进程；
-4. 状态目录里残留的事务目录，并标注哪些能删、哪些要留。
+3. 残留的镜像拉取进程（`images/create`）；
+4. `/tmp/.container-autoupdate` 下的残留目录（并标注哪些能删、哪些要留）。
 
 ### 怎么用
 
@@ -291,47 +281,59 @@ docker cp /tmp/ct-stale-lock-check.sh dpanel:/tmp/ct-stale-lock-check.sh
 docker exec -it dpanel sh /tmp/ct-stale-lock-check.sh
 ```
 
-可选环境变量：`CT_LOCK_PREFIX`（锁文件前缀，默认 `/tmp/.container-autoupdate`）、
-`CT_STATE_ROOT`（状态目录，默认 `/tmp/.container-autoupdate`）。
+可选环境变量：`CT_LOCK_PREFIX`（锁文件前缀，默认 `/tmp/.container-autoupdate`）、`CT_STATE_ROOT`（要列出的目录，默认 `/tmp/.container-autoupdate`）。
 
-### 看到结果之后
+### 看完结果再清理
 
-| 看到的东西 | 能不能删 | 说明 |
-|---|---|---|
-| 旧的 `.lock` 文件 | **可以删** | 当前版本不再使用锁，留着只是垃圾。删掉不影响任何功能。 |
-| 占着锁的进程 | **先确认再杀** | 先看它的命令行：`cat /proc/<PID>/cmdline`（NUL 分隔）。确认是没退干净的残留再 `kill <PID>`。 |
-| 残留的拉取进程（`images/create`） | **可以杀** | 拉取早就该结束了，活着的那个是残留，杀掉即可。 |
-| `compat/` 目录 | **可以不删** | 只是「每个目标上次跑过的版本」的记录，删掉只会在下次升级时多提示一次。 |
-| 事务目录（`compose-*` / `plain-*`） | **先看日志再删** | 说明那一轮出过问题。里面的 `pull.log` / `create.json` 是「为什么失败」的唯一证据。 |
+确认清单里的东西没人要了，再手工执行：
 
-### 真正的解法
+```sh
+# 1) 旧的锁文件（v2.0.0 已不使用锁，留着只是垃圾）
+rm -f /tmp/.container-autoupdate/*.lock
 
-清垃圾只是治标。**根治是升级到不再使用互斥锁的版本**——新版本没有锁，也就不存在「被残留进程占住」这回事。
-升级后确认两件事：同一个目标只挂一个 DPanel 计划任务；启动命令里没有残留的 `LOCK_PREFIX=...`
-（有的话脚本会按破坏性变更中止，退出码 `3`）。
+# 2) 残留的拉取进程：先看它的命令行，确认是残留再 kill
+cat /proc/<PID>/cmdline | tr '\0' ' '
+kill <PID>
 
-## 8. 常见问题
+# 3) v1.x 残留的事务目录（先看里面的日志，确认问题已解决）
+rm -rf /tmp/.container-autoupdate/compose-<项目名>
+```
 
-**Q：日志说「已是最新」，但明明上游发版了。**
-A：脚本比对的是**远端 digest** 与**容器实际运行的镜像**。上游发了版但 tag 内容没变（很少见）、或者你用的是固定 digest 引用，都会这样。先用 `--dry-run` 看它认到的远端 digest 是什么。
+`compat/` 目录建议保留：那是跨版本提示的记录（`COMPAT_ROOT`），删掉只会在下次升级时多提示一次。
 
-**Q：日志说「SKIP 容器 xxx 属于 Compose 项目 yyy」。**
-A：这个容器是 compose 起的，应该用 `--compose yyy`，让 compose 负责重建。用容器模式重建会让 compose 的元数据错位。
+## 7. 常见问题
 
-**Q：更新后容器起来了但服务不正常，脚本却说成功。**
-A：脚本只能判断「容器健康」，判断不了「业务正确」。镜像自带 healthcheck 时门禁比较可靠；没有 healthcheck 时只观察 30 秒是否仍在运行（`PLAIN_BOOT`），这对启动后就崩、或半死不活的服务是盲区。这类服务建议在 Compose 里加 healthcheck。
+**Q：Compose 报 `commonDataNotFoundOrDeleted`，怎么办？**
+A：这个项目**没在 DPanel 里登记过**。脚本会识别出来并给出迁移指引（退出码 `1`，项目未做任何改动）：
 
-**Q：回滚之后数据不对了。**
-A：回滚只恢复**容器和镜像**，不会撤销新版本程序已经对数据卷/数据库做过的迁移。这是设计边界，不是 bug。生产数据请另做备份。
+```text
+[2026-11-03 06:00:12] ERR DPanel 里没有登记名为 myapp 的 Compose 项目
+[2026-11-03 06:00:12]     compose:deploy 只能操作 DPanel「Compose」页面里登记过的项目
+[2026-11-03 06:00:12]     处理方式二选一：
+[2026-11-03 06:00:12]       1) 在 DPanel 网页里新建 Compose 项目，名称填 myapp（指向它的 docker-compose.yaml）
+[2026-11-03 06:00:12]       2) 改用容器模式：--container <该项目里的容器名>
+[2026-11-03 06:00:12]     项目未做任何改动
+```
+
+两条路选一条：在 DPanel 网页里新建 / 导入 Compose 项目（名称要与 `--compose` 一致），或改用 `--container`。
+
+**Q：任务失败，日志是「这个参数已经不能用了：xxx」，退出码 `3`。**
+A：你的启动命令里还留着 v1.x 的旧写法。按日志里的「迁移方式」改；作废清单见[第 4 节](#4-从-v1x-迁移)。别顺手乱加 `--compat`——填错版本会每次运行都硬停（见[第 3 节](#3-兼容机制)）。
+
+**Q：脚本在宿主上跑，怎么指定 DPanel 容器？**
+A：加 `--dpanel-container <容器名>`（默认 `dpanel`）。这时脚本用 `docker exec <容器名> /app/server/dpanel ...` 调用 DPanel，并要求本机有可用的 `docker` 命令（脚本会先 `docker version` 探一下）。DPanel CLI 不在默认路径时用 `--dpanel-bin <路径>`；DPanel 里的 docker 环境名不是 `local` 时用 `--dpanel-docker-env <名字>`。
+
+**Q：计划任务跑到一半被杀，退出码 `143`。**
+A：DPanel 的「执行超时」到了。三件事一起看：DPanel 执行超时（设 ≥ 600 秒）、脚本整轮硬上限 `T_HARD`（默认 540 秒）、单次升级 / 部署超时 `DP_T_UPGRADE`（默认 420 秒，实际还会按剩余预算收敛）。**内部超时必须明显小于外部超时**，否则被 SIGKILL 的那一轮日志里可能只剩 `signal: killed`。
+
+**Q：`--dry-run` 在 Compose 模式下什么都没做。**
+A：这是如实的：DPanel 的 `compose:deploy` 就是部署动作，没有「只检查」能力。Compose 模式下 `--dry-run` 只打一行说明就退出（退出码 `0`），什么都不动。要预演只能在**测试项目**上真跑一次，或用 `--container` 模式检查单个容器。
+
+**Q：日志说 `OK DPanel 已部署 Compose 项目 X`，是不是就更新到最新版了？**
+A：不一定。`OK` 只说明 DPanel 执行完了这次部署（脚本显式传了 `--pull-image dpanel`，让 DPanel 先拉镜像再部署），但部署本身不保证版本一定变了——以 DPanel 的操作记录、或容器实际运行的镜像为准。
 
 **Q：能不能一次更新多个目标？**
-A：不能，一个进程一个目标。要批量就在外面套一层循环或并行（见第 6 节）。
+A：不能，一个进程一个目标。不同目标可以各自挂一个计划任务；同一目标只挂一个。
 
-**Q：`--state-dir` 里的文件能删吗？**
-A：分三种情况：
-
-- **正常成功收尾**（退出码 `0`）：事务目录会自动清掉，不用管。
-- **回滚成功**（退出码 `1`，容器已复原）：现场会**故意保留**，因为 `create.json` / 新旧规格 / `pull.log` 是「这一轮为什么失败」的唯一证据，日志末尾会打「回滚现场已保留在 …」。排查完手动删掉即可。
-- **回滚本身失败**（退出码 `2`）：现场必须保留，人工接手时全靠它。
-
-动手前那份 `--state-dir` 目录本身不会被清空，只是每轮的事务子目录。
+**Q：能不能让脚本从多个镜像地址并行取最快的？**
+A：不需要。镜像拉取全部由 DPanel / Docker daemon 负责，用的是你和 daemon 配置的镜像源；脚本根本不碰 Registry。这个想法历史上评估过，未实施。

@@ -2,175 +2,236 @@
 
 > 语言：[中文](how-it-works.md) | [English](how-it-works.en.md)
 
-> 这一页解释脚本**怎么做**、**什么情况会拒绝动手**、**哪些事它保护不了**。用之前值得花三分钟读一遍。
+> 这一页解释脚本**怎么做**、**什么情况会不动手**、**哪些事它保护不了**。用之前值得花三分钟读一遍。
 
-## 1. 一轮都发生了什么
+## 1. 一句话说清它做什么
+
+v2.0.0 起，脚本**不再自己拉镜像、不再自己重建容器**：它只做三件事 ——
+
+1. **判断该不该更新**（问 DPanel「这个目标有没有新版本」）；
+2. **把更新动作交给 DPanel 执行**；
+3. **把 DPanel 的结果如实报出来**（成功 / 失败 / 无需更新）。
+
+所有更新能力都来自 DPanel 自己的命令行：容器走 `container:upgrade`，Compose 项目走 `compose:deploy`。
+
+为什么这么改：
+
+- 自己重建容器要**准确复刻**网络、挂载（含匿名卷真实名字）、资源限制、重启策略、Capabilities……漏一处就是生产事故。v1.x 为此写了上千行，仍出过「拉取卡死被误判」「失败原因打两遍」这类问题。
+- DPanel 本来就有这两件事的成熟实现，而且它的「备份容器」就是现成的回滚点。
+- 脚本因此从 1700+ 行降到 700 行左右，逻辑面小，可控。
+
+## 2. 前置条件
+
+- **必须在装了 DPanel 的机器上用**：更新动作要靠 DPanel 的 CLI。
+- **推荐在 DPanel 容器里跑**（DPanel 的「计划任务」默认就是在 `dpanel` 容器内执行）：脚本直接调用 `/app/server/dpanel`。
+- 如果在宿主上跑（不在 dpanel 容器内）：需要宿主有 `docker` 命令，脚本会用 `docker exec dpanel /app/server/dpanel ...` 调用。可用 `--dpanel-container` 指定容器名（默认 `dpanel`）。
+- **Compose 模式要求该项目已经在 DPanel 里登记过**（DPanel 网页 → Compose → 新建/导入）。没登记时 DPanel 会返回 `{"code":500,"error":"...commonDataNotFoundOrDeleted..."}`，脚本会识别出来并给出迁移指引，退出码 `1`。
+- 依赖命令：`timeout` `sed` `awk` `grep`（busybox / coreutils 都行）。**不再需要 `curl`、`flock`**。不在 dpanel 容器内时额外需要 `docker`。
+
+参数与环境变量见 [参数文档](parameters.md#全部命令行参数)。
+
+## 3. 一轮都发生了什么
 
 ```
-0. 依赖自检 → 连 Docker
-1. 从 Compose 文件 / 容器本身读出镜像引用
-2. 问远端「最新 digest 是多少」，和容器实际运行的镜像比对
-     取不到就重试（默认 2 次，间隔 5 秒；DIGEST_RETRIES / DIGEST_RETRY_WAIT 可调）
-     仍然取不到 → 整轮放弃（容器原样不动）
-     相同 → 打印「已是最新」退出（通常 2~4 秒）
-3. 把当前镜像打成 <repo>:rollback-pending 占位（不动 :prev）
-4. 拉取新版本：走 Docker Engine API，盯进度字节数
-     连续 60 秒没有新字节 → 判定卡死，kill -9，本轮放弃（容器原样不动）
-     但层全部拉完之后有单独宽限（默认 180 秒，T_STALL_FINISH），
-     那是 Docker 在写镜像配置、回源查签名的时间，那段时间本来就不吐字节
-     放弃之前会先问 daemon「镜像是不是其实已经落盘了」→ 落盘了就算成功
-     拉取失败 → 默认重试 1 次（--pull-retries 可调；0 = 不重试）
-5. 校验：本地落盘的 digest 必须等于拉取流自己报告的那个 digest
-6. 切换（见下两节）
-7. 健康门禁
-     成功 → 回滚点 :prev 才移到上一版，清理旧镜像
-     失败 → 回滚，坏版本钉成 <repo>:bad（默认 7 天后自动解除）
+1. 解析参数
+2. 兼容检查：旧 flag / 旧环境变量命中 → 中止并给出迁移方式（退出码 3）
+   --compat <版本> 声明「只验证到某版本」→ 含更新的破坏性变更就硬停
+3. 依赖检查：timeout / sed / awk / grep；不在 dpanel 容器内时还要 docker
+   然后调 DPanel CLI（dp_cli version）确认它确实可用
+4. 按模式转交更新：
+     容器          → container:upgrade（先不带 --upgrade 只检查）
+     Compose 项目  → compose:deploy --name <项目名> --pull-image dpanel
+5. 报结果（OK / ERR / WARN / DRY）
+6. 写 lastver（跨版本提示用的「这个目标见过当前版本」记录）
+7. 退出
 ```
 
-**拉取失败会重试，默认 1 次。** 拉取失败（网络抖动、镜像源瞬时 5xx、拉取流中途断开）默认重试一次，两次尝试之间等 10 秒；用 `--pull-retries <次数>` 可以改成任意次数，`0` = 不重试（等价于旧行为）。
+两个顺序是刻意的：
 
-不是所有失败都重试：
+- **兼容检查排在依赖检查之前** —— 调用方式已经失效时要先看到迁移说明，而不是先被一句「找不到 docker / 找不到 DPanel CLI」引向无关的排查方向。
+- **跨版本 `WARN` 在依赖检查之前打印，但 `lastver` 在依赖检查之后才写** —— 依赖缺失那一轮不算「用户已知悉」，下次仍会提示。
 
-- **镜像源明确返回的错误**（镜像不存在、仓库名写错、鉴权失败）不重试 —— 重试也不会成功，只是白等。
-- **时间预算不够**就不重试 —— 剩下的时间必须留给健康门禁和回滚。宁可这一轮失败，也不能把计划任务拖到超时被杀、下一轮接着超时。
-- **重试有自己的一份时间预算** —— 不能把后面镜像的份额吃掉。
+## 4. 容器模式（`--container`）的完整流程
 
-原来「一次都不重试」是有意为之（那时判断：卡死都发生在「建连/取清单」阶段，重试只会把时间预算耗光）。现在区分开了：**卡死**（60 秒无字节）仍然直接放弃，**失败**（流结束了但结果不对）才重试 —— 后者多数是瞬时故障，重试一次通常就成了。
+1. `container:upgrade --name <容器> --docker-env local`（**不带** `--upgrade`）= **只检查**。DPanel 自己比对远端与本地 digest，返回 JSON：
 
-**查远端 digest 也会重试。** 问镜像仓库「最新 digest 是多少」同样是瞬时故障高发点，默认重试 2 次、间隔 5 秒
-（`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` 可调，`DIGEST_RETRIES=0` = 不重试）。
-取不到 digest 时脚本不会硬猜「可能没更新」，而是整轮放弃并在日志里写明已尝试几次。
+   ```json
+   {"upgrade":true,"digest":"sha256:a5c10db1...","digestLocal":["ghcr.1ms.run/yetone/magpie@sha256:d9d64cc1..."],"error":"","message":"","status":"upgrade"}
+   ```
 
-**拉取的「收尾阶段」有专门宽限。** Docker 把所有层拉完之后，还要写镜像配置（要回源查签名），
-那段时间拉取流**一个字节都不吐**。按「60 秒无字节 = 卡死」去判，就会把一次快要成功的拉取掐掉，
-而且 daemon 侧会因此报 `context canceled`，**已经下载好的层全部作废**（生产上真实发生过：
-层都 `Pull complete` 了，只差镜像配置，脚本把流掐了，整轮白跑）。
-所以脚本做了两件事：层拉完后进入单独的收尾宽限（`T_STALL_FINISH`，默认 180 秒）；
-宽限用尽仍没拿到 digest 时，**先问 daemon 镜像是不是其实已经落盘了** ——
-真落盘了（tag 已经指向新镜像、RepoDigests 有值）就按成功收场，不再白跑。
+2. `upgrade` **不是** `true` → 就是「已是最新」。脚本打 `OK 容器 <名> 已是最新（DPanel 报告 status=latest）`，退出码 `0`，**容器一点没动**。
 
-**失败原因会同时写到 stderr。** 计划任务在任务失败时只保留 stderr、丢掉 stdout；
-所以 `ERR` / `CRITICAL` 行（以及紧随其后的缩进说明行）除了在完整日志里，还会**额外**写一份到 stderr，
-这样计划任务里就不会只剩一句干巴巴的 `exit status 1`。详见 [参数文档](parameters.md#失败原因写到哪里)。
+   ```text
+   [2026-11-03 16:38:08] OK 容器 myapp 已是最新（DPanel 报告 status=latest）
+       → OK: container myapp is already up to date (DPanel reports status=latest)
+   ```
 
-**并发靠 DPanel 计划任务。** 脚本内部**没有**互斥锁：同一目标只挂一个计划任务即可。
-（旧版脚本里有一把锁，但那个锁会被残留的子进程长期占住，导致之后每一轮都打「SKIP 同一更新目标的另一个任务仍在执行」然后退出——现已移除，详见 [版本与升级](../README.md#版本与升级)。）
+3. `--dry-run` → 打 `发现新版本（远端 digest=sha256:...）` + `DRY 只检查不动手，本轮不升级`，退出码 `0`。
 
-## 2. Compose 模式怎么更新
+   ```text
+   [2026-11-03 16:38:08] 发现新版本（远端 digest=sha256:a5c10db1...）
+   [2026-11-03 16:38:08] DRY 只检查不动手，本轮不升级
+       → DRY: check only, no action taken; this round does not upgrade
+   ```
 
-本质就是「用 compose 重新部署一遍」：
+4. 剩余时间不足（`< DP_MIN_UPGRADE`，默认 90 秒）→ **不动手**，退出码 `1`：
+
+   ```text
+   [2026-11-03 16:38:08] WARN 剩余时间不足（40s < 90s），本轮不启动升级，容器保持原样
+   [2026-11-03 16:38:08]      下一轮计划任务会重新检查；也可以把 T_HARD 或计划任务的超时调大
+       → WARN: not enough time left (40s < 90s); the upgrade is not started this round and the container is left as is
+       →      the next scheduled task will check again; you can also raise T_HARD or the timeout of the scheduled task
+   ```
+
+5. 真升级加 `--upgrade`：`container:upgrade --name <容器> --upgrade --docker-env local`。成功返回 `{"containerId":"..."}`，脚本打 `OK DPanel 已完成升级（containerId=...）`，退出码 `0`。
+
+6. **回滚点 = DPanel 生成的备份容器**，名字形如 `<容器名>-bak-<时间戳>`（例如 `myapp-bak-20261103163808`）：它跑着升级前的镜像、处于 Exited 状态。要回滚就把它改回来（DPanel 网页里能直接看到这个备份容器）。
+
+7. **升级失败时 DPanel 自己回滚**（实测：镜像坏掉时容器保持旧镜像，并留下备份容器）。脚本报错退出码 `1`，日志里带 DPanel 的错误文本。
+
+> 这是 v2.0.0 与 v1.x **最大的不同**：回滚点不再是 `:prev` 镜像标签，而是 DPanel 的备份容器。
+
+## 5. Compose 模式（`--compose`）的完整流程
+
+1. **只能部署，没有「只检查」**：DPanel 的 `compose:deploy` 就是部署动作。
+2. **`--dry-run` 在 Compose 模式下什么都不做**，只如实说明，退出码 `0`：
+
+   ```text
+   [2026-11-03 16:38:08] DRY Compose 模式没有「只检查」能力（DPanel 的 compose:deploy 会直接部署）
+   [2026-11-03 16:38:08]     本轮未执行部署；要检查容器有没有新版本请用 --container 模式
+       → DRY: Compose mode has no "check only" capability (DPanel's compose:deploy deploys directly)
+       →     nothing was deployed this round; to check whether a container has a new version, use --container mode
+   ```
+
+   要预演只能靠容器模式，或者先在测试项目上跑一遍。
+3. 真部署：`compose:deploy --name <项目名> --pull-image dpanel --docker-env local`。
+4. 剩余时间不足（`< DP_MIN_UPGRADE`）→ 不部署，退出码 `1`：`WARN 剩余时间不足（40s < 90s），本轮不部署，项目保持原样`。
+5. 成功 → 打 `OK DPanel 已部署 Compose 项目 <项目名>`，退出码 `0`。
+
+### 为什么必须显式 `--pull-image dpanel`
+
+`--pull-image` 有 `dpanel` / `command` 两个取值，**默认是 `command`**。实测 `command` 那条路**不会去拉新镜像**（已是最新的标签不会重新回源），结果就是「部署成功但版本没变」。所以脚本显式传 `--pull-image dpanel`，让 DPanel 用自己的拉取逻辑先拉每个服务的镜像，再部署。
+
+### 成功与失败都藏在 JSON 里
+
+- 成功时 DPanel 返回 `{"name":"<项目名>"}` —— **注意：成功时没有 `code` 字段**。
+- 失败可能是 `{"code":500,...,"error":"..."}`，而且 **CLI 退出码仍然是 `0`** —— 退出码不可信，**成败必须解析 JSON**。
+- 脚本判定失败的条件是「`code` ≥ 400，或 `status=failed`，或 `error` 字段非空」，**不是**「`code` 不等于 200」。写成后者会把「成功但没 `code`」误判成失败。
+- 项目没在 DPanel 里登记 → `commonDataNotFoundOrDeleted` → 脚本给迁移指引并退出 `1`：
+
+  ```text
+  [2026-11-03 16:38:08] ERR DPanel 里没有登记名为 myapp 的 Compose 项目
+  [2026-11-03 16:38:08]     compose:deploy 只能操作 DPanel「Compose」页面里登记过的项目
+  [2026-11-03 16:38:08]     处理方式二选一：
+  [2026-11-03 16:38:08]       1) 在 DPanel 网页里新建 Compose 项目，名称填 myapp（指向它的 docker-compose.yaml）
+  [2026-11-03 16:38:08]       2) 改用容器模式：--container <该项目里的容器名>
+  [2026-11-03 16:38:08]     项目未做任何改动
+      → ERR: DPanel has no Compose project registered under the name myapp
+      →      compose:deploy can only act on projects registered on DPanel's "Compose" page
+      →      two ways out:
+      →        1) create a Compose project in the DPanel web UI named myapp (pointing at its docker-compose.yaml)
+      →        2) switch to container mode: --container <a container name of that project>
+      →      the project was left untouched
+  ```
+
+## 6. 什么情况会跳过 / 不动手
+
+这些都不是故障，是脚本（或 DPanel）主动不动手。日志里会写明具体原因。
+
+| 情况 | 结果 |
+|---|---|
+| 容器模式：DPanel 报告 `status=latest`（`upgrade` 不是 `true`） | 打 `OK 容器 <名> 已是最新…`，退出码 `0`，容器一点没动 |
+| `--dry-run`（容器模式） | 只检查并打印发现的新版本，退出码 `0`，不升级 |
+| `--dry-run`（Compose 模式） | **什么都不做**，退出码 `0`（`compose:deploy` 没有「只检查」能力） |
+| 剩余时间不足（`< DP_MIN_UPGRADE`，默认 90 秒） | 不打乱干，退出码 `1`，目标保持原样 |
+| Compose 项目未在 DPanel 登记 | 打 `ERR DPanel 里没有登记名为 <名> 的 Compose 项目` + 迁移指引，退出码 `1` |
+| 旧参数 / 旧环境变量命中 `BREAKING_TABLE` | 立即中止，退出码 `3`，什么都没改，日志里有新写法 |
+| 依赖命令缺失（`timeout` `sed` `awk` `grep`，或不在 dpanel 容器内时缺 `docker`） | 打 `ERR 缺少依赖命令：…`，退出码 `1` |
+
+旧参数：`--compose-dir`、`--state-dir`、`--bad-ttl-days`、`--pull-retries`；旧环境变量见 [参数文档](parameters.md#全部环境变量)。
+
+## 7. 保护不了什么（重要）
+
+### Compose 模式没有「只检查」
+
+`compose:deploy` 就是部署动作，DPanel 没给 Compose 提供「只查不部署」的接口。所以 Compose 模式下 `--dry-run` 什么都不做，也没法提前预演；要预演只能靠容器模式，或先在测试项目上跑。
+
+### Compose 模式不生成备份容器、不维护 `:prev`
+
+DPanel 的 compose 部署没有备份机制，脚本也不再自己打 `:prev` 标签。所以：
+
+- **回滚只能靠本地旧镜像**；
+- **Compose 模式无法提前知道「有没有新版本」**：脚本不做镜像 digest 比对（那是 v1.x 干的活），它就是把部署交给 DPanel，由 DPanel 决定要不要重建。日志里不会有「已是最新」这种判断（除非 DPanel 自己在输出里说）。
+
+Compose 模式的手工回滚：
 
 ```sh
-COMPOSE_PROJECT_NAME=<项目名> \
-COMPOSE_FILE=<原config> \
-COMPOSE_ENV_FILES=<原env> \
+# 旧镜像还在本地时（先 docker images 找到旧镜像 ID）
+docker tag <旧镜像ID> <镜像仓库>:latest
 docker compose up -d --force-recreate
 ```
 
-- **项目名、config 文件、env 文件都从运行中容器的 label 读出来**，所以和原来那份部署完全一致。
-- 这些参数走**环境变量**而不是 `-p` / `-f` / `--env-file` 命令行参数。原因：拼命令行字符串时，路径里一旦有空格，compose 会**打印 Usage 帮助却返回 `rc=0`**（静默出错，实测踩过）。环境变量传参没有这个问题，而且同样不靠当前目录猜项目名。
-- 多个 compose 文件时用 `COMPOSE_PATH_SEPARATOR=,` 显式声明分隔符，避免含冒号的路径被拆错。
-- **不使用 `--remove-orphans`**：它会把 compose 文件里没有、但仍在跑的同项目容器一起删掉。
-- 健康门禁检查**项目内所有容器**（有 healthcheck 的看 `healthy`，没有的看「启动后 30 秒仍在运行」）。
-- 回滚 = 把 tag 还原成更新前那版，再 `up` 一次；回滚后还要复查一遍确实跑在旧镜像上。
+容器模式则相反：DPanel 会留下 `<容器名>-bak-<时间戳>` 备份容器。DPanel 的 `--disable-bak` 我们**没有传**，默认就是备份。
 
-## 3. 容器模式怎么更新
+### 容器健康与业务正确，脚本不再自己判定
 
-不用 `docker run` 拼参数，而是**照旧容器的声明式配置重建一个**：
-
-1. 把旧容器改名为 `<名>__old_<时间戳>`（**此时它还在正常运行，服务不中断**）
-2. 停掉旧的
-3. 用旧容器的 `Config` + `HostConfig` + 实际挂载 + 网络声明，走 Docker API 以**原名字**创建新容器
-4. **启动之前**先逐项校验新容器规格与旧容器一致（镜像、命令、环境、端口、挂载、网络、重启策略、资源限制…）
-5. 启动 → 健康门禁（无 healthcheck 的观察 30 秒）
-6. 成功 → 记回滚点，删掉更早的那份 `__old_*`（只保留 1 份）
-
-几点刻意为之的选择：
-
-- **不把运行态的 `NetworkSettings` 整包回投**（那里面是容器 ID、自动分配的 MAC/IP，回投会导致冲突）。网络按声明重建，自动生成的 MAC/IP 让它重新分配。
-- **实际挂载转成显式 `Mounts`**，匿名卷用它真实的卷名。这样重建后挂的是同一个卷，不会「换个新卷、数据没了」。
-- **全程按容器 ID 操作**，不按名字。改名过程中名字会短暂被占用，按 ID 才不会认错对象。
-- 回滚是「把旧容器改回原名并启动」，旧容器一直留着，所以回滚很快。
-
-## 4. 什么情况会直接跳过（`SKIP`）
-
-这些不是故障，是脚本主动拒绝。日志里会写明具体原因。
-
-| 情况 | 为什么跳过 |
-|---|---|
-| 容器属于某个 Compose 项目 | 该用 `--compose`，让 compose 负责重建，否则 compose 的元数据会错位 |
-| 容器 `AutoRemove=true` | 停掉旧容器时它会被自动删除，回滚副本就没了 |
-| 容器 `NetworkMode=container:<别的容器>` | 共享另一个容器的网络栈，单独重建会断链 |
-| 有容器通过 `--network container:` 或 legacy link 依赖它 | 同上，重建会把这些依赖打断 |
-| 用了 `VolumesFrom` | 挂载语义无法可靠复现 |
-| 挂载带 SELinux `z/Z`（且不是卷）或其它无法保留的 Mode | 重建后权限语义会变 |
-| 卷用了自定义 driver | 非 local driver 的卷行为无法保证 |
-| 网络 driver 不是 bridge/host/null | 非常规网络（如 macvlan）重建风险高 |
-| 网络有 MAC 但没有 IPv4 | 无法区分「自动生成的 MAC」和「用户显式指定的 MAC」 |
-| 容器当前不是 `running` | 不折腾停止中的容器 |
-| 镜像引用是 digest 形式（`repo@sha256:…`） | 固定 digest 意味着「不许变」，没有「有没有新版」的概念 |
-| 目标就是脚本自己所在的容器 | 自己更新自己会杀掉执行进程 |
-| 远端版本仍在 `:bad` 钉住期 | 已知这个版本有问题，先不碰 |
-
-Compose 模式额外两条：
-
-- **项目里有非 running 的容器** → 整轮跳过。避免把「一次性的 / 故意停掉的服务」当成正常状态去重建。
-- **同一镜像在项目内的运行版本不一致**（有的容器是新版、有的是旧版）→ 跳过，提示先人工统一。
-
-## 5. 保护不了的事（重要）
+v1.x 会自己观察容器是否 healthcheck 通过、启动后是否还在跑。v2.0.0 起这件事交给 DPanel：脚本只报 DPanel 说的结果。
 
 ### 数据不会被回滚
 
-回滚只恢复**容器和镜像**。新版本程序已经对数据卷/数据库做过的迁移、写入、schema 变更，**不会**因为回滚而撤销。
+回滚只恢复**容器和镜像**。新版本程序已经对数据卷 / 数据库做过的迁移、写入、schema 变更，**不会**因为回滚而撤销。
 
-> 跑数据库、跑有状态服务的容器，请务必另有备份。脚本能保证「容器回到旧镜像」，保证不了「数据回到旧状态」。
-
-### 健康 ≠ 业务正确
-
-脚本只能判断「容器健康」。镜像自带 healthcheck 时这个判断比较可靠；**没有 healthcheck 时只观察 30 秒是否仍在运行**，这对以下情况是盲区：
-
-- 启动 40 秒后才崩
-- 起来了但连不上数据库、返回 500
-- 起来了但开始写坏数据
-
-这类服务建议在 Compose 文件里补一个 healthcheck，门禁才有意义。
-
-### 只认「tag 有没有变」
-
-判断依据是远端 digest 与运行中镜像的比对。如果上游**复用了同一个 tag 但内容没变**，或者你用固定 digest 引用，脚本会认为「已是最新」——这是正确行为，不是漏更新。
+> 跑数据库、跑有状态服务的容器，请务必另有备份。脚本和 DPanel 能保证「容器回到旧镜像」，保证不了「数据回到旧状态」。
 
 ### 只处理「一个新版本」
 
-如果上游一次性跳了好几个版本，脚本只拉到最新那个，不会逐个过渡。跨大版本的升级（比如数据库 schema 要求逐版迁移）需要你自己安排。
+如果上游一次性跳了好几个版本，本轮只会到最新那个，不会逐个过渡。跨大版本的升级（比如数据库 schema 要求逐版迁移）需要你自己安排。
 
-## 6. 失败之后现场长什么样
+### 镜像从哪来，脚本不管
+
+脚本**不碰 Registry**：镜像源由 Docker daemon / DPanel 与你自己的配置决定。所以「多个 GitHub 加速站并行竞速」这类机制在 v2.0.0 架构下不再需要，也不再实施。
+
+## 8. 失败现场长什么样
+
+### 错误行同时在 stdout 和真正的 stderr
+
+计划任务（DPanel）在任务**失败**时只保留 stderr、丢弃 stdout。所以 `ERR` / `CRITICAL` 行（以及紧随其后的缩进补充行）会**同时**写两份：完整日志在 stdout，失败原因额外写一份到真正的 stderr。这样计划任务里就不会只剩一句干巴巴的 `exit status 1`，**日志里一定有原因**（这也是排查失败的第一手材料）。
+
+DPanel 的原始错误文本会被**透传**进日志，脚本不改写它。详见 [参数文档](parameters.md#失败原因写到哪里)。
+
+### 退出码
 
 | 退出码 | 现场 |
 |---|---|
-| `0` | 干净。临时的 `:rollback-pending` 已清，孤儿镜像已清理（`--dry-run` 例外：演练不动任何东西，也就不清理） |
-| `1` | **容器和镜像都没动**，和跑之前一样，可以直接重跑。这里包含两种情形：动手前就中止（拉取失败、远端查不到、预算不足），以及**新版本不健康但已自动回滚成功**——后者会在状态目录里留下现场（`create.json`、新旧规格、`pull.log`）供排查，日志末尾有「回滚现场已保留在 …」 |
-| `2` | 回滚本身失败了。状态目录（默认 `/tmp/.container-autoupdate`）会**故意保留**，里面有新旧容器 ID、原镜像 ID、改名记录，供人工接手 |
-| `3` | **破坏性变更**，你的调用方式已失效。脚本在动手之前就停下了，什么都没改。按日志里的「迁移方式」改命令即可 |
+| `0` | 成功（含「已是最新」与 `--dry-run`） |
+| `1` | 失败：DPanel 报错、项目未登记、剩余预算不足、依赖缺失、参数错误。目标保持原样 |
+| `2` | 保留。v2.0.0 目前不产生（回滚由 DPanel 负责，脚本不感知） |
+| `3` | **破坏性变更**：你的调用方式已失效。脚本在动手之前就停下，什么都没改，按日志里的迁移方式改命令即可 |
+| `130` | 被 Ctrl-C（SIGINT）中断 |
+| `143` | 被 `timeout` / SIGTERM 杀掉（DPanel 计划任务超时常见） |
 
-`2` 是唯一「必须人工接手」的情况（`3` 也需要你动手，但只是改一下命令，容器本身没被碰过）。典型原因：Docker 本身无响应、磁盘满、旧容器被人为删掉了。此时不要急着重启机器，也不要 `docker system prune`——现场信息就在状态目录里。
+## 9. 与 v1.x 的差别
 
-## 7. 回滚点与坏版本钉住
+| 方面 | v1.x | v2.0.0 |
+|---|---|---|
+| 谁拉镜像 | 脚本自己走 Docker Engine API 拉，还盯进度字节数、判卡死、重试 | DPanel、Docker daemon（脚本不碰 Registry） |
+| 谁重建容器 | 脚本自己按声明式配置重建，还要逐项校验规格 | DPanel 的 `container:upgrade` |
+| 谁重建 Compose 项目 | 脚本自己 `docker compose up -d --force-recreate` | DPanel 的 `compose:deploy` |
+| 回滚点 | `<镜像仓库>:prev` 标签（只留 1 份） | DPanel 的备份容器 `<容器名>-bak-<时间戳>`（容器模式） |
+| 健康门禁 | 脚本自己判断（healthcheck / 观察 30 秒） | DPanel 的升级流程负责，脚本不再判定 |
+| 坏版本钉住 | `<镜像仓库>:bad`，默认 7 天 | 取消 |
+| 失败原因 | stdout + 真正的 stderr | 不变（stdout + 真正的 stderr） |
+| 事务目录 | `--state-dir` / `STATE_ROOT`，保留回滚现场 | 取消 |
+| 互斥锁 | 已移除（并发靠 DPanel 计划任务） | 不变：脚本内部不加锁 |
+| 拉取控制参数 | `--pull-retries`、`PULL_RETRIES`、`DIGEST_RETRIES`、`T_STALL`、`T_STALL_FINISH` 等 | 全部作废（拉取由 DPanel 负责） |
+| 跨版本提示 | `COMPAT_ROOT` 下的 `lastver` | 不变 |
 
-- 回滚点 = `<镜像仓库>:prev` 这个 tag，**只保留 1 份**，永远指向「上一个已知能健康运行的版本」。
-- 更新成功后才会移动它；更新失败时它保持不动，所以随时可以回到上一版。
-- 失败的新版本会被钉成 `<镜像仓库>:bad`，默认 7 天内不再尝试（可用 `--bad-ttl-days` 改）。这样上游发了个坏版本时，你不会每小时重试一次、反复把服务搞挂。
-- 想立刻解除钉子：`docker rmi <镜像仓库>:bad`。
+作废的参数与环境变量（命中即中止，退出码 `3`）：
 
-手工回退：
+- 参数：`--compose-dir`、`--state-dir`、`--bad-ttl-days`、`--pull-retries`。
+- 环境变量：`STATE_ROOT`、`BAD_TTL_DAYS`、`PULL_RETRIES`、`DIGEST_RETRIES`、`DIGEST_RETRY_WAIT`、`T_STALL`、`T_STALL_FINISH`、`T_PULL_MAX`、`T_UP`、`T_HEALTH`、`HEALTH_TRIES`、`T_ROLLBACK`、`PLAIN_BOOT`、`COMPOSE_DIR`、`COMPOSE_BASE`。
+- 例外：`T_INSPECT` 仍被接受，等价于 `DP_T_CHECK`。
 
-```sh
-# Compose 模式（进入项目目录，项目名可从 docker inspect 的 label 读到）
-cd /path/to/项目目录
-docker tag <镜像仓库>:prev <镜像仓库>:latest
-docker compose up -d --force-recreate
+另外，v2.0.0 **不再产生** `<镜像仓库>:prev` 标签和 `/tmp/.container-autoupdate/compose-*` 事务目录；升级后可以手动清掉（排查脚本 `scripts/ct-stale-lock-check.sh` 会把它们列出来）。
 
-# 容器模式
-docker rm -f <容器名>
-docker rename <容器名>__old_<时间戳> <容器名>
-docker start <容器名>
-```
+迁移与版本策略见 [README](../README.md#版本与升级)。
