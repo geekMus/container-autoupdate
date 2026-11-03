@@ -11,6 +11,9 @@
 1. Read the image reference from the Compose file / from the container itself
 2. Ask the remote "what is the latest digest" and compare it with the image
    the container is actually running
+     if it cannot be fetched, retry (twice by default, 5 seconds apart;
+     DIGEST_RETRIES / DIGEST_RETRY_WAIT are tunable)
+     still unavailable → abandon this round (the container stays untouched)
      same → print "already up to date" and exit (usually 2~4 seconds)
 3. Tag the current image as <repo>:rollback-pending as a placeholder (does not touch :prev)
 4. Pull the new version through the Docker Engine API, watching the byte counters
@@ -32,6 +35,13 @@ Not every failure is retried:
 - **A retry has its own share of the time budget** — it must not eat into the share reserved for the images after it.
 
 The original "never retry anything" was deliberate (back then the judgement was: stalls happen during the "connect / fetch the manifest" phase, so a retry would only burn the time budget). The two cases are now separated: a **stall** (60 seconds without bytes) is still abandoned right away, while a **failure** (the stream ended but the result is not right) is retried — the latter is usually a transient fault, and one retry normally succeeds.
+
+**Querying the remote digest is retried too.** Asking the registry "what is the latest digest" is just as prone to transient faults, so it is retried twice by default with 5 seconds in between (`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` are tunable, `DIGEST_RETRIES=0` = no retry).
+When the digest cannot be fetched the script does not guess "probably not updated" — it abandons the round and writes how many attempts it made into the log.
+
+**The failure reason is written to stderr as well.** A scheduled task keeps only stderr and discards stdout when the task fails;
+so the `ERR` / `CRITICAL` lines (and the indented follow-up lines right after them) are **also** written to stderr, on top of being part of the complete log.
+That way the scheduled task is not left with nothing but a bare `exit status 1`. See [the parameter docs](parameters.en.md#where-the-failure-reason-is-written).
 
 **Concurrency is the DPanel scheduled task's job.** The script has **no** mutex lock inside: one scheduled task per target is enough.
 (Older versions of the script did have a lock, but that lock could be held for a long time by a leftover child process, which made every later round print "SKIP another task for the same update target is still running" and exit — it has been removed, see [Versions and upgrades](../README.en.md#versions-and-upgrades).)

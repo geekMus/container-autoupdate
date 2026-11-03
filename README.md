@@ -79,6 +79,12 @@ container-autoupdate.sh --compose myapp --pull-retries 2   # 拉取失败多试�
 `--pull-retries <次数>` 可以改次数，`0` = 不重试。
 但**拉取卡死**（60 秒没有任何新字节）和**镜像源明确报错**（镜像不存在、鉴权失败）不重试 —— 重试也不会成功。
 
+查远端 digest（问镜像仓库「最新 digest 是多少」）同样默认**重试 2 次**、间隔 5 秒；
+`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` 可调，`DIGEST_RETRIES=0` = 不重试。
+
+> **计划任务里失败时能直接看到原因**：失败原因除了在完整日志里，还会额外写一份到 stderr。
+> 计划任务在任务失败时只保留 stderr，早期版本因为只写 stdout，任务里只剩一句 `exit status 1`，什么都排查不出来。
+
 ## 版本与升级
 
 地址用 `releases/latest/download/`，**不含版本号，永远指向最新发布版**，直接复制粘贴即可。

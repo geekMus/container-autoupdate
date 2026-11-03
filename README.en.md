@@ -80,6 +80,12 @@ A failed pull (network hiccup, transient 5xx from the registry) is **retried onc
 `--pull-retries <count>` changes the number of retries, `0` = do not retry.
 A **stalled pull** (no new bytes for 60 seconds) and an **explicit error from the registry** (image does not exist, authentication failed) are *not* retried — retrying would not succeed either.
 
+Querying the remote digest (asking the registry "what is the latest digest") is likewise **retried twice** by default, 5 seconds apart;
+`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` are tunable, `DIGEST_RETRIES=0` = do not retry.
+
+> **A failed scheduled task now shows the reason directly**: the failure reason is written to stderr on top of being part of the complete log.
+> A scheduled task keeps only stderr when the task fails; earlier versions wrote to stdout only, so the task was left with nothing but `exit status 1` and nothing to debug with.
+
 ## Versions and upgrades
 
 The URL uses `releases/latest/download/`, which **contains no version number and always points at the latest published release** — copy and paste it as is.

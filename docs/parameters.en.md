@@ -121,6 +121,8 @@ Bootstrapper behaviour at a glance:
 | `DRY_RUN=1` | `--dry-run` | Same as above |
 | `BAD_TTL_DAYS` | `--bad-ttl-days` | Same as above |
 | `PULL_RETRIES` | `--pull-retries` | Same as above |
+| `DIGEST_RETRIES` | — | How many times to retry when querying the remote digest fails (default `2`; `0` = no retry) |
+| `DIGEST_RETRY_WAIT` | — | Seconds between the remote digest retries (default `5`) |
 | `COMPAT_UNTIL` | `--compat` | Same as above |
 | `STATE_ROOT` | `--state-dir` | Same as above |
 
@@ -153,7 +155,32 @@ Bootstrapper behaviour at a glance:
 | The registry often hangs and does not return | `T_STALL=120` (do not make it too small; even a healthy pull can stay silent for a long time) |
 | The same new version keeps failing and you want to retry sooner | `--bad-ttl-days 1` |
 | Pulls often fail because of network jitter | `--pull-retries 2` (the default is 1; `0` = no retry) |
+| The remote digest often cannot be fetched (slow or jittery registry) | It is already retried twice by default; raise it to `DIGEST_RETRIES=4` and `DIGEST_RETRY_WAIT=10` if that is not enough |
+| The scheduled task only shows "exit status 1" and no reason | See [Where the failure reason is written](#where-the-failure-reason-is-written) |
 | The script has been upgraded but you want to keep the current behaviour first | `--compat <the version you have verified>`, e.g. `--compat 1.2.3` |
+
+## Where the failure reason is written
+
+The script's output goes to two streams:
+
+- **stdout**: the complete log (including every `ERR` / `CRITICAL` line and its indented follow-up lines).
+- **stderr**: **the failure reason only** — the `ERR` / `CRITICAL` lines and the indented follow-up lines right after them.
+
+Why a separate stderr copy: a scheduled task (DPanel) keeps **only stderr** when the task **fails** and discards stdout.
+Earlier versions wrote the failure reason to stdout only, so the scheduled task was left with nothing but a bare `exit status 1` and nothing to debug with.
+Now the failure reason is written to both streams: the log stays complete, and the scheduled task shows the reason directly.
+
+```
+# This is what a failed scheduled task shows (stderr)
+[2026-11-03 06:00:12] ERR 无法获取 ghcr.1ms.run/yetone/magpie:latest 远端 digest（已尝试 2 次），本轮跳过整个项目
+```
+
+When you run it by hand both streams land on the terminal, so there is no visible difference; you can also look at them separately:
+
+```sh
+sh container-autoupdate.sh --compose myapp >/tmp/ct.out 2>/tmp/ct.err
+# /tmp/ct.out holds the complete log, /tmp/ct.err only the failure reason
+```
 
 ## Exit codes
 

@@ -121,6 +121,8 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `DRY_RUN=1` | `--dry-run` | 同上 |
 | `BAD_TTL_DAYS` | `--bad-ttl-days` | 同上 |
 | `PULL_RETRIES` | `--pull-retries` | 同上 |
+| `DIGEST_RETRIES` | — | 查远端 digest 失败后重试几次（默认 `2`；`0` = 不重试） |
+| `DIGEST_RETRY_WAIT` | — | 查远端 digest 重试间隔秒数（默认 `5`） |
 | `COMPAT_UNTIL` | `--compat` | 同上 |
 | `STATE_ROOT` | `--state-dir` | 同上 |
 
@@ -153,7 +155,32 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | 镜像仓库经常卡住不返回 | `T_STALL=120`（别调太小，健康拉取也可能长时间静默） |
 | 同一个新版本反复失败，想快点重试 | `--bad-ttl-days 1` |
 | 拉取经常因为网络抖动失败 | `--pull-retries 2`（默认就是 1；`0` = 不重试） |
+| 查远端 digest 经常取不到（镜像仓库慢或抖动） | 默认已经重试 2 次；还不够就 `DIGEST_RETRIES=4`、`DIGEST_RETRY_WAIT=10` |
+| 计划任务里只看到「exit status 1」，看不到原因 | 看 [失败原因写到哪里](#失败原因写到哪里) |
 | 脚本升到新版、但你想先稳住现有行为 | `--compat <你验证过的版本>`，例如 `--compat 1.2.3` |
+
+## 失败原因写到哪里
+
+脚本的输出分两路：
+
+- **stdout**：完整日志（含每一条 `ERR` / `CRITICAL` 和它们的补充说明行）。
+- **stderr**：**只有失败原因** —— `ERR` / `CRITICAL` 行，以及紧随其后的缩进补充行。
+
+为什么单独写一份 stderr：计划任务（DPanel）在任务**失败**时只保留 stderr、丢掉 stdout。
+早期版本只把失败原因写在 stdout，于是计划任务里只剩一句干巴巴的 `exit status 1`，什么都排查不出来。
+现在失败原因同时写两路：日志照样完整，失败时计划任务也能直接看到原因。
+
+```
+# 计划任务里失败时能看到的就是这些（stderr）
+[2026-11-03 06:00:12] ERR 无法获取 ghcr.1ms.run/yetone/magpie:latest 远端 digest（已尝试 2 次），本轮跳过整个项目
+```
+
+手动跑的时候两个流都在终端上，看不出区别；也可以自己分开看：
+
+```sh
+sh container-autoupdate.sh --compose myapp >/tmp/ct.out 2>/tmp/ct.err
+# /tmp/ct.out 完整日志，/tmp/ct.err 只有失败原因
+```
 
 ## 退出码
 

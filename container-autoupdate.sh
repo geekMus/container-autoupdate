@@ -25,6 +25,19 @@
 # 生产数据库仍应另有备份。私有仓库需要匿名 API 拉取可用，否则安全中止。
 # ===========================================================================
 set -u
+# 失败原因必须能落到「真正的 stderr」。
+# 计划任务（DPanel）在任务失败时只保留 stderr、丢掉 stdout；如果失败原因只写在
+# stdout 上，计划任务里就只剩一句「exit status 1」，排查时什么都看不到。
+# 下面 exec 2>&1 会把 fd 2 指到 stdout，所以先把原来的 stderr 另存到 fd 3。
+# 先探一下 stderr 能不能用：exec 的重定向失败会让非交互 shell 直接退出，
+# stderr 被关掉的环境不能因此崩掉（探不到就退回用 stdout 报错）。
+if ( : >&2 ) ; then
+  exec 3>&2
+  ERR_FD=3
+else
+  # stderr 根本用不了（被关掉了）：退回写 stdout。宁可重复也不让脚本崩掉。
+  ERR_FD=1
+fi
 exec 2>&1
 
 # ======================= 配置区（二选一）===================================
@@ -52,7 +65,7 @@ COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到�
 PULL_RETRIES="${PULL_RETRIES:-1}"  # 拉取失败后的重试次数（0 = 不重试）
 
 START=$(date +%s)
-VERSION="1.1.1"
+VERSION="1.1.2"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
@@ -72,7 +85,43 @@ PULL_KIND=""      # 拉取失败的分类：ok / transient / permanent / stall /
 now()     { date +%s; }
 elapsed() { echo $(( $(now) - START )); }
 left()    { echo $(( T_HARD - $(elapsed) )); }
-log()     { echo "[$(date '+%F %T')] $*"; }
+# ---- 错误原因同时落到真正的 stderr ----
+# 计划任务（DPanel）在任务失败时只保留 stderr、丢掉 stdout。
+# 所以失败原因不能只写在 stdout 上，否则计划任务里只剩一句「exit status 1」。
+# 判定规则：消息以 ERR / CRITICAL 开头的算「错误行」；紧随错误行之后的缩进补充行
+# （log "   ..."）属于同一个错误块，一起进 stderr。
+# 用 _LOG_ERR 记住「上一个错误块是否还在延续」，不靠猜缩进。
+_log_stderr() {
+  if [ "${ERR_FD:-2}" = "3" ]; then
+    echo "$1" >&3
+  elif [ "${ERR_FD:-2}" = "1" ]; then
+    echo "$1"
+  else
+    echo "$1" >&2
+  fi
+}
+log() {
+  _l="[$(date '+%F %T')] $*"
+  echo "$_l"
+  case "$*" in
+    ERR\ *|CRITICAL\ *)
+      _log_stderr "$_l"
+      _LOG_ERR=1
+      ;;
+    "   "*)
+      # 缩进补充行：属于上一个错误块时一起进 stderr。
+      # 非缩进的普通日志行会清掉标记，错误块因此自然结束。
+      if [ "${_LOG_ERR:-0}" = "1" ]; then
+        _log_stderr "$_l"
+      else
+        _LOG_ERR=0
+      fi
+      ;;
+    *)
+      _LOG_ERR=0
+      ;;
+  esac
+}
 safe_key() { printf '%s' "$1" | sed 's|[^A-Za-z0-9_.-]|_|g'; }
 json_quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's|\\|\\\\|g; s|"|\\"|g')"; }
 
@@ -313,6 +362,8 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   DRY_RUN=1                     同 --dry-run
   BAD_TTL_DAYS                  同 --bad-ttl-days
   PULL_RETRIES                  同 --pull-retries
+  DIGEST_RETRIES                查远端 digest 失败后重试几次（默认 2；0 = 不重试）
+  DIGEST_RETRY_WAIT             查远端 digest 重试间隔秒数（默认 5）
   COMPAT_UNTIL                  同 --compat
   T_HARD / T_INSPECT / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
                                 各阶段超时（秒），一般不用改
@@ -360,37 +411,37 @@ parse_args() {
   _SAW_CONTAINER=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --compose)      [ "$#" -ge 2 ] || { echo "ERR --compose 缺少参数" >&2; exit 1; }
+      --compose)      [ "$#" -ge 2 ] || { echo "ERR --compose 缺少参数" >&"$ERR_FD"; exit 1; }
                       COMPOSE_NAME="$2"; CONTAINER_NAME=""; _SAW_COMPOSE=1; shift 2 ;;
-      --container)    [ "$#" -ge 2 ] || { echo "ERR --container 缺少参数" >&2; exit 1; }
+      --container)    [ "$#" -ge 2 ] || { echo "ERR --container 缺少参数" >&"$ERR_FD"; exit 1; }
                       CONTAINER_NAME="$2"; COMPOSE_NAME=""; _SAW_CONTAINER=1; shift 2 ;;
-      --compose-dir)  [ "$#" -ge 2 ] || { echo "ERR --compose-dir 缺少参数" >&2; exit 1; }
+      --compose-dir)  [ "$#" -ge 2 ] || { echo "ERR --compose-dir 缺少参数" >&"$ERR_FD"; exit 1; }
                       COMPOSE_DIR="$2"; shift 2 ;;
-      --docker-sock)  [ "$#" -ge 2 ] || { echo "ERR --docker-sock 缺少参数" >&2; exit 1; }
+      --docker-sock)  [ "$#" -ge 2 ] || { echo "ERR --docker-sock 缺少参数" >&"$ERR_FD"; exit 1; }
                       DOCKER_SOCK="$2"; shift 2 ;;
-      --state-dir)    [ "$#" -ge 2 ] || { echo "ERR --state-dir 缺少参数" >&2; exit 1; }
+      --state-dir)    [ "$#" -ge 2 ] || { echo "ERR --state-dir 缺少参数" >&"$ERR_FD"; exit 1; }
                       STATE_ROOT="$2"; shift 2 ;;
-      --bad-ttl-days) [ "$#" -ge 2 ] || { echo "ERR --bad-ttl-days 缺少参数" >&2; exit 1; }
+      --bad-ttl-days) [ "$#" -ge 2 ] || { echo "ERR --bad-ttl-days 缺少参数" >&"$ERR_FD"; exit 1; }
                       BAD_TTL_DAYS="$2"; shift 2 ;;
-      --pull-retries) [ "$#" -ge 2 ] || { echo "ERR --pull-retries 缺少参数" >&2; exit 1; }
+      --pull-retries) [ "$#" -ge 2 ] || { echo "ERR --pull-retries 缺少参数" >&"$ERR_FD"; exit 1; }
                       PULL_RETRIES="$2"; shift 2 ;;
-      --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&2; exit 1; }
+      --compat)       [ "$#" -ge 2 ] || { echo "ERR --compat 缺少参数" >&"$ERR_FD"; exit 1; }
                       COMPAT_UNTIL="$2"; _SAW_COMPAT=1; shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       -V|--version)   echo "$VERSION"; exit 0 ;;
       *)              compat_removed_flag "$1"
-                      echo "ERR 未知参数：$1（用 --help 查看用法）" >&2; exit 1 ;;
+                      echo "ERR 未知参数：$1（用 --help 查看用法）" >&"$ERR_FD"; exit 1 ;;
     esac
   done
   # 命令行上两个目标都显式给过 → 直接拒绝，不做「后者胜出」的静默覆盖
   if [ "$_SAW_COMPOSE" = "1" ] && [ "$_SAW_CONTAINER" = "1" ]; then
-    echo "ERR 配置错误：--compose 与 --container 必须且只能给一个" >&2
+    echo "ERR 配置错误：--compose 与 --container 必须且只能给一个" >&"$ERR_FD"
     exit 1
   fi
   # 重试次数必须是非负整数。给错值要立刻报错，不能悄悄当成 0 或 1。
   case "$PULL_RETRIES" in
-    ''|*[!0-9]*) echo "ERR --pull-retries 必须是非负整数（当前值=$PULL_RETRIES）" >&2; exit 1 ;;
+    ''|*[!0-9]*) echo "ERR --pull-retries 必须是非负整数（当前值=$PULL_RETRIES）" >&"$ERR_FD"; exit 1 ;;
   esac
 }
 
@@ -426,22 +477,22 @@ check_deps() {
     command -v "$_b" >/dev/null 2>&1 || _missing="$_missing $_b"
   done
   if [ -n "$_missing" ]; then
-    echo "ERR 缺少依赖命令：$_missing" >&2
-    echo "    需要 docker / curl / timeout 以及 busybox 或 coreutils 基础工具" >&2
+    echo "ERR 缺少依赖命令：$_missing" >&"$ERR_FD"
+    echo "    需要 docker / curl / timeout 以及 busybox 或 coreutils 基础工具" >&"$ERR_FD"
     exit 1
   fi
   if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-    echo "ERR 无法连接 Docker（socket=${SOCK:-$API_HOST}）" >&2
-    echo "    请确认 Docker 正在运行，且当前用户有权限访问 socket" >&2
+    echo "ERR 无法连接 Docker（socket=${SOCK:-$API_HOST}）" >&"$ERR_FD"
+    echo "    请确认 Docker 正在运行，且当前用户有权限访问 socket" >&"$ERR_FD"
     exit 1
   fi
   # buildx 是「查远端 digest」的唯一手段（remote_digest 用它读 manifest）。
   # 缺它时 digest 会恒为空，脚本每轮都报「无法获取远端 digest」而不更新——
   # 那个错误信息会把人引向网络问题，所以必须在动手之前就把原因说清楚。
   if ! docker buildx version >/dev/null 2>&1; then
-    echo "ERR 缺少 docker buildx 插件（查询远端 digest 依赖它）" >&2
-    echo "    Debian/Ubuntu：apt install docker-buildx-plugin" >&2
-    echo "    其他发行版：https://github.com/docker/buildx/releases 下载后放进 \$HOME/.docker/cli-plugins/" >&2
+    echo "ERR 缺少 docker buildx 插件（查询远端 digest 依赖它）" >&"$ERR_FD"
+    echo "    Debian/Ubuntu：apt install docker-buildx-plugin" >&"$ERR_FD"
+    echo "    其他发行版：https://github.com/docker/buildx/releases 下载后放进 \$HOME/.docker/cli-plugins/" >&"$ERR_FD"
     exit 1
   fi
 }
@@ -488,6 +539,33 @@ split_ref() {
 remote_digest() {
   timeout -s KILL "$T_INSPECT" docker buildx imagetools inspect "$1" 2>/dev/null \
     | sed -n 's/^Digest:  *//p' | head -n1
+}
+
+# 查远端 digest 是个纯网络请求，最容易遇到瞬时故障（连接被重置、镜像源超时、
+# DNS 抖动）。一次失败就放弃整轮太脆——生产上就因为一次取 digest 失败让
+# 整轮更新直接结束。所以这里按 DIGEST_RETRIES 重试几次（间隔几秒）。
+# 重试次数为 0 时行为与以前完全一样（只查一次）。
+#
+# 结果放在全局变量 DIGEST_RESULT 里，不用 echo 返回：
+# 这个函数是在 $( ) 里调用的，而 log() 写的是 stdout——
+# 用 echo 返回的话，重试提示会被一起收进「digest」里，把结果弄脏。
+DIGEST_RETRIES="${DIGEST_RETRIES:-2}"
+DIGEST_RETRY_WAIT="${DIGEST_RETRY_WAIT:-5}"
+DIGEST_RESULT=""
+remote_digest_retry() {
+  DIGEST_RESULT=""
+  _dimg="$1"
+  _dtries=$(( ${DIGEST_RETRIES:-2} + 1 ))
+  _dn=1
+  while [ "$_dn" -le "$_dtries" ]; do
+    DIGEST_RESULT=$(remote_digest "$_dimg")
+    [ -n "$DIGEST_RESULT" ] && return 0
+    if [ "$_dn" -ge "$_dtries" ]; then break; fi
+    log "   查远端 digest 失败（$_dimg），${DIGEST_RETRY_WAIT}s 后重试（第 $_dn/${_dtries} 次尝试）"
+    sleep "$DIGEST_RETRY_WAIT"
+    _dn=$(( _dn + 1 ))
+  done
+  return 1
 }
 
 is_current() {
@@ -1123,8 +1201,9 @@ plain_update() {
   case "$P_STOP" in null|'') P_STOP=10 ;; *[!0-9]*) P_STOP=10 ;; esac
   log "MODE container 容器=$P_NAME 镜像=$P_IMG"
 
-  P_REMOTE=$(remote_digest "$P_IMG")
-  [ -n "$P_REMOTE" ] || { log "ERR 无法获取远端 digest，本轮跳过"; EXIT_CODE=1; plain_discard; return; }
+  remote_digest_retry "$P_IMG"
+  P_REMOTE="$DIGEST_RESULT"
+  [ -n "$P_REMOTE" ] || { log "ERR 无法获取远端 digest（已尝试 ${DIGEST_RETRIES:-2} 次），本轮跳过"; EXIT_CODE=1; plain_discard; return; }
   is_pinned_bad "$P_REPO" "$P_REMOTE" && { log "SKIP 远端版本仍在 :bad 钉住期"; plain_discard; return; }
   is_current "$P_OLDID" "$P_REMOTE" && { log "OK $P_NAME 已是最新 $P_REMOTE"; plain_discard; return; }
   [ "$DRY_RUN" != "1" ] || { log "DRY 发现新版本 $P_REMOTE，不执行"; plain_discard; return; }
@@ -1445,8 +1524,9 @@ compose_update() {
   for IMG in $IMAGES; do
     case "$IMG" in *@*) log "SKIP Compose 含 digest 固定镜像 $IMG，不自动更新整个项目"; compose_discard; return ;; esac
     set -- $(split_ref "$IMG"); REPO="$1"; TAG="$2"
-    REMOTE=$(remote_digest "$IMG")
-    [ -n "$REMOTE" ] || { log "ERR 无法获取 $IMG 远端 digest，本轮跳过整个项目"; EXIT_CODE=1; compose_discard; return; }
+    remote_digest_retry "$IMG"
+    REMOTE="$DIGEST_RESULT"
+    [ -n "$REMOTE" ] || { log "ERR 无法获取 $IMG 远端 digest（已尝试 ${DIGEST_RETRIES:-2} 次），本轮跳过整个项目"; EXIT_CODE=1; compose_discard; return; }
     is_pinned_bad "$REPO" "$REMOTE" && { log "SKIP $IMG 为钉住坏版本；为避免重建时带上它，跳过整个项目"; compose_discard; return; }
     LOCID=$(local_imgid_for "$IMG")
     [ "$LOCID" != "MIXED" ] || { log "SKIP 项目内同一镜像 $IMG 的运行版本不一致，请先人工统一"; compose_discard; return; }
