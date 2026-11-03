@@ -92,14 +92,23 @@ jobs:
       - name: 判断是否需要发版
         id: check
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -eu
           TAG="v$VERSION"
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "tag $TAG 已存在，无需发版（VERSION 未变更）"
+          # 不能只看 tag：上一轮可能「tag 打出去了、Release 没发出去」
+          # （实测发生过：gh release create 偶发失败，而 tag 已经推上去了）。
+          # 只判 tag 存在就 skip，会让这个版本永远发不出去——所以两个都要看。
+          _tag=0
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && _tag=1
+          _rel=0
+          gh release view "$TAG" >/dev/null 2>&1 && _rel=1
+          if [ "$_tag" = "1" ] && [ "$_rel" = "1" ]; then
+            echo "tag 与 Release 都已存在，无需发版（VERSION 未变更）"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            echo "tag=$_tag release=$_rel，继续发版"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -157,6 +166,11 @@ jobs:
         run: |
           set -eu
           TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            # 上一轮已经把它打出去了（只有 Release 那步失败）——不能重复创建。
+            echo "tag $TAG 已存在，跳过创建"
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # tag 消息复用发布说明，这样 `git show vX.Y.Z` 也能看到这版改了什么
@@ -175,9 +189,28 @@ jobs:
           # 主脚本与排查脚本作为 Release 资产上传，这样
           # releases/latest/download/{container-autoupdate.sh,ct-stale-lock-check.sh} 永远指向最新发布版。
           # 3.0.0 起不再有 ct-bootstrap.sh：安装方式改为计划任务里直接下载主脚本。
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            container-autoupdate.sh \
-            scripts/ct-stale-lock-check.sh
-          echo "已发布 Release $TAG"
+          # 失败时重试：gh release create 会偶发失败（实测 v4.0.2 这一轮就挂了），
+          # 而 tag 已经推出去，不重试就得手工补发 Release。
+          _i=1
+          while :; do
+            if gh release create "$TAG" \
+                 --title "$TAG" \
+                 --notes-file release-notes.md \
+                 container-autoupdate.sh \
+                 scripts/ct-stale-lock-check.sh; then
+              echo "已发布 Release $TAG"
+              exit 0
+            fi
+            if [ "$_i" -ge 4 ]; then
+              echo "::error::gh release create 连续 4 次失败，请手工补发 Release $TAG"
+              exit 1
+            fi
+            echo "第 $_i 次 gh release create 失败，30 秒后重试"
+            _i=$(( _i + 1 ))
+            sleep 30
+            # 重试前再确认一次：也许上一次其实成功了（只是返回码不对）
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG 其实已经存在，收工"
+              exit 0
+            fi
+          done
