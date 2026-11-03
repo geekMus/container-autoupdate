@@ -15,7 +15,7 @@
 ### Recommended: use the bootstrapper (it has a cache, so it does not have to go online every round)
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /usr/local/bin/ct-bootstrap.sh
 chmod +x /usr/local/bin/ct-bootstrap.sh
 /usr/local/bin/ct-bootstrap.sh --compose myapp
@@ -26,8 +26,8 @@ What the bootstrapper does on each run:
 | Situation | Network cost |
 |---|---|
 | Pinned with `--ct-version <version>` (or `CT_VERSION`) and the local copy exists | **Zero** (never goes online) |
-| Default (follows latest), the local copy is the same version | One 4KB Range probe (about 1 second), no download |
-| Default, the remote has a new version | Probe + one 64KB download, then cached |
+| Default (follows latest), the local copy is the same version | One Range probe (fetches the head of the file, 16KB; about 1 second), no download |
+| Default, the remote has a new version | Probe + one full download, then cached |
 | Probe failed but a local cache exists | Zero (uses the cache, prints `WARN`) |
 | Probe failed and there is no cache | Zero, but **fails loudly** (never a silent success) |
 
@@ -40,7 +40,7 @@ See the [parameter reference](parameters.en.md#bootstrapper-ct-bootstrapsh-param
 If you do not want to use the bootstrapper, run the main script directly. Note that in this case **the script does not upgrade itself** — you have to download it again yourself from time to time:
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 chmod +x /usr/local/bin/container-autoupdate.sh
 /usr/local/bin/container-autoupdate.sh --compose myapp
@@ -51,7 +51,7 @@ chmod +x /usr/local/bin/container-autoupdate.sh
 Use this when you want to check the network and the arguments quickly, without leaving a file behind:
 
 ```sh
-URL=https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
 _t=$(mktemp)
 if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
   sh "$_t" --compose myapp
@@ -108,7 +108,7 @@ Once pinned, the bootstrapper **never goes online to fetch a new version** — i
 If you do not use the bootstrapper and run the main script directly, replace `latest/download` in the URL with a concrete tag (the tag numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page):
 
 ```sh
-https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
     → the trailing comment is Chinese ("example placeholder: replace v1.2.3 with the real tag from the Releases page")
 ```
 
@@ -177,21 +177,44 @@ Boundary behaviour of `--compat`:
 
 ## 3. Mainland China network: switch to a mirror prefix
 
-`raw.githubusercontent.com` often cannot be reached from mainland China (measured: repeated 8-second timeouts). The bootstrapper's default source already handles this (`CT_SOURCE=auto` tries gh-proxy → direct → ghproxy.net in turn). Alternative prefixes when you write the URL by hand:
+`raw.githubusercontent.com` often cannot be reached from mainland China (measured: repeated 8-second timeouts). The bootstrapper's default source already handles this (`CT_SOURCE=auto` tries **self-hosted mirror → gh-proxy → direct → ghproxy.net** in turn, and moves on to the next source whenever one fails).
 
-| Prefix | Form | Notes |
+Default source order (measured 2026-11-03 inside the N1 dpanel container):
+
+| Order | Prefix | Measured |
 |---|---|---|
-| `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | **Most stable in practice**: both the 4KB Range request and the full download take about 1 second |
-| `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | Public (measured: repeated 15-second timeouts; the bootstrapper only uses it as the last fallback) |
-| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | Self-hosted (occasional 403/522; in practice less stable than gh-proxy) |
+| 1 | `https://github.mus.pp.ua/` | Self-hosted. Both the Range probe and the full download correctly forward Release assets (sha256 matches the official one); but it times out occasionally — 3 out of 5 attempts succeeded |
+| 2 | `https://gh-proxy.com/` | Public. 5 out of 5 succeeded, about 1 second on average — the most stable |
+| 3 | `https://github.com/` (no prefix) | A direct download of a Release asset is more stable than a raw file, but it does show occasional DNS failures (`curl: (6)`) and 12-second delays |
+| 4 | `https://ghproxy.net/` | Public (measured: repeated 15-second timeouts; only used as the last fallback) |
 
-You can also go **direct** (without a prefix): `https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh`. A direct download of a Release asset is more stable than a raw file, but it does show occasional DNS failures (`curl: (6)`) and 12-second delays in practice, so the bootstrapper puts it after gh-proxy.
+The full form when you write the URL by hand:
+
+```sh
+# Self-hosted mirror (the default first choice)
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+
+# Public acceleration mirror (the default fallback)
+https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+```
+
+To make the bootstrapper use one specific source only: `CT_SOURCE=mus` (self-hosted), `CT_SOURCE=gh-proxy`, `CT_SOURCE=direct`, `CT_SOURCE=ghproxy`, or pass any custom prefix directly.
 
 > **Always pass `-L`** (or `--location`). `releases/latest/download/` first answers with a 302 redirect to the URL of the concrete tag; without `-L`, `curl -f` treats it as a failure (`curl: (22)`).
 >
-> Mirror prefixes **occasionally** return `403` / `522` for Release assets (measured: the same URL returned 403 a few minutes ago and 200 a few minutes later). That is flakiness on the mirror side, not a wrong URL — a retry usually works. The bootstrapper tries each source twice by default (`CT_TRIES`) and falls back to the local cache when the probe fails.
+> Mirror prefixes **occasionally** return `403` / `522` / timeouts for Release assets (measured: the same URL failed a few minutes ago and returned 200 a few minutes later). That is flakiness on the mirror side, not a wrong URL — a retry usually works. The bootstrapper tries each source twice by default (`CT_TRIES`) and falls back to the local cache when the probe fails.
 >
 > Do **not** use `cdn.jsdelivr.net` for this repository: in practice it returns a cached old version (`@main` once served historical content with `VERSION=6.0.0`). jsdelivr suits static files at a fixed tag, not the "follow the latest release" scenario.
+
+### How many bytes the version probe fetches
+
+To keep the traffic small, the bootstrapper fetches only the head of the file (a `Range` request) when it looks for the version number. The size of that window is `--ct-probe-bytes` / `CT_PROBE_BYTES` (16KB by default).
+
+> **The pitfall hit here**: the window used to be fixed at 4KB, but the `VERSION=` line moves further down as the header comments of the script grow (one release had already pushed it to byte 4012). As soon as the window no longer covers it, the probe fails silently — the log only shows `WARN 探测远端版本失败（网络问题）` while the network was perfectly fine.
+>
+> The window is now 16KB, and **when the version number is not found, the whole file is fetched once and parsed again**. So as long as the network works, the probe no longer fails because the version line moved down.
+>
+> When you see "probe failed", look at the `探测远端版本：<URL>` line right above it — it tells you which source and which address was being tried.
 
 ## 4. Exit codes
 
@@ -266,7 +289,7 @@ it only lists the following and ends with copy-pasteable cleanup commands:
 ### How to use it
 
 ```sh
-curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
   -o /tmp/ct-stale-lock-check.sh
 sh /tmp/ct-stale-lock-check.sh
 ```

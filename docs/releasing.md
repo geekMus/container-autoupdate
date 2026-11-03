@@ -98,4 +98,4 @@ Release 资产 + `releases/latest/download/` 的好处：
 
 - 地址里**不含版本号**，使用者粘贴一次就不用再改；
 - 只指向**正式发布**的版本，不会拿到半成品；
-- 加速服务（`gh-proxy.com`、`ghproxy.net`、自建那套）都能代理 Release 资产，实测 15MB 文件 5.9 秒下载完成。
+- 加速服务（自建站 `github.mus.pp.ua`、公共站 `gh-proxy.com`、`ghproxy.net`）都能代理 Release 资产，实测 15MB 文件 5.9 秒下载完成。默认源顺序是**自建站优先、公共站兜底**（实测 2026-11-03：自建站能正确转 Release 资产但偶发 40 秒超时，公共站 5 次全成功、约 1 秒）。

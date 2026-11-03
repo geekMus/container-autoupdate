@@ -58,9 +58,10 @@ Two ways to specify them, in priority order: **command line `--ct-*` > environme
 | `--ct-version <version>` | `CT_VERSION` | empty | **Setting it means fixed-version mode** (e.g. `1.2.3`, with or without the `v` prefix): it does not probe the remote side, runs the local copy if there is one, and **never touches the network**. Recommended in production; the version numbers are on the Releases page. |
 | `--ct-cache-dir <dir>` | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | The script cache directory. When running inside a container, mount a writable directory or change it to `/tmp`. |
 | `--ct-cache-keep <N>` | `CT_CACHE_KEEP` | `3` | How many historical version files to keep; the extra ones are deleted. `0` means no pruning. |
-| `--ct-source <source>` | `CT_SOURCE` | `auto` | Download source: `auto` (gh-proxy → direct → ghproxy.net), `direct`, `gh-proxy`, `ghproxy`, or any custom prefix (it is prepended to `https://github.com/...`). |
+| `--ct-source <source>` | `CT_SOURCE` | `auto` | Download source: `auto` (**self-hosted mirror → gh-proxy → direct → ghproxy.net**), `direct`, `gh-proxy`, `ghproxy`, `mus` (self-hosted mirror), or any custom prefix (it is prepended to `https://github.com/...`). |
 | `--ct-t-net <seconds>` | `CT_T_NET` | `20` | Timeout for a single network operation (seconds). Applies to probing and to downloading separately. |
 | `--ct-tries <N>` | `CT_TRIES` | `2` | How many attempts per source. |
+| `--ct-probe-bytes <N>` | `CT_PROBE_BYTES` | `16000` | How many bytes of the head of the file to fetch when probing for the version number (a `Range` request). **Do not lower it**: the version line moves further down as the script grows, and a window that no longer covers it fails to find the version (it shows up as "probe failed"). When the version is not found, the bootstrapper fetches the whole file once and parses it again. |
 | `--ct-force` | `CT_FORCE=1` | off | Ignore the cache and force a re-download. |
 | `--ct-quiet` | `CT_QUIET=1` | off | Do not print the bootstrapper's own logs (the main script's logs are unchanged). |
 | `--ct-help` | — | — | Show the bootstrapper's help. |
@@ -82,15 +83,15 @@ Bootstrapper behaviour at a glance:
 |---|---|
 | Fixed version set (`--ct-version` / `CT_VERSION`) and the local copy exists | Runs it directly, **zero network requests** |
 | Fixed version set and no local copy | Downloads that version and runs it (only the fixed tag is tried; `latest` is never used) |
-| No fixed version, a version was probed and it is already local | Sends a single 4KB Range request, no download |
-| No fixed version, a newer version was probed | Downloads 64KB and caches it, then runs it |
+| No fixed version, a version was probed and it is already local | Sends a single Range request (fetches the head of the file, 16KB by default), no download |
+| No fixed version, a newer version was probed | Downloads the whole file and caches it, then runs it |
 | Probe failed and a usable cache exists | Runs from the cache and logs `WARN` (the exit code depends on the main script) |
 | Probe failed and no cache | `ERR`, exit code `1` (**never a silent success**) |
 | The cache file is corrupted | Re-downloads it automatically (validation: syntax + `VERSION` field + signature string) |
 
-> Why the default source is `gh-proxy.com` instead of a direct connection: in testing (2026-11-01) a direct connection to `github.com`
-> occasionally failed DNS and took 12 seconds, while `gh-proxy.com` was stable at 1~2 seconds; `ghproxy.net` has timed out repeatedly and is unusable.
-> To connect directly, set `--ct-source direct` or `CT_SOURCE=direct`.
+> Why the default sources are not a direct connection: in testing (2026-11-03, inside the N1 dpanel container) both the self-hosted mirror `github.mus.pp.ua` and the public mirror `gh-proxy.com` correctly forward Release assets (the sha256 matches the official one), but the self-hosted one occasionally times out after 40 seconds (3 of 5 attempts succeeded) while `gh-proxy.com` succeeded 5 out of 5 times in about 1 second. The default order is **self-hosted first (fast, and under your own control), public as the fallback**, then direct, then `ghproxy.net`.
+>
+> To use one specific source only, set `--ct-source mus` / `--ct-source gh-proxy` / `--ct-source direct` / `--ct-source ghproxy`, or the same values through `CT_SOURCE=`.
 
 
 ## All command-line parameters

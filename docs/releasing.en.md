@@ -98,4 +98,4 @@ Benefits of Release assets plus `releases/latest/download/`:
 
 - the URL **contains no version number**, so users paste it once and never have to change it;
 - it points only at **officially released** versions, so nobody gets a half-finished build;
-- acceleration services (`gh-proxy.com`, `ghproxy.net`, and the self-hosted one) can all proxy Release assets; measured: a 15MB file finished downloading in 5.9 seconds.
+- acceleration services (the self-hosted `github.mus.pp.ua`, the public `gh-proxy.com`, `ghproxy.net`) can all proxy Release assets; measured: a 15MB file finished downloading in 5.9 seconds. The default source order is **self-hosted first, public as the fallback** (measured 2026-11-03: the self-hosted one forwards Release assets correctly but occasionally times out after 40 seconds, while the public one succeeded 5 out of 5 times in about 1 second).

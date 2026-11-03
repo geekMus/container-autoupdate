@@ -25,13 +25,15 @@
 
 ```sh
 # 引导器会自己缓存脚本：第一次下载，之后同版本直接复用，不必每轮都联网
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /tmp/ct-bootstrap.sh
 sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
 普通容器把最后一段换成 `--container mycontainer`。
 
+> 下载地址里的 `https://github.mus.pp.ua/` 是自建加速前缀，不想要就去掉它（直连 GitHub）。前缀坏了就换 `https://gh-proxy.com/`——引导器自己会按「自建站 → gh-proxy → 直连」的顺序逐个试。
+>
 > 执行超时请设 **≥ 600 秒**。
 >
 > **为什么不推荐 `curl ... | sh`**：管道写法在下载失败时会**静默成功**（任务日志看不出这轮没跑成）。引导器会把下载落到文件、校验通过才执行，失败时明确返回非 0。
@@ -43,7 +45,7 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 想临时检查一次，直接跑就行（跑完就结束，不会常驻）。引导器第一次要先落地到本地：
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /tmp/ct-bootstrap.sh
 sh /tmp/ct-bootstrap.sh --compose myapp
 ```
@@ -55,8 +57,8 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 | 模式 | 行为 | 网络开销 |
 |---|---|---|
 | 固定版本（`--ct-version <版本号>` / `CT_VERSION`） | 本地有就直接跑 | **零**（完全不联网） |
-| `latest`（默认），本地同版本 | 只探测远端版本号，不下载 | 一次 4KB Range 请求（约 1 秒） |
-| `latest`，远端更新 | 下载新版本并缓存，再执行 | 一次探测 + 一次完整下载（约 70KB） |
+| `latest`（默认），本地同版本 | 只探测远端版本号，不下载 | 一次 Range 请求（取文件头 16KB，约 1 秒） |
+| `latest`，远端更新 | 下载新版本并缓存，再执行 | 一次探测 + 一次完整下载（约 80KB） |
 | 探测失败但本地有缓存 | 用缓存继续跑，只打 `WARN` | 零 |
 | 探测失败且无缓存 | **明确报错退出**（不会静默成功） | 零 |
 
@@ -133,7 +135,7 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 不改任何东西、不杀任何进程，末尾给出可复制的清理命令，由你确认后自己执行。
 
 ```sh
-curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
   -o /tmp/ct-stale-lock-check.sh
 sh /tmp/ct-stale-lock-check.sh
 ```

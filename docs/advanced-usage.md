@@ -15,7 +15,7 @@
 ### 推荐：用引导器（自带缓存，不必每轮联网）
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /usr/local/bin/ct-bootstrap.sh
 chmod +x /usr/local/bin/ct-bootstrap.sh
 /usr/local/bin/ct-bootstrap.sh --compose myapp
@@ -26,8 +26,8 @@ chmod +x /usr/local/bin/ct-bootstrap.sh
 | 情形 | 网络开销 |
 |---|---|
 | 设了 `--ct-version <版本号>`（或 `CT_VERSION`），本地已有 | **零**（完全不联网） |
-| 默认（跟 latest），本地同版本 | 一次 4KB Range 探测（约 1 秒），不下载 |
-| 默认，远端有新版本 | 探测 + 一次 64KB 下载，然后缓存 |
+| 默认（跟 latest），本地同版本 | 一次 Range 探测（取文件头 16KB，约 1 秒），不下载 |
+| 默认，远端有新版本 | 探测 + 一次完整下载，然后缓存 |
 | 探测失败但本地有缓存 | 零（用缓存，打 `WARN`） |
 | 探测失败且无缓存 | 零，但**明确报错退出**（不会静默成功） |
 
@@ -40,7 +40,7 @@ chmod +x /usr/local/bin/ct-bootstrap.sh
 如果你不想用引导器，就直接跑主脚本。注意此时**脚本不会自己升级**，你得自己定期重下：
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh \
   -o /usr/local/bin/container-autoupdate.sh
 chmod +x /usr/local/bin/container-autoupdate.sh
 /usr/local/bin/container-autoupdate.sh --compose myapp
@@ -51,7 +51,7 @@ chmod +x /usr/local/bin/container-autoupdate.sh
 想快速验证网络与参数、又不留文件时用这个：
 
 ```sh
-URL=https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
+URL=https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh
 _t=$(mktemp)
 if curl -fsSL --max-time 60 "$URL" -o "$_t"; then
   sh "$_t" --compose myapp
@@ -107,7 +107,7 @@ curl -fsSL "$URL" | sh -s -- --compose myapp
 如果你不用引导器、直接跑主脚本，那就把地址里的 `latest/download` 换成具体 tag（tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）：
 
 ```sh
-https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/download/v1.2.3/container-autoupdate.sh  # 示例占位：把 v1.2.3 换成 Releases 页面上的真实 tag
 ```
 
 什么时候该锁死：你不想在无人值守的生产环境上突然换行为。锁死之后，升级变成一次显式的版本号替换。
@@ -169,21 +169,44 @@ container-autoupdate.sh --compose myapp --compat 0.9.0
 
 ## 3. 国内网络：换镜像源
 
-`raw.githubusercontent.com` 在国内经常连不上（实测多次 8 秒超时）。引导器的默认源已经处理了这件事（`CT_SOURCE=auto` 会依次试 gh-proxy → 直连 → ghproxy.net）。手写地址时的替代前缀：
+`raw.githubusercontent.com` 在国内经常连不上（实测多次 8 秒超时）。引导器的默认源已经处理了这件事（`CT_SOURCE=auto` 会依次试 **自建站 → gh-proxy → 直连 → ghproxy.net**），哪个源失败就换下一个。
 
-| 前缀 | 形式 | 备注 |
+默认源顺序（2026-11-03 实测，N1 dpanel 容器内）：
+
+| 顺序 | 前缀 | 实测 |
 |---|---|---|
-| `https://gh-proxy.com/` | `https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | **实测最稳**：Range 4KB 与完整下载都约 1 秒 |
-| `https://ghproxy.net/` | `https://ghproxy.net/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | 公共（实测多次 15 秒超时，引导器只作为最后兜底） |
-| `https://github.mus.pp.ua/` | `https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh` | 自建（会偶发 403/522，实测不如 gh-proxy 稳） |
+| 1 | `https://github.mus.pp.ua/` | 自建站。Range 探测与完整下载都正确转 Release 资产（sha256 与官方一致）；但偶发 40 秒超时，5 次里成功 3 次 |
+| 2 | `https://gh-proxy.com/` | 公共站。5 次全成功，平均 1 秒，最稳 |
+| 3 | `https://github.com/`（不加前缀） | 直连 Release 资产比 raw 文件稳，但实测会偶发 DNS 失败（`curl: (6)`）和 12 秒延迟 |
+| 4 | `https://ghproxy.net/` | 公共（实测多次 15 秒超时，只作为最后兜底） |
 
-也可以用**直连**（不加前缀）：`https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh`。直连 Release 资产比 raw 文件稳，但实测会偶发 DNS 失败（`curl: (6)`）和 12 秒延迟，所以引导器把它排在 gh-proxy 之后。
+手写地址时的完整形式：
+
+```sh
+# 自建站（默认首选）
+https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+
+# 公共加速站（默认兜底）
+https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh
+```
+
+想让引导器只走某一个源：`CT_SOURCE=mus`（自建站）、`CT_SOURCE=gh-proxy`、`CT_SOURCE=direct`（直连）、`CT_SOURCE=ghproxy`，也可以直接给一个自定义前缀。
 
 > **一定要带 `-L`**（或 `--location`）。`releases/latest/download/` 会先返回 302 跳到具体 tag 的地址，不带 `-L` 时 `curl -f` 会把它当失败（`curl: (22)`）。
 >
-> 加速源对 Release 资产**偶发** `403` / `522`（实测同一地址几分钟前 403、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。引导器对每个源默认试 2 次（`CT_TRIES`），并在探测失败时回退到本地缓存。
+> 加速源对 Release 资产**偶发** `403` / `522` / 超时（实测同一地址几分钟前失败、几分钟后 200）。这是加速源侧的抖动，不是地址写错——重试一次通常就好。引导器对每个源默认试 2 次（`CT_TRIES`），并在探测失败时回退到本地缓存。
 >
 > `cdn.jsdelivr.net` **不要用于本仓库**：实测它返回的是缓存旧版本（`@main` 拿到过 `VERSION=6.0.0` 的历史内容）。jsdelivr 适合固定 tag 的静态文件，不适合「跟最新发布版」的场景。
+
+### 探测远端版本会取多少字节
+
+引导器为了少下载流量，探测版本号时只取文件头一段（`Range` 请求）。这个窗口是 `--ct-probe-bytes` / `CT_PROBE_BYTES`（默认 16KB）。
+
+> **踩过的坑**：早先这个窗口固定是 4KB，而 `VERSION=` 那一行会随着脚本头部注释变长往下挪（某一版已经挪到第 4012 字节）。窗口一盖不到，探测就静默失败——日志里只会看到 `WARN 探测远端版本失败（网络问题）`，可网络其实好得很。
+>
+> 现在窗口放大到 16KB，而且**探不到版本号时会自动把整个文件取下来再解析一次**。所以只要网络通，探测就不会再因为版本行下移而失败。
+>
+> 看到「探测远端版本失败」时，先看它上面那行 `探测远端版本：<URL>`——那行告诉你当时试的是哪个源、哪个地址。
 
 ## 4. 退出码
 
@@ -256,7 +279,7 @@ wait
 ### 怎么用
 
 ```sh
-curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
   -o /tmp/ct-stale-lock-check.sh
 sh /tmp/ct-stale-lock-check.sh
 ```

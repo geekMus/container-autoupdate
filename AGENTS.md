@@ -276,16 +276,21 @@ docker compose up -d --force-recreate        # 让容器真的回到旧镜像
 - **缓存文件必须四道校验后才能执行**：`sh -n` 语法 + `file_version` 能解析出 `VERSION` + 含特征串 `container-autoupdate` + 字节数 > 1000。
   只做 `sh -n` 是不够的：`garbage` 这种一行垃圾也能通过 `sh -n`，然后被当成脚本执行（实测报 `line 1: garbage: not found`，rc=127）。
 - **`sed` 的捕获组必须写成 `\(...\)`**，不是 `(...)`。曾漏了反斜杠导致版本号恒为空，连带让上面的坏包校验全部失效。
-- **探测只用 Range 取前 4KB**（`curl -r 0-4000`），不要为此下载整个文件。`VERSION` 在文件第 53 行，4KB 足够。
+- **探测只取文件头一段（`curl -r 0-<PROBE_BYTES>`），不要为此下载整个文件。**
+  - `PROBE_BYTES` 默认 16000（`CT_PROBE_BYTES` / `--ct-probe-bytes` 可调）。
+  - **窗口必须能盖住 `VERSION=` 那一行。** 这一行会随着脚本头部注释变长而下移：实测 v1.1.0/v1.1.1 在第 3305 字节，v1.1.2 已经挪到第 **4012** 字节 —— 早先固定的 4KB 窗口就此盖不到，探测静默失败，日志里只显示 `WARN 探测远端版本失败（网络问题）`，可网络其实好得很。
+  - **Range 成功但没解析出版本号时，要把整个文件取下来再解析一次**（兜底）。Range 本身失败就不要浪费一次完整下载，直接换下一个源。
   - 不要用 `HEAD` 读 302 的 `Location`：直连要 12 秒，代理根本不返回 `Location`。
   - 不要用 `api.github.com/releases/latest`：会限流（`API rate limit exceeded`）。
-- **默认源顺序是 `gh-proxy.com` → 直连 → `ghproxy.net`**，依据是实测：
+- **默认源顺序是 `github.mus.pp.ua`（自建）→ `gh-proxy.com` → 直连 `github.com` → `ghproxy.net`**，依据是实测（2026-11-03，N1 dpanel 容器内）：
   | 源 | Range 探测 | 完整下载 |
   |---|---|---|
-  | `gh-proxy.com` | 1~2s，3/3 成功 | 1s |
+  | `github.mus.pp.ua` | 成功时 4~7s，**5 次里成功 3 次**（失败是 40s 超时） | 内容正确，偶发超时 |
+  | `gh-proxy.com` | **5/5 成功，平均 1s** | 1s |
   | 直连 `github.com` | 1s，但 3 次中 1 次 DNS 失败 | 不稳 |
   | `ghproxy.net` | **3/3 全部 15s 超时** | — |
-- **自建源 `github.mus.pp.ua` 不进默认列表。** 实测 8 次里 Range 成功 5 次、下载成功 4 次，平均 12~20s；根因是它把请求转给 GitHub **网页前端**（响应头 `content-type: text/html` + `set-cookie`），不是直转 Release 资产。它内容正确（sha256 与官方一致），使用者可用 `CT_SOURCE` 自行接入，但不该是默认。
+  - 早先「自建源把请求转给 GitHub 网页前端、不是直转 Release 资产」这一结论**已被实测推翻**：自建站两种 URL 形式（长形式 `https://github.mus.pp.ua/https://github.com/...`、短形式 `https://github.mus.pp.ua/<owner>/<repo>/...`）都能正确直转 Release 资产（`content-type: application/octet-stream`，sha256 与官方一致）。它只是**偶发超时**，所以放第一位（快、且是自己控制的），公共站兜底。
+  - 长形式与短形式在不同环境里快慢正好相反（宿主长形式超时短形式快，容器内反过来），所以两种形式都要能用，不能只押一种。
 - **固定版本模式（`--ct-version` / `CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。引导器自己的开关用 `--ct-*`（命令行优先于同名 `CT_*` 环境变量），其余参数原样透传给主脚本。
 - **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh` 和 `ct-bootstrap.sh` 两个资产；少传一个，`releases/latest/download/ct-bootstrap.sh` 就是 404。
 
@@ -389,7 +394,8 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 引导器把一行垃圾当成脚本执行 | 只用 `sh -n` 校验，垃圾也能过语法 | 四道校验：`sh -n` + 能解析 `VERSION` + 特征串 + 字节数 > 1000 |
 | 引导器版本号恒为空 | `sed` 捕获组写成 `(...)` 而非 `\(...\)` | 改回 `\(...\)` |
 | 引导器探测失败却 rc=0 | 把「探测失败」当成「没有新版本」 | 只能回退到合格缓存或 `die` |
-| 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | `gh-proxy.com` 优先；API 会限流 |
+| 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | 自建站 `github.mus.pp.ua` 优先、公共站 `gh-proxy.com` 兜底；API 会限流 |
+| 引导器「探测远端版本失败（网络问题）」但网络其实正常 | 探测窗口没盖住 `VERSION=` 那行（它会随脚本变长下移） | 窗口放大到 16KB；Range 成功却没解析出版本号时，把整文件取下来再解析一次 |
 | `releases/latest/download/ct-bootstrap.sh` 404 | Release 只传了主脚本 | 两个资产都要传 |
 
 ---
@@ -410,6 +416,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 下载地址是 `releases/...`，带 `-L`，没用 jsdelivr
 - [ ] 四个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
 - [ ] 改了 `ct-bootstrap.sh` → 引导器 10 个场景（固定版本 / 命中缓存 / 有新版本 / 网络故障有缓存 / 无缓存 / 坏包 / 参数透传 / 缓存裁剪 / 强制更新）已复跑
+- [ ] 改了探测窗口或脚本头部注释 → 确认 `VERSION=` 那一行仍落在探测窗口内（`grep -b -m1 '^VERSION=' container-autoupdate.sh` 看字节偏移），并复跑「窗口盖不到时整文件兜底」这一场景
 - [ ] 推送后做了 §9.3 的三方 sha1 核对
 - [ ] 改了用户文档 → 对应英文副本已同步（§8.6）
 - [ ] 每份用户文档的 H1 正下方有语言切换条，中英互指

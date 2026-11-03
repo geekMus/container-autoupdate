@@ -196,7 +196,7 @@ echo ""
 echo "**生产环境推荐用引导器**（自带缓存，不必每轮联网；锁版本时完全不联网）："
 echo ""
 echo '```sh'
-echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
+echo "curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
 echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
 echo "/usr/local/bin/ct-bootstrap.sh --ct-version $VERSION --compose myapp   # 锁到本版"
 echo '```'
@@ -209,12 +209,12 @@ echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
 echo '```'
 echo ""
 echo "> \`-L\` 不能省：\`releases/latest/download/\` 会返回 302 跳转。"
-echo "> 国内网络可用前缀 \`https://gh-proxy.com/\`（实测最稳）或 \`https://ghproxy.net/\`。"
+echo "> 国内网络可用前缀 \`https://github.mus.pp.ua/\`（自建站，默认首选）或 \`https://gh-proxy.com/\`（公共站，兜底）。"
 echo ""
 echo "排查残留进程和旧锁文件（只读脚本，不改任何东西）："
 echo ""
 echo '```sh'
-echo "curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \\"
+echo "curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \\"
 echo "  -o /tmp/ct-stale-lock-check.sh"
 echo "sh /tmp/ct-stale-lock-check.sh"
 echo '```'

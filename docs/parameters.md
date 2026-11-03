@@ -58,9 +58,10 @@ Docker 端还需要 **Compose v2 插件**（`docker compose`，不是老的 `doc
 | `--ct-version <版本>` | `CT_VERSION` | 空 | **设了就是固定版本模式**（如 `1.2.3`，带不带 `v` 前缀都行）：不探测远端，本地有就直接跑，**完全不联网**。生产环境推荐设，版本号见 Releases 页面。 |
 | `--ct-cache-dir <目录>` | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | 脚本缓存目录。容器内跑要挂载可写目录，或改到 `/tmp`。 |
 | `--ct-cache-keep <N>` | `CT_CACHE_KEEP` | `3` | 保留几个历史版本文件，超出的删掉。设 `0` 表示不裁剪。 |
-| `--ct-source <源>` | `CT_SOURCE` | `auto` | 下载源：`auto`（gh-proxy → 直连 → ghproxy.net）、`direct`、`gh-proxy`、`ghproxy`，或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |
+| `--ct-source <源>` | `CT_SOURCE` | `auto` | 下载源：`auto`（**自建站 → gh-proxy → 直连 → ghproxy.net**）、`direct`、`gh-proxy`、`ghproxy`、`mus`（自建站），或任意自定义前缀（会拼在 `https://github.com/...` 前面）。 |
 | `--ct-t-net <秒>` | `CT_T_NET` | `20` | 单次网络操作超时（秒）。探测和下载各自适用。 |
 | `--ct-tries <N>` | `CT_TRIES` | `2` | 每个源尝试几次。 |
+| `--ct-probe-bytes <N>` | `CT_PROBE_BYTES` | `16000` | 探测版本号时取文件头多少字节（`Range` 请求）。**别调小**：版本行会随着脚本变长而下移，窗口盖不到就会探不到版本号（表现为「探测远端版本失败」）。探不到时引导器会自动把整个文件取下来再解析一次。 |
 | `--ct-force` | `CT_FORCE=1` | 关 | 忽略缓存强制重新下载。 |
 | `--ct-quiet` | `CT_QUIET=1` | 关 | 不打印引导器自己的日志（主脚本日志照旧）。 |
 | `--ct-help` | — | — | 显示引导器帮助。 |
@@ -82,15 +83,15 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 |---|---|
 | 已设固定版本（`--ct-version` / `CT_VERSION`）+ 本地有该版本 | 直接执行，**零网络请求** |
 | 已设固定版本 + 本地没有 | 下载该版本后执行（只试固定 tag，不会拿 latest） |
-| 未设固定版本 + 探测到版本且本地已有 | 只发一次 4KB Range 请求，不下载 |
-| 未设固定版本 + 探测到新版本 | 下载 64KB 并缓存，然后执行 |
+| 未设固定版本 + 探测到版本且本地已有 | 只发一次 Range 请求（默认取文件头 16KB），不下载 |
+| 未设固定版本 + 探测到新版本 | 下载完整文件并缓存，然后执行 |
 | 探测失败 + 本地有可用缓存 | 用缓存执行，打 `WARN`（退出码取决于主脚本） |
 | 探测失败 + 本地无缓存 | `ERR`，退出码 `1`（**不会静默成功**） |
 | 缓存文件损坏 | 自动重新下载（校验：语法 + `VERSION` 字段 + 特征字符串） |
 
-> 为什么默认源是 `gh-proxy.com` 而不是直连：实测（2026-11-01）直连 `github.com`
-> 偶发 DNS 失败与 12 秒延迟，`gh-proxy.com` 稳定 1~2 秒；`ghproxy.net` 已连续超时不可用。
-> 想直连就设 `--ct-source direct` 或 `CT_SOURCE=direct`。
+> 为什么默认源不是直连：实测（2026-11-03，N1 dpanel 容器内）自建站 `github.mus.pp.ua` 与公共站 `gh-proxy.com` 都能正确转 Release 资产（sha256 与官方一致），但自建站偶发 40 秒超时（5 次成功 3 次），`gh-proxy.com` 5 次全成功、约 1 秒。默认顺序是**自建站优先（快、且是自己控制的），公共站兜底**，再直连、最后 `ghproxy.net`。
+>
+> 想只用某一个源就设 `--ct-source mus` / `--ct-source gh-proxy` / `--ct-source direct` / `--ct-source ghproxy`，也可以用 `CT_SOURCE=` 写同样的值。
 
 
 ## 全部命令行参数

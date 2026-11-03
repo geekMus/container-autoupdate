@@ -26,13 +26,15 @@ Create a scheduled task and paste **two lines** into the script box:
 ```sh
 # The bootstrapper caches the script itself: the first run downloads it,
 # later runs reuse the cached copy of the same version without going online
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /tmp/ct-bootstrap.sh
 sh /tmp/ct-bootstrap.sh --compose myapp
 ```
 
 For a plain container, replace the last part with `--container mycontainer`.
 
+> The `https://github.mus.pp.ua/` prefix in the download URL is a self-hosted acceleration prefix; drop it to connect to GitHub directly. If that prefix is down, use `https://gh-proxy.com/` instead — the bootstrapper itself tries the sources in the order "self-hosted → gh-proxy → direct".
+>
 > Set the execution timeout to **≥ 600 seconds**.
 >
 > **Why `curl ... | sh` is not recommended**: with a pipe, a failed download **silently succeeds** (the task log gives no hint that the round did not run). The bootstrapper writes the download to a file, verifies it, and only then executes it; on failure it returns a non-zero exit code explicitly.
@@ -44,7 +46,7 @@ For a plain container, replace the last part with `--container mycontainer`.
 To check once in a while, just run it (it ends when it is done, nothing stays resident). The bootstrapper has to be written to disk once:
 
 ```sh
-curl -fsSL https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
+curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
   -o /tmp/ct-bootstrap.sh
 sh /tmp/ct-bootstrap.sh --compose myapp
 ```
@@ -56,8 +58,8 @@ sh /tmp/ct-bootstrap.sh --compose myapp
 | Mode | Behaviour | Network cost |
 |---|---|---|
 | Pinned version (`--ct-version <version>` / `CT_VERSION`) | Runs the local copy if present | **Zero** (never goes online) |
-| `latest` (default), local copy is current | Only probes the remote version number, does not download | One 4KB Range request (about 1 second) |
-| `latest`, remote has a new version | Downloads the new version, caches it, then executes it | One probe + one full download (about 70KB) |
+| `latest` (default), local copy is current | Only probes the remote version number, does not download | One Range request (fetches the head of the file, 16KB; about 1 second) |
+| `latest`, remote has a new version | Downloads the new version, caches it, then executes it | One probe + one full download (about 80KB) |
 | Probe failed but a local cache exists | Runs from the cache and prints a `WARN` | Zero |
 | Probe failed and no cache exists | **Fails loudly** (never a silent success) | Zero |
 
@@ -136,7 +138,7 @@ The repository ships a **read-only** investigation script: it only lists the pro
 changes nothing and kills nothing, and ends with copy-pasteable cleanup commands for you to run after confirming.
 
 ```sh
-curl -fsSL -L https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
+curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-stale-lock-check.sh \
   -o /tmp/ct-stale-lock-check.sh
 sh /tmp/ct-stale-lock-check.sh
 ```

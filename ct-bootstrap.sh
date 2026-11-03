@@ -17,14 +17,17 @@
 #   ct-bootstrap.sh --ct-version 1.2.3 --ct-source direct -- --compose myapp --dry-run
 #
 # 设计取舍：
-#   - 探测用 Range 读文件头里的 VERSION：只取前 4KB，几乎零流量。
+#   - 探测用 Range 读文件头里的 VERSION：只取前一小段，几乎零流量。
+#     窗口大小见 PROBE_BYTES；探不到就整文件取一次兜底，绝不因为版本行下移而失效。
 #     探测失败**不阻断**：本地有缓存就继续用，只打 WARN。
 #   - 下载必须落地到临时文件再执行。管道写法（curl | sh）会把下载失败吞成 rc=0。
 #   - 缓存按版本分文件，只保留最近 CACHE_KEEP 个。
 #   - 下载后要真正校验（语法 + 版本号 + 特征字符串），否则半截文件会被当脚本跑。
+#   - 默认源顺序：自建站 github.mus.pp.ua 优先，公共站 gh-proxy.com 兜底，
+#     再直连 github.com，最后 ghproxy.net。哪个源失败就换下一个。
 # =============================================================================
 
-BOOT_VERSION="2"
+BOOT_VERSION="3"
 
 REPO="geekMus/container-autoupdate"
 ASSET="container-autoupdate.sh"
@@ -32,10 +35,11 @@ ASSET="container-autoupdate.sh"
 # ---- 可覆盖的配置（环境变量作默认；下面命令行可覆盖）----
 CACHE_DIR="${CT_CACHE_DIR:-/var/cache/container-autoupdate}"
 PIN_VERSION="${CT_VERSION:-}"     # 非空 = 固定版本模式（如 1.2.3 或 v1.2.3）
-SOURCE="${CT_SOURCE:-auto}"       # auto | direct | gh-proxy | ghproxy | 自定义前缀
+SOURCE="${CT_SOURCE:-auto}"       # auto | direct | gh-proxy | ghproxy | mus | 自定义前缀
 CACHE_KEEP="${CT_CACHE_KEEP:-3}"  # 保留几个历史版本
 T_NET="${CT_T_NET:-20}"           # 单次网络超时（秒）
 TRIES="${CT_TRIES:-2}"            # 每个源尝试次数
+PROBE_BYTES="${CT_PROBE_BYTES:-16000}"  # 探测时取文件头多少字节（找 VERSION 行）
 FORCE_UPDATE="${CT_FORCE:-0}"     # 1 = 忽略缓存强制重新下载
 QUIET="${CT_QUIET:-0}"
 
@@ -50,9 +54,10 @@ boot_usage() {
   --ct-version <版本>     固定版本模式（如 1.2.3；带不带 v 都行）。本地有则零联网
   --ct-cache-dir <目录>   缓存目录（默认 /var/cache/container-autoupdate）
   --ct-cache-keep <N>     保留几个历史版本（默认 3；0 = 不裁剪）
-  --ct-source <源>        auto | direct | gh-proxy | ghproxy | 自定义前缀（默认 auto）
+  --ct-source <源>        auto | direct | gh-proxy | ghproxy | mus | 自定义前缀（默认 auto）
   --ct-t-net <秒>         单次网络超时（默认 20）
   --ct-tries <N>          每个源尝试次数（默认 2）
+  --ct-probe-bytes <N>    探测时取文件头多少字节找版本号（默认 16000）
   --ct-force              忽略缓存强制重新下载
   --ct-quiet              不打印引导器日志（主脚本日志照旧）
   --ct-help               显示本帮助
@@ -64,21 +69,27 @@ boot_usage() {
   ct-bootstrap.sh --compose myapp
   ct-bootstrap.sh --ct-version 1.2.3 --compose myapp --dry-run
   CT_SOURCE=direct ct-bootstrap.sh --ct-version 1.2.3 -- --compose myapp
+  CT_SOURCE=mus ct-bootstrap.sh --ct-version 1.2.3 -- --compose myapp
 BOOT_USAGE
 }
 
 # ---- 候选源基址（每行一个，按优先级）----
-# 实测（N1 dpanel 容器内，2026-11-01）：
-#   gh-proxy.com  ：Range 4KB 1~2s，完整下载 64KB 1s，稳定
-#   github.com    ：直连不稳（偶发 DNS rc=6），HEAD 要 12s，Range 偶发失败
-#   ghproxy.net   ：连续 3 次 15s 超时，已不可用
-# 所以默认顺序是 gh-proxy 优先、直连兜底。
+# 实测（2026-11-03，N1 dpanel 容器内）：
+#   github.mus.pp.ua：自建站。Range 探测与完整下载都正确转 Release 资产
+#                     （sha256 与官方一致），但偶发 40 秒超时：5 次里成功 3 次。
+#   gh-proxy.com    ：公共站。5 次全成功，平均 1 秒，最稳。
+#   github.com      ：直连。偶发 DNS rc=6，HEAD 要 12 秒。
+#   ghproxy.net     ：连续 15s 超时，已不可用。
+# 所以默认顺序是：自建站优先（快、且是自己控制的），公共站兜底，
+# 再直连、最后 ghproxy.net。哪个源先失败就换下一个。
 base_urls() {
   case "$SOURCE" in
     direct)   echo "https://github.com/$REPO" ;;
     gh-proxy) echo "https://gh-proxy.com/https://github.com/$REPO" ;;
     ghproxy)  echo "https://ghproxy.net/https://github.com/$REPO" ;;
+    mus)      echo "https://github.mus.pp.ua/https://github.com/$REPO" ;;
     auto)
+      echo "https://github.mus.pp.ua/https://github.com/$REPO"
       echo "https://gh-proxy.com/https://github.com/$REPO"
       echo "https://github.com/$REPO"
       echo "https://ghproxy.net/https://github.com/$REPO"
@@ -121,24 +132,45 @@ verify_file() {
 }
 
 # ---- 探测 latest 版本 ----
-# 实测结论（2026-11-01，N1 dpanel 容器内）：
+# 实测结论（2026-11-03，N1 dpanel 容器内）：
 #   - HEAD 读 302 Location：只有直连 github.com 能给 Location，但要 12 秒，太慢；
 #     代理（gh-proxy）对 HEAD 不返回 Location，拿不到 tag。
-#   - Range 0-4000 + 读文件里的 VERSION：代理上稳定 1~2 秒，且拿到的是**真实版本号**，
+#   - Range + 读文件里的 VERSION：代理上稳定 1~2 秒，且拿到的是**真实版本号**，
 #     比解析 URL 更可信。所以统一用 Range。
-#   - 完整下载只要 1 秒（64KB），所以探测的价值不在省时间，而在「本地同版本就不下载」。
+#
+#   ★ 窗口大小踩过的坑：早先固定用 Range 0-4000，而 VERSION 行会随着脚本头部
+#     注释变长而下移（v1.1.2 时已经落到第 4012 字节）。窗口一盖不到，
+#     探测就静默失败——日志里只会看到「WARN 探测远端版本失败」，而网络其实没问题。
+#     现在：窗口放大到 PROBE_BYTES（默认 16KB，仍是小流量）；**每个源只补一次**
+#     整文件（只在窗口失效时才付这个流量，且不随重试次数重复）。
+#
 # 返回：把版本号（如 1.2.3，不含 v）打到 stdout；全部失败返回非 0。
 probe_latest_version() {
   for _pb in $(base_urls); do
     _pu=$(url_for "$_pb" "")
     _ptry=1
     while [ "$_ptry" -le "$TRIES" ]; do
-      _ppart=$(curl -fsSL --max-time "$T_NET" -r 0-4000 "$_pu" 2>/dev/null)
+      # 只在每个源的第一次尝试时打印一次源地址：
+      # 源超时是排查时最需要的信息，但不必每轮刷屏。
+      [ "$_ptry" = "1" ] && log "探测远端版本：$_pu"
+      # 第一步：只取头部一段
+      _ppart=$(curl -fsSL --max-time "$T_NET" -r "0-$PROBE_BYTES" "$_pu" 2>/dev/null)
       if [ -n "$_ppart" ]; then
         _pv=$(printf '%s\n' "$_ppart" | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -n1)
         if [ -n "$_pv" ]; then
           echo "$_pv"
           return 0
+        fi
+        # 第二步：头部拿到了但没盖到版本行 → 整文件取一次再解析。
+        # 只在「Range 请求成功」时才做这次补救：Range 本身就失败（超时/网络断）
+        # 时再花一次完整下载的代价不划算，直接换下一个源更快。
+        _pfull=$(curl -fsSL --max-time "$((T_NET * 3))" "$_pu" 2>/dev/null)
+        if [ -n "$_pfull" ]; then
+          _pv=$(printf '%s\n' "$_pfull" | sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -n1)
+          if [ -n "$_pv" ]; then
+            echo "$_pv"
+            return 0
+          fi
         fi
       fi
       _ptry=$((_ptry + 1))
@@ -202,6 +234,9 @@ while [ "$#" -gt 0 ]; do
     --ct-tries)
       [ "$#" -ge 2 ] || die "--ct-tries 缺少参数"
       TRIES="$2"; shift 2 ;;
+    --ct-probe-bytes)
+      [ "$#" -ge 2 ] || die "--ct-probe-bytes 缺少参数"
+      PROBE_BYTES="$2"; shift 2 ;;
     --ct-force)
       FORCE_UPDATE=1; shift ;;
     --ct-quiet)
