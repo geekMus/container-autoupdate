@@ -81,7 +81,7 @@ COMPAT_ROOT="${COMPAT_ROOT:-/tmp/.container-autoupdate/compat}"  # 跨版本提�
 COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到这个版本」
 
 START=$(date +%s)
-VERSION="2.1.0"
+VERSION="3.0.0"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -174,6 +174,9 @@ BREAKING_TABLE='
 2.0.0|env|PLAIN_BOOT|删除这个环境变量|无 healthcheck 容器的观察已交由 DPanel
 2.0.0|env|COMPOSE_BASE|删除这个环境变量|不再需要从容器标签反查 Compose 目录的基路径（反查用 compose 自己写在容器上的标签）
 2.1.0|behavior|Compose 更新交给 DPanel 的 compose:deploy|Compose 项目改用 docker compose pull + up -d 就地重新部署|2.1.0 起 Compose 模式不再依赖 DPanel 的 compose:deploy：不需要项目先在 DPanel 里登记，也不用管 --pull-image；容器模式仍然交给 DPanel
+3.0.0|behavior|先用引导器 ct-bootstrap.sh 下载主脚本再执行|DPanel 计划任务里直接下载主脚本并执行|3.0.0 起不再发布引导器：计划任务自己下载 container-autoupdate.sh、校验通过才执行；想锁版本就用带 tag 的下载地址
+3.0.0|flag|--ct-version|删除这个参数|3.0.0 起引导器已取消，全部 --ct-* 参数一并作废：锁版本请把下载地址换成 releases/download/vX.Y.Z/container-autoupdate.sh
+3.0.0|env|CT_VERSION|删除这个环境变量|3.0.0 起引导器已取消，全部 CT_* 环境变量一并作废；锁版本改用带 tag 的下载地址
 '
 # ==================== 登记表结束 ===========================================
 
@@ -261,6 +264,23 @@ compat_removed_env() {
 $_rows
 EOF
   return 0
+}
+
+# 引导器（ct-bootstrap.sh）在 3.0.0 被取消，它的 9 个 CT_* 变量一并作废。
+# 单独处理而不是往 BREAKING_TABLE 里塞 9 行：用户看到的应该是同一条迁移说明。
+compat_bootstrap_env() {
+  _found=""
+  for _n in CT_VERSION CT_CACHE_DIR CT_CACHE_KEEP CT_FORCE CT_PROBE_BYTES CT_QUIET CT_SOURCE CT_T_NET CT_TRIES; do
+    eval "_cur=\${$_n:-}"
+    [ -n "$_cur" ] && _found="${_found:+$_found }$_n=$_cur"
+  done
+  [ -n "$_found" ] || return 0
+  log "ERR 这些环境变量已经不能用了：$_found"
+  log "    从 v3.0.0 起：引导器 ct-bootstrap.sh 已取消（连同 CT_* 变量一起作废）"
+  log "    原因：更新改成在 DPanel 计划任务里直接下载主脚本并执行，不再有引导器这一层"
+  log "    迁移方式：把计划任务换成 README 里那段「下载 → 校验 → 执行」的命令；想锁版本就把下载地址换成带 tag 的路径"
+  log "    本次未做任何改动，退出码 3"
+  exit 3
 }
 
 # --compat <版本>：用户声明「我只验证到这个版本」。
@@ -453,16 +473,22 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   # Compose 项目的目录通常是自动认出来的；要显式指定也可以：
   container-autoupdate.sh --compose myapp --compose-dir /opt/myapp
 
-  # 直接跑远程脚本，跟随最新发布版（地址不含版本号，粘贴即用）
-  # 先落地再执行：`curl ... | sh` 会把下载失败的退出码吞掉，出问题时看不到原因。
-  _t=$(mktemp)
-  curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh -o "$_t" \
-    && sh "$_t" --compose myapp
-  rm -f "$_t"
+  # 推荐：整段填进 DPanel 计划任务的「脚本」框（v3.0.0 起没有引导器了）
+  #   下载 → 校验 → 通过才替换 → 执行；下载失败时沿用上一轮的副本，照样能跑。
+  U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+  U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+  T=/tmp/ct-new.sh
+  curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
+  if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
+     && grep -q container-autoupdate "$T"; then
+    mv -f "$T" /tmp/container-autoupdate.sh
+  fi
+  [ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+  sh /tmp/container-autoupdate.sh --compose myapp
 
-  # 生产环境想锁死版本：把上面的 latest/download 换成带版本号的路径
-  # releases/download/v2.1.0/container-autoupdate.sh
-  # -L 不能省：latest/download 会返回 302 跳转。
+  # 想锁死版本：把上面两个地址里的 latest/download 换成带版本号的路径
+  # releases/download/v3.0.0/container-autoupdate.sh
+  # 不需要 -L：那三个地址都不是 302；用 latest/download 时 curl -L 也不会出错。
 USAGE
 }
 
@@ -494,6 +520,12 @@ parse_args() {
       --dry-run)      DRY_RUN=1; shift ;;
       -h|--help)      usage; exit 0 ;;
       -V|--version)   echo "$VERSION"; exit 0 ;;
+      --ct-*)         log "ERR 这个参数已经不能用了：$1"
+                      log "    从 v3.0.0 起：引导器 ct-bootstrap.sh 已取消，全部 --ct-* 参数一并作废"
+                      log "    原因：更新改成在 DPanel 计划任务里直接下载主脚本并执行，不再有引导器这一层"
+                      log "    迁移方式：把计划任务换成 README 里那段「下载 → 校验 → 执行」的命令；想锁版本就用带 tag 的下载地址"
+                      log "    本次未做任何改动，退出码 3"
+                      exit 3 ;;
       *)              compat_removed_flag "$1"
                       echo "ERR 未知参数：$1（用 --help 查看用法）" >&"$ERR_FD"; exit 1 ;;
     esac
@@ -545,12 +577,13 @@ jp_val() {
 }
 
 # DPanel 的失败一律体现在 JSON 里，不能看退出码：
-# `compose:deploy` 对未登记的项目会返回 rc=0 但 JSON 是 {"code":500,...}（实测）。
+# 容器不存在时 `container:upgrade` 会返回 rc=0 但 JSON 是 {"code":500,...}（实测）。
 # 真机实测到的形状（DPanel 1.11.2）：
 #   成功 —— 容器检查 {"upgrade":..,"status":"latest"|"upgrade"}；
-#           容器升级 {"containerId":"..."}；
-#           Compose 部署 {"name":"项目名"} —— 注意成功时**没有 code 字段**；
+#           容器升级 {"containerId":"..."} —— 两者都**没有 code 字段**；
 #   失败 —— {"code":500,"error":"url: /dpanel/api/..."}。
+# （历史：v2.0.0 时 Compose 也交给 DPanel，`compose:deploy` 对未登记的项目同样是
+#   rc=0 + {"code":500,...}，成功形状是 {"name":"项目名"}、没有 code。规则一致。）
 # 所以判定必须是「code >= 400 或 status=failed 或有 error 文本才算失败」，
 # 绝不能写成「code 不等于 200 就是失败」——那会把没有 code 的成功当失败。
 dp_failed() {
@@ -933,6 +966,9 @@ log "container-autoupdate v$VERSION 启动"
 # 这两步必须放在 check_deps 之前：调用方式已经失效时，要给出迁移说明，
 # 而不是先抱怨「找不到 docker / 找不到 DPanel CLI」——那会把用户引向
 # 完全无关的排查方向。
+# 引导器的 CT_* 排在最前面：它们要的是一条「改用新安装方式」的说明，
+# 而不是逐变量的「删掉即可」（CT_VERSION 在登记表里也有一行，仅作备案）。
+compat_bootstrap_env
 compat_removed_env
 compat_gate
 

@@ -35,11 +35,13 @@
    | 找上一个发布 tag | 取「比当前版本小的最大者」，用 awk 比三段数字（不依赖 `sort -V`） |
    | 生成发布说明 | `scripts/gen-release-notes.sh` → 定位句 + 本版破坏性变更 + 提交列表 + 下载命令 + sha256 |
    | 打 tag | tag `vx.y.z` 不存在就创建（annotated，**消息就是发布说明**） |
-   | 发布 Release | 不存在就创建，用发布说明作正文，**同时上传三个资产**：`container-autoupdate.sh`、`ct-bootstrap.sh` 与 `scripts/ct-stale-lock-check.sh` |
+   | 发布 Release | 不存在就创建，用发布说明作正文，**同时上传两个资产**：`container-autoupdate.sh` 与 `scripts/ct-stale-lock-check.sh` |
 
-   完成后，`releases/latest/download/container-autoupdate.sh`、`.../ct-bootstrap.sh` 和 `.../ct-stale-lock-check.sh` 都指向新版本。
+   完成后，`releases/latest/download/container-autoupdate.sh` 和 `.../ct-stale-lock-check.sh` 都指向新版本。
 
-   > 三个资产都要传。少传一个，对应的 `releases/latest/download/...` 就是 404。
+   > 两个资产都要传。少传一个，对应的 `releases/latest/download/...` 就是 404。
+
+   > v3.0.0 起不再有引导器 `ct-bootstrap.sh`：工作流里有一道 `test ! -e ct-bootstrap.sh` 守卫，仓库里一旦又冒出这个文件就会失败。
 
    > 发布说明是自动生成的，不用人工写；`git show vx.y.z` 也能看到改了什么（tag 消息即发布说明）。
 

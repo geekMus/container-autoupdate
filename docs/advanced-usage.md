@@ -12,20 +12,25 @@
 
 ## 1. DPanel 计划任务
 
-### 脚本框里写两行
+### 脚本框里写一段
 
-新建计划任务，脚本框里填**两行**：
+新建计划任务，脚本框里填**一段**（v3.0.0 起没有引导器，下载、校验、执行都在这里）：
 
 ```sh
-# 第一行：把引导器落到本地（自带缓存，同版本不重复下载）
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-# 第二行：跑一轮。--compose 换成你的项目名；普通容器写 --container <容器名>
-sh /tmp/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+T=/tmp/ct-new.sh
+curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
+if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
+   && grep -q container-autoupdate "$T"; then
+  mv -f "$T" /tmp/container-autoupdate.sh
+fi
+[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
-- 不要写成 `curl ... | sh`：管道写法在下载失败时会**静默成功**（任务日志里看不出这一轮没跑成）。引导器先落地、校验通过才执行，失败时明确返回非 0。
-- 生产环境想锁死版本：给引导器加 `--ct-version <版本号>`（或设 `CT_VERSION`；版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、完全不联网。引导器的全部开关见 [参数文档](parameters.md)。
+- 不要写成 `curl ... | sh`：管道写法在下载失败时会**静默成功**（任务日志里看不出这一轮没跑成）。上面那段把下载落到临时文件、三道校验通过才覆盖、失败时明确返回非 0；下载失败还会**沿用上一轮的副本**继续跑。
+- 生产环境想锁死版本：把两个地址里的 `latest/download` 换成 `download/v3.0.0`（版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）。
 - 两种模式的对应关系：
 
 | 你的容器是怎么起的 | 用哪个参数 | 脚本实际执行 |
@@ -63,7 +68,7 @@ DPanel 计划任务在**失败时只保留 stderr**（成功时只保留 stdout�
 允许，但那只是**单次运行**：
 
 ```sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+docker exec -it dpanel sh -c 'curl -fsSL --max-time 60 https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh -o /tmp/container-autoupdate.sh && sh /tmp/container-autoupdate.sh --compose myapp'
 ```
 
 ### 不推荐 cron / systemd timer
@@ -265,7 +270,7 @@ container-autoupdate.sh --compose myapp --compat 1.2.3
 迁移前后各做一次：
 
 1. **迁移前**：把计划任务的「脚本 / 环境变量」里所有作废项逐个删掉（对着上面的表核一遍）。
-2. **迁移后**：手动跑一轮 `sh /tmp/ct-bootstrap.sh --compose myapp --dry-run` 确认脚本认到的目标与项目目录是对的，再去掉 `--dry-run`。
+2. **迁移后**：手动跑一轮 `docker exec -it dpanel sh -c 'sh /tmp/container-autoupdate.sh --compose myapp --dry-run'` 确认脚本认到的目标与项目目录是对的，再去掉 `--dry-run`。
 
 ### `LOCK_PREFIX` 仍会命中中止
 
@@ -276,7 +281,7 @@ container-autoupdate.sh --compose myapp --compat 1.2.3
 | 参数 | 环境变量 | 默认 | 说明 |
 |---|---|---|---|
 | `--compose-dir <路径>` | `COMPOSE_DIR` | 空 | Compose 项目目录；反查不到时兜底（v2.1.0 恢复） |
-| `--dpanel-container <名字>` | `DPANEL_NAME` | `dpanel` | DPanel 所在容器名（只在「不在 dpanel 容器内跑」时用到） |
+| `--dpanel-container <名字>` | `DPANEL_NAME` | `dpanel` | DPanel 所在容器名；只在调试时（不在 dpanel 容器内跑）用到 |
 | `--dpanel-bin <路径>` | `DPANEL_BIN` | `/app/server/dpanel` | DPanel CLI 路径 |
 | `--dpanel-docker-env <名字>` | `DPANEL_DOCKER_ENV` | `local` | 传给 DPanel CLI 的 `--docker-env` |
 

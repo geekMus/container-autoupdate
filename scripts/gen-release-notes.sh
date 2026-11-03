@@ -191,25 +191,46 @@ else
 fi
 echo ""
 
-echo "### 下载"
+echo "### 安装 / 更新"
 echo ""
-echo "**生产环境推荐用引导器**（自带缓存，不必每轮联网；锁版本时完全不联网）："
+if [ "$(printf '%s' "$VERSION" | cut -d. -f1)" -ge 3 ] 2>/dev/null; then
+  echo "**本版起没有引导器了**：把下面整段填进 DPanel 计划任务的「脚本」框（一个脚本就够）。"
+  echo ""
+  echo '```sh'
+  echo "U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
+  echo "U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'"
+  echo "T=/tmp/ct-new.sh"
+  echo 'curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true'
+  echo 'if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \'
+  echo '   && grep -q container-autoupdate "$T"; then'
+  echo '  mv -f "$T" /tmp/container-autoupdate.sh'
+  echo 'fi'
+  echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }'
+  echo 'sh /tmp/container-autoupdate.sh --compose myapp'
+  echo '```'
+  echo ""
+  echo "想锁死本版：把上面两个地址里的 \`latest/download\` 换成 \`download/$TAG\`。"
+  echo "从旧版（带 \`ct-bootstrap.sh\` 的任务）迁移：直接把这整段替换掉原来的两行即可；"
+  echo "任务里若还留着 \`CT_*\` 变量或 \`--ct-*\` 参数，脚本会停下并说明（退出码 3）。"
+else
+  echo "**生产环境推荐用引导器**（自带缓存，不必每轮联网；锁版本时完全不联网）："
+  echo ""
+  echo '```sh'
+  echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
+  echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
+  echo "/usr/local/bin/ct-bootstrap.sh --ct-version $VERSION --compose myapp   # 锁到本版"
+  echo '```'
+  echo ""
+  echo "想直接跑主脚本（自己维护文件，不会自动升级）："
+  echo ""
+  echo '```sh'
+  echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/download/$TAG/container-autoupdate.sh \\"
+  echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
+  echo '```'
+fi
 echo ""
-echo '```sh'
-echo "curl -fsSL -L https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \\"
-echo "  -o /usr/local/bin/ct-bootstrap.sh && chmod +x /usr/local/bin/ct-bootstrap.sh"
-echo "/usr/local/bin/ct-bootstrap.sh --ct-version $VERSION --compose myapp   # 锁到本版"
-echo '```'
-echo ""
-echo "想直接跑主脚本（自己维护文件，不会自动升级）："
-echo ""
-echo '```sh'
-echo "curl -fsSL -L https://github.com/geekMus/container-autoupdate/releases/download/$TAG/container-autoupdate.sh \\"
-echo "  -o container-autoupdate.sh && chmod +x container-autoupdate.sh"
-echo '```'
-echo ""
-echo "> \`-L\` 不能省：\`releases/latest/download/\` 会返回 302 跳转。"
-echo "> 国内网络可用前缀 \`https://github.mus.pp.ua/\`（自建站，默认首选）或 \`https://gh-proxy.com/\`（公共站，兜底）。"
+echo "> \`latest/download\` 会返回 302，用 \`curl\` 时加 \`-L\`；上面那段已经带了。"
+echo "> 国内网络可用前缀 \`https://gh-proxy.com/\`（公共站）或 \`https://github.mus.pp.ua/\`（自建站）。"
 echo ""
 echo "排查残留进程和旧锁文件（只读脚本，不改任何东西）："
 echo ""

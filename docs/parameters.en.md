@@ -362,50 +362,8 @@ sh container-autoupdate.sh --compose myapp >/tmp/ct.out 2>/tmp/ct.err
 # /tmp/ct.out is the full log, /tmp/ct.err holds only the failure reason
 ```
 
-## Bootstrapper (ct-bootstrap.sh) parameters and environment variables
+## The bootstrapper (retired in v3.0.0)
 
-The bootstrapper is the recommended way to use this: it downloads and caches the main script, and you maintain one command line.
-It needs `curl` (probing and downloading) and `sh` itself; outside the dpanel container it also needs `docker`.
+Earlier versions shipped a bootstrapper, `ct-bootstrap.sh`, that downloaded and cached the main script. It is gone as of v3.0.0: the whole script is under 50KB, and "download → verify → run" right inside the scheduled task is enough — caching and version probing bought nothing.
 
-Two ways to specify, in priority order: **command line `--ct-*` > environment variable `CT_*`**.
-Bootstrapper options must come before the main script's parameters; `--` can also separate them explicitly.
-
-| Command line | Environment variable | Default | Notes |
-|---|---|---|---|
-| `--ct-version <version>` | `CT_VERSION` | empty | **Setting it means fixed-version mode** (such as `1.2.3`, with or without the `v` prefix): it does not probe remotely and runs the local copy directly, **with no network access at all**. Recommended in production; version numbers are on the Releases page. |
-| `--ct-cache-dir <directory>` | `CT_CACHE_DIR` | `/var/cache/container-autoupdate` | The script cache directory. Inside a container, mount a writable directory there or point it at `/tmp`. |
-| `--ct-cache-keep <N>` | `CT_CACHE_KEEP` | `3` | How many historical version files to keep; older ones are deleted. `0` means no trimming. |
-| `--ct-source <source>` | `CT_SOURCE` | `auto` | The download source: `auto` (**self-hosted → gh-proxy → direct → ghproxy.net**), `direct`, `gh-proxy`, `ghproxy`, `mus` (the self-hosted site), or any custom prefix (prepended to `https://github.com/...`). |
-| `--ct-t-net <seconds>` | `CT_T_NET` | `20` | Timeout for a single network operation (seconds). It applies to probing and downloading separately. |
-| `--ct-tries <N>` | `CT_TRIES` | `2` | How many attempts per source. |
-| `--ct-probe-bytes <N>` | `CT_PROBE_BYTES` | `16000` | How many bytes of the file head to fetch (`Range` request) when probing the version number. **Do not shrink it**: the version line moves down as the script grows, and a window that misses it cannot find the version (it shows up as "probing the remote version failed"). When it cannot find one, the bootstrapper automatically fetches the whole file and parses it again. |
-| `--ct-force` | `CT_FORCE=1` | off | Ignore the cache and download again. |
-| `--ct-quiet` | `CT_QUIET=1` | off | Do not print the bootstrapper's own log (the main script's log is unaffected). |
-| `--ct-help` | — | — | Show the bootstrapper help. |
-
-```sh
-# command line (recommended in a DPanel scheduled task's script box)
-ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
-
-# environment variables (the older style, still supported)
-CT_VERSION=1.2.3 ct-bootstrap.sh --compose myapp
-
-# mixed: the command line overrides the environment variable; everything after -- goes to the main script
-CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compose myapp --dry-run
-```
-
-What the bootstrapper does, at a glance:
-
-| Situation | Result |
-|---|---|
-| A fixed version is set (`--ct-version` / `CT_VERSION`) and the local copy has it | Run it directly, **with zero network requests** |
-| A fixed version is set and the local copy lacks it | Download that version and run it (it tries only the fixed tag, never latest) |
-| No fixed version, a version was probed and the local copy already has it | Send one Range request only (the first 16KB of the file by default), no download |
-| No fixed version and a new version was probed | Download the whole file, cache it, then run it |
-| Probing failed and a usable local cache exists | Run the cached copy and print `WARN` (the exit code comes from the main script) |
-| Probing failed and there is no local cache | `ERR`, exit code `1` (**it never succeeds silently**) |
-| The cached file is corrupt | Download again automatically (checks: syntax + the `VERSION` field + the feature string) |
-
-> Why the default source is not a direct connection: measurements (2026-11-03, inside the N1 dpanel container) showed that both the self-hosted site `github.mus.pp.ua` and the public `gh-proxy.com` proxy Release assets correctly (sha256 matching the official one), but the self-hosted site occasionally times out at 40 seconds (3 successes out of 5) while `gh-proxy.com` succeeded 5 out of 5 in about 1 second. The default order is **self-hosted first (fast and under our control), public site as the fallback**, then direct, then `ghproxy.net`.
->
-> To use just one source, set `--ct-source mus` / `--ct-source gh-proxy` / `--ct-source direct` / `--ct-source ghproxy`, or write the same value in `CT_SOURCE=`.
+Nine environment variables retired with it (`CT_VERSION`, `CT_CACHE_DIR`, `CT_CACHE_KEEP`, `CT_SOURCE`, `CT_T_NET`, `CT_TRIES`, `CT_PROBE_BYTES`, `CT_FORCE`, `CT_QUIET`), together with every `--ct-*` argument. If one is still in the task, the script stops immediately (exit code `3`) and prints the migration path; the new shape is in [Quick start](../README.en.md#quick-start), and pinning a version means using a tag-qualified download URL.

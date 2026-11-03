@@ -311,7 +311,7 @@ If upstream skipped several versions at once, this round goes only to the newest
 
 The script **does not touch the registry**: pulling images is handed to docker / the daemon and the registry, using the setup you configured (Docker's registry-mirror, DPanel's settings). So mechanisms like "racing several GitHub mirrors in parallel" are **no longer needed, and are not implemented**: which source is fast and which one connects is docker's business, and the script has no control over it.
 
-(For comparison: the bootstrapper `ct-bootstrap.sh` still tries sources one after another in a fixed order when downloading "the script itself" — that is not parallel racing.)
+(For comparison: the part of the scheduled task that downloads "the script itself" uses "try the second URL only if the first fails", which is not parallel racing either — for a file under 50KB, two sequential attempts are already fast enough.)
 
 ## 8. What a failure looks like
 

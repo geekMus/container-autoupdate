@@ -332,31 +332,15 @@ docker compose up -d                  # 让容器跑在 1.35 的内容上
 - 帮助文本在 `cat <<'USAGE'`（带引号 heredoc）里，**变量不会展开**，不许在里面写 `$VERSION`。
 - 文档里承诺的行为必须与源码一致。特别是不许写「脚本每次运行都会把版本号写进日志」而 `log()` 并不打印版本号——要么改文档，要么改代码。
 
-### 8.5 引导器 `ct-bootstrap.sh` 的硬性约束
+### 8.5 历史：引导器 `ct-bootstrap.sh`（v3.0.0 已取消）
 
-引导器是**使用者实际运行的东西**，它的错误比主脚本的错误更致命（主脚本至少还会自己校验参数）。改动它必须守住下面几条：
+v3.0.0 起不再有引导器：整套脚本不到 50KB，计划任务里「下载 → 校验 → 执行」八行就够，缓存与版本探测都没有价值。以下约束只对 v2.x 及更早的版本成立，留作**历史教训**——新装法仍然守同样的两条底线：
 
-- **不许把「探测失败」当成「没有新版本」。** 探测失败时只能走两条路：回退到通过 `verify_file` 的本地缓存，或 `die`（非 0）。**绝不允许静默地「什么都不做然后 exit 0」**——使用者会以为更新成功。
-- **缓存文件必须四道校验后才能执行**：`sh -n` 语法 + `file_version` 能解析出 `VERSION` + 含特征串 `container-autoupdate` + 字节数 > 1000。
-  只做 `sh -n` 是不够的：`garbage` 这种一行垃圾也能通过 `sh -n`，然后被当成脚本执行（实测报 `line 1: garbage: not found`，rc=127）。
-- **`sed` 的捕获组必须写成 `\(...\)`**，不是 `(...)`。曾漏了反斜杠导致版本号恒为空，连带让上面的坏包校验全部失效。
-- **探测只取文件头一段（`curl -r 0-<PROBE_BYTES>`），不要为此下载整个文件。**
-  - `PROBE_BYTES` 默认 16000（`CT_PROBE_BYTES` / `--ct-probe-bytes` 可调）。
-  - **窗口必须能盖住 `VERSION=` 那一行。** 这一行会随着脚本头部注释变长而下移：实测 v1.1.0/v1.1.1 在第 3305 字节，v1.1.2 已经挪到第 **4012** 字节 —— 早先固定的 4KB 窗口就此盖不到，探测静默失败，日志里只显示 `WARN 探测远端版本失败（网络问题）`，可网络其实好得很。
-  - **Range 成功但没解析出版本号时，要把整个文件取下来再解析一次**（兜底）。Range 本身失败就不要浪费一次完整下载，直接换下一个源。
-  - 不要用 `HEAD` 读 302 的 `Location`：直连要 12 秒，代理根本不返回 `Location`。
-  - 不要用 `api.github.com/releases/latest`：会限流（`API rate limit exceeded`）。
-- **默认源顺序是 `github.mus.pp.ua`（自建）→ `gh-proxy.com` → 直连 `github.com` → `ghproxy.net`**，依据是实测（2026-11-03，N1 dpanel 容器内）：
-  | 源 | Range 探测 | 完整下载 |
-  |---|---|---|
-  | `github.mus.pp.ua` | 成功时 4~7s，**5 次里成功 3 次**（失败是 40s 超时） | 内容正确，偶发超时 |
-  | `gh-proxy.com` | **5/5 成功，平均 1s** | 1s |
-  | 直连 `github.com` | 1s，但 3 次中 1 次 DNS 失败 | 不稳 |
-  | `ghproxy.net` | **3/3 全部 15s 超时** | — |
-  - 早先「自建源把请求转给 GitHub 网页前端、不是直转 Release 资产」这一结论**已被实测推翻**：自建站两种 URL 形式（长形式 `https://github.mus.pp.ua/https://github.com/...`、短形式 `https://github.mus.pp.ua/<owner>/<repo>/...`）都能正确直转 Release 资产（`content-type: application/octet-stream`，sha256 与官方一致）。它只是**偶发超时**，所以放第一位（快、且是自己控制的），公共站兜底。
-  - 长形式与短形式在不同环境里快慢正好相反（宿主长形式超时短形式快，容器内反过来），所以两种形式都要能用，不能只押一种。
-- **固定版本模式（`--ct-version` / `CT_VERSION` 非空）必须完全不联网**，这是它存在的唯一理由。引导器自己的开关用 `--ct-*`（命令行优先于同名 `CT_*` 环境变量），其余参数原样透传给主脚本。
-- **改了 `ct-bootstrap.sh` 也要升 `VERSION` 并发布**，因为 Release 必须同时上传 `container-autoupdate.sh`、`ct-bootstrap.sh` 与 `scripts/ct-stale-lock-check.sh` 三个资产；少传一个，对应的 `releases/latest/download/...` 就是 404。
+- **绝不允许「静默成功」**：下载失败只能「沿用上一轮通过校验的副本」或报错退出（`ERR 拿不到可用的更新脚本` + `rc=1`）。「探测失败就当没有新版本、然后 exit 0」这种写法会让使用者以为更新成功。
+- **下到的东西必须先校验再执行**：字节数 > 1000、`sh -n` 通过、含特征串 `container-autoupdate`。只做 `sh -n` 是不够的：一行 `garbage` 也能过语法检查，然后被当成脚本执行（实测报 `line 1: garbage: not found`，rc=127）；`gh-proxy.net` 还会返回 195 字节的 HTML 跳转页（`rc=0`，内容完全不是脚本）。
+- 旧引导器踩过的具体坑（探测窗口被 `VERSION=` 行的下移顶出 4KB、`sed` 捕获组漏反斜杠导致版本号恒为空、`api.github.com` 限流、自建源偶发 40s 超时）随它一起作废，不必在新代码里复刻。
+
+> 现行装法的权威写法只有一处：`README.md` / `README.en.md` 的「快速开始」代码块，以及 `scripts/gen-release-notes.sh` 为 v3+ 生成的那一段。二者必须逐行一致。
 
 ### 8.6 用户文档必须中英文同步
 
@@ -389,7 +373,7 @@ MUST
 NEVER
 
 - **不许翻译 `AGENTS.md`**（维护者内部规则，保持中文）。
-- **不许翻译脚本里的注释**（`container-autoupdate.sh` / `ct-bootstrap.sh` 的注释一律中文，本次只做文档）。
+- **不许翻译脚本里的注释**（`container-autoupdate.sh` 与 `scripts/*.sh` 的注释一律中文，本次只做文档）。
 - **不许只在英文版里加新内容**——中文版缺了内容 = 面向中文用户的文档残缺。
 
 ---
@@ -455,11 +439,11 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | DPanel 任务丢了 `scriptRunTimeout` | UI 编辑时重写 setting JSON，`omitempty` 键被抹掉 | 每次 UI 编辑后回读确认 |
 | 表格塌成一行 | 多行被合并 | 每行独立 |
 | 发版后用户拿到旧代码 | 改了脚本没升 VERSION | 必升 VERSION，并做 §9.3 三方核对 |
-| 引导器把一行垃圾当成脚本执行 | 只用 `sh -n` 校验，垃圾也能过语法 | 四道校验：`sh -n` + 能解析 `VERSION` + 特征串 + 字节数 > 1000 |
-| 引导器版本号恒为空 | `sed` 捕获组写成 `(...)` 而非 `\(...\)` | 改回 `\(...\)` |
-| 引导器探测失败却 rc=0 | 把「探测失败」当成「没有新版本」 | 只能回退到合格缓存或 `die` |
-| 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | 自建站 `github.mus.pp.ua` 优先、公共站 `gh-proxy.com` 兜底；API 会限流 |
-| 引导器「探测远端版本失败（网络问题）」但网络其实正常 | 探测窗口没盖住 `VERSION=` 那行（它会随脚本变长下移） | 窗口放大到 16KB；Range 成功却没解析出版本号时，把整文件取下来再解析一次 |
+| （历史 v3.0.0 前）引导器把一行垃圾当成脚本执行 | 只用 `sh -n` 校验，垃圾也能过语法 | 四道校验：`sh -n` + 能解析 `VERSION` + 特征串 + 字节数 > 1000（新装法保留其中三道） |
+| （历史 v3.0.0 前）引导器版本号恒为空 | `sed` 捕获组写成 `(...)` 而非 `\(...\)` | 改回 `\(...\)`（引导器已删，教训仍有效：正则捕获组别漏反斜杠） |
+| （历史 v3.0.0 前）引导器探测失败却 rc=0 | 把「探测失败」当成「没有新版本」 | 只能回退到合格缓存或 `die`（新装法同理：拿不到可用脚本必须 `rc=1`） |
+| （历史 v3.0.0 前）引导器 Range 探测很慢 | 用了直连或 `api.github.com` | 自建站 `github.mus.pp.ua` 优先、公共站 `gh-proxy.com` 兜底；API 会限流 |
+| （历史 v3.0.0 前）引导器「探测远端版本失败（网络问题）」但网络其实正常 | 探测窗口没盖住 `VERSION=` 那行（它会随脚本变长下移） | 窗口放大到 16KB；Range 成功却没解析出版本号时，把整文件取下来再解析一次 |
 | 拉取最后卡在「层都拉完了」被判卡死，daemon 报 `context canceled` | Docker 写镜像配置期间不吐字节，被当成停滞掐掉，已下载的层全作废 | 层拉完后进收尾宽限（`T_STALL_FINISH`）；放弃前先问 daemon 镜像是否已落盘 |
 | DPanel CLI 明明失败了，脚本却报成功 | 用 CLI 退出码判成败，而失败时退出码仍是 0（容器不存在、项目未登记、镜像清单读不到） | 解析 JSON：`code` ≥ 400 或 `status=failed` 或 `error` 非空才算失败 |
 | 反过来：DPanel 成功了却被判失败 | 成功的形状（`{"name":"..."}`、`{"containerId":"..."}`）**没有 `code` 字段** | 没有 `code` 不是失败信号 |
@@ -475,17 +459,16 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 计划任务里只有一句 `exit status 1` | 失败原因只写了 stdout，而 DPanel 失败时只保留 stderr | 把 `ERR`/`CRITICAL` 行与紧随的缩进补充行写进真 stderr |
 | 每轮都重建容器 | 跳过了「先检查后升级」 | 先不带 `--upgrade` 调一次，`upgrade` 为 true 才真升级 |
 | 升级后没有回滚点 | 传了 `--disable-bak` | 不许传它：`<容器名>-bak-<时间戳>` 就是回滚点 |
-| `releases/latest/download/ct-stale-lock-check.sh` 404 | Release 只传了主脚本 | 三个资产都要传 |
+| `releases/latest/download/ct-stale-lock-check.sh` 404 | Release 只传了主脚本 | 两个资产都要传（v3.0.0 起没有引导器） |
 
 ---
 
 ## 11. 提交前检查清单
 
 - [ ] `sh -n container-autoupdate.sh` 通过
-- [ ] `sh -n ct-bootstrap.sh` 通过
 - [ ] `sh -n scripts/gen-release-notes.sh` 通过
 - [ ] `sh -n scripts/ct-stale-lock-check.sh` 通过
-- [ ] 四个 `.sh` 的 CR 计数为 0
+- [ ] 三个 `.sh` 的 CR 计数为 0（`container-autoupdate.sh` 与 `scripts/*.sh`）
 - [ ] 改了脚本 → `VERSION` 已按 §7.3 升级
 - [ ] 若含破坏性变更 → 已登记 `BREAKING_TABLE`，且类别（`flag`/`env`/`behavior`）选对
 - [ ] `--help`、`--version`、无参数、`--bogus`、`--compat` 非法值 五个快速用例行为正确
@@ -493,9 +476,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 测试容器 / 镜像 / 状态目录已清理，生产已复原且 `healthy`
 - [ ] 文档里没有新增硬编码的当前版本号
 - [ ] 下载地址是 `releases/...`，带 `-L`，没用 jsdelivr
-- [ ] 四个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
-- [ ] 改了 `ct-bootstrap.sh` → 引导器 10 个场景（固定版本 / 命中缓存 / 有新版本 / 网络故障有缓存 / 无缓存 / 坏包 / 参数透传 / 缓存裁剪 / 强制更新）已复跑
-- [ ] 改了探测窗口或脚本头部注释 → 确认 `VERSION=` 那一行仍落在探测窗口内（`grep -b -m1 '^VERSION=' container-autoupdate.sh` 看字节偏移），并复跑「窗口盖不到时整文件兜底」这一场景
+- [ ] 三个 `.sh` 在 git 里的权限都是 `100755`（`git ls-files -s`）
 - [ ] 推送后做了 §9.3 的三方 sha1 核对
 - [ ] 改了用户文档 → 对应英文副本已同步（§8.6）
 - [ ] 每份用户文档的 H1 正下方有语言切换条，中英互指
@@ -523,3 +504,13 @@ v2.1.0 起另外还要过这几条：
 - [ ] N1 真机跑过**两条路**：Compose（标签反查目录 → pull → up -d → 三态报告）与容器模式（容器内直执 + `docker exec` 各一次），并贴出真实输出
 - [ ] 测试留下的 `<容器名>-bak-<时间戳>` 备份容器、被顶掉的镜像 tag、`compose-*` 事务残留都已清干净
 - [ ] N1 上的测试脚本与临时文件（容器内 `/tmp/...`、宿主 `/tmp/...`）已删
+
+v3.0.0 起另外还要过这几条：
+
+- [ ] 仓库里**没有** `ct-bootstrap.sh`（CI 里有 `test ! -e ct-bootstrap.sh` 守卫；Release 只发两个资产）
+- [ ] 计划任务的装法只有一处权威写法：`README.md` / `README.en.md` 的快速开始代码块与 `scripts/gen-release-notes.sh` 为 v3+ 生成的那段**逐行一致**（改了其中一处就同步另一处）
+- [ ] 那段装法仍然守两条底线：下载失败**不许静默成功**（沿用上一轮通过校验的副本，或 `ERR` + `rc=1`）；下到的东西**先校验再执行**（字节数 > 1000、`sh -n`、含 `container-autoupdate` 特征串）
+- [ ] 没有把 `curl ... | sh` 写进任何文档或示例（管道会吞掉下载失败）
+- [ ] `--ct-*` 任何形态、`CT_*` 任何非空值都 `rc=3` 并给出「改用计划任务里那段下载校验执行」的迁移说明（不是逐变量「删掉即可」——`compat_bootstrap_env` 必须排在 `compat_removed_env` 之前）
+- [ ] 文档里锁版本的写法是**带 tag 的下载地址**（`releases/download/vX.Y.Z/…`），不是 `--ct-version`
+- [ ] 文档里没有残留「引导器 / ct-bootstrap / 缓存目录 / `--ct-*` 表」的现行说法（只允许出现在「v3.0.0 迁移」段与 AGENTS.md 的§8.5 历史节）

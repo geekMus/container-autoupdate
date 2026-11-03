@@ -20,10 +20,21 @@ jobs:
         # v6 起运行时是 node24；v4 是 node20，已被 GitHub 标为弃用
         uses: actions/checkout@v6
 
+      - name: 引导器确实已经删掉
+        run: |
+          set -eu
+          # 3.0.0 起不再发布 ct-bootstrap.sh。它若被谁加回来，
+          # Release 会多出一个「用户任务里早就不该有」的资产，文档也会自相矛盾。
+          if [ -e ct-bootstrap.sh ]; then
+            echo "::error::ct-bootstrap.sh 不该再存在（3.0.0 起安装方式改为计划任务里直接下载主脚本）"
+            exit 1
+          fi
+          echo "ct-bootstrap.sh 不存在，符合预期"
+
       - name: 语法检查
         run: |
           set -eu
-          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
+          for f in container-autoupdate.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             if ! sh -n "$f"; then
               echo "::error::$f 语法检查失败（sh -n）"
               exit 1
@@ -34,7 +45,7 @@ jobs:
       - name: 行尾检查
         run: |
           set -eu
-          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
+          for f in container-autoupdate.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             if grep -qU $'\r' "$f"; then
               echo "::error::$f 含 CRLF 行尾，请转换为 LF"
               exit 1
@@ -56,7 +67,7 @@ jobs:
         run: |
           set -eu
           # git 里应记录为 100755；记录成 100644 时用户下载后必须自己 chmod +x
-          for f in container-autoupdate.sh ct-bootstrap.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
+          for f in container-autoupdate.sh scripts/gen-release-notes.sh scripts/ct-stale-lock-check.sh; do
             MODE=$(git ls-files -s "$f" | awk '{print $1}')
             if [ "$MODE" != "100755" ]; then
               echo "::error::$f 在 git 中的模式是 $MODE，应为 100755（可执行）"
@@ -71,9 +82,30 @@ jobs:
           set -eu
           sh container-autoupdate.sh --help >/dev/null
           sh container-autoupdate.sh --version
-          # 引导器 --help 不存在，用 CT_VERSION 固定版跑 --version 验证它能把参数透传
-          CT_CACHE_DIR=/tmp/ct-ci CT_VERSION=$(grep -m1 '^VERSION=' container-autoupdate.sh | cut -d'"' -f2) \
-            sh ct-bootstrap.sh --version || echo "::warning::引导器端到端验证跳过（网络不可达）"
+
+      - name: 迁移防线仍然有效
+        run: |
+          set -eu
+          # 旧写法必须硬停并给迁移说明（退出码 3），不能被当成未知参数（1）或被忽略。
+          rc=0
+          sh container-autoupdate.sh --ct-version 1.2.3 --compose a >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "3" ]; then
+            echo "::error::--ct-version 应以退出码 3 中止，实际是 $rc"
+            exit 1
+          fi
+          rc=0
+          CT_VERSION=1.2.3 sh container-autoupdate.sh --compose a >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "3" ]; then
+            echo "::error::CT_VERSION 仍被设置时应以退出码 3 中止，实际是 $rc"
+            exit 1
+          fi
+          rc=0
+          sh container-autoupdate.sh --state-dir /tmp/x --compose a >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "3" ]; then
+            echo "::error::--state-dir 应以退出码 3 中止，实际是 $rc"
+            exit 1
+          fi
+          echo "迁移防线检查通过"
 
       - name: 文档检查
         run: |
@@ -87,4 +119,3 @@ jobs:
         continue-on-error: true
         run: |
           shellcheck -S warning container-autoupdate.sh || true
-          shellcheck -S warning ct-bootstrap.sh || true

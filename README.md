@@ -34,58 +34,61 @@
 ## 前置条件
 
 - **容器模式**需要目标机器上装了 **DPanel**：升级动作靠 DPanel 自己的命令行（DPanel 1.11.x 自带的 `container:upgrade`）。
-- **推荐在 dpanel 容器里跑**：DPanel 的「计划任务」默认就是在 dpanel 容器内执行，脚本直接调用 `/app/server/dpanel`。
-- 容器模式在宿主上跑也行，但需要宿主有 `docker` 命令：脚本会改用 `docker exec dpanel /app/server/dpanel ...` 进容器调用。DPanel 容器名不叫 `dpanel` 时用 `--dpanel-container <名字>` 指定。
-- **Compose 模式不依赖 DPanel**：它需要 `docker` 与 **Compose v2 插件**（`docker compose`，不是 `docker-compose`）；插件不可用时打 `ERR 无法执行 docker compose（缺 compose 插件？）`，退出码 `1`。
+- **在 DPanel 的 dpanel 容器里跑**：DPanel 的「计划任务」默认就在这个容器内执行，脚本直接调用容器里的 `/app/server/dpanel`，Docker 操作则通过挂载进来的 `/var/run/docker.sock` 落到宿主 daemon。本项目的定位就是「DPanel 的一个计划任务」，**不提供宿主机运行方式**。
+- **Compose 模式还需要 `docker` 与 Compose v2 插件**（`docker compose`，不是 `docker-compose`）：dpanel 容器里自带 docker CLI；插件不可用时打 `ERR 无法执行 docker compose（缺 compose 插件？）`，退出码 `1`。
 - **Compose 项目不需要在 DPanel 网页里登记**：脚本按项目名从容器标签反查项目目录与 compose 文件；反查不到时用 `--compose-dir <路径>` 指定，或者先手动 `docker compose up -d` 一次，让标签落到容器上。
-- 依赖命令：`timeout` `sed` `awk` `grep`（busybox / coreutils 都行）。Compose 模式、以及不在 dpanel 容器内跑的时候，额外需要 `docker`。主脚本**不需要 `curl`、`flock`**（引导器仍需 `curl` 下载脚本）。
+- 依赖命令：`timeout` `sed` `awk` `grep`（busybox / coreutils 都行），Compose 模式额外需要 `docker`。脚本自己**不需要 `curl`、`flock`**——`curl` 只用在计划任务里那段「下载脚本」的命令上。
 
 ## 快速开始
 
 ### DPanel 计划任务
 
-新建计划任务，脚本框里填**两行**：
+新建计划任务，把下面整段填进「脚本」框（**一个脚本就够**，v3.0.0 起没有引导器了）：
 
 ```sh
-# 引导器会自己缓存脚本：第一次下载，之后同版本直接复用，不必每轮都联网
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+T=/tmp/ct-new.sh
+curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
+if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
+   && grep -q container-autoupdate "$T"; then
+  mv -f "$T" /tmp/container-autoupdate.sh
+fi
+[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
-普通容器把最后一段换成 `--container mycontainer`。
+普通容器把最后一行换成 `--container mycontainer`。
 
-> 下载地址里的 `https://github.mus.pp.ua/` 是自建加速前缀，不想要就去掉它（直连 GitHub）。前缀坏了就换 `https://gh-proxy.com/`——引导器自己会按「自建站 → gh-proxy → 直连」的顺序逐个试。
+> 这段在干什么：下载到临时文件 → 校验（不是空包、语法没问题、确实是这个脚本）→ 通过才覆盖 `/tmp/container-autoupdate.sh` → 执行。**下载失败时保留上一轮的副本继续跑**，偶发网络问题不会让这一轮白过。
 >
 > 执行超时请设 **≥ 600 秒**（脚本自身的硬上限是 540 秒）。
 >
-> **为什么不推荐 `curl ... | sh`**：管道写法在下载失败时会**静默成功**（任务日志看不出这轮没跑成）。引导器会把下载落到文件、校验通过才执行，失败时明确返回非 0。
+> **为什么不写 `curl ... | sh`**：管道会把 `curl` 的失败吞掉（任务日志看不出这轮其实没跑成）；上面那段把下载落地、校验、再执行，失败时明确返回非 0。
 >
-> **生产环境建议锁版本**：给引导器加 `--ct-version <版本号>`（或设 `CT_VERSION`；版本号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)），它就不再探测远端、永不联网取新版本。用 `latest` 也没关系——真遇到破坏性变更，脚本会自己停下并在日志里写清原因和改法。
+> **锁版本**：把两个地址里的 `latest/download` 换成 `download/v3.0.0`（tag 见 [Releases](https://github.com/geekMus/container-autoupdate/releases)）。不锁也没关系——真遇到破坏性变更，脚本会自己停下并写清原因和改法。
 
 ### 手动跑一轮
 
-想临时检查一次，直接跑就行（跑完就结束，不会常驻）。引导器第一次要先落地到本地：
+想临时检查一次，在 dpanel 容器里跑（跑完就结束，不会常驻）：
 
 ```sh
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+docker exec -it dpanel sh -c 'curl -fsSL --max-time 60 https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh -o /tmp/container-autoupdate.sh && sh /tmp/container-autoupdate.sh --compose myapp --dry-run'
 ```
 
 > 不建议用 cron / systemd timer 来定时跑：同一个目标同时跑两轮会互相踩。要定时更新就用 DPanel 计划任务——同一目标只挂一个计划任务即可。
 
-## 引导器怎么工作
+## 脚本怎么升级自己
 
-| 模式 | 行为 | 网络开销 |
-|---|---|---|
-| 固定版本（`--ct-version <版本号>` / `CT_VERSION`） | 本地有就直接跑 | **零**（完全不联网） |
-| `latest`（默认），本地同版本 | 只探测远端版本号，不下载 | 一次 Range 请求（取文件头 16KB，约 1 秒） |
-| `latest`，远端更新 | 下载新版本并缓存，再执行 | 一次探测 + 一次完整下载（约 80KB） |
-| 探测失败但本地有缓存 | 用缓存继续跑，只打 `WARN` | 零 |
-| 探测失败且无缓存 | **明确报错退出**（不会静默成功） | 零 |
+| 情况 | 行为 |
+|---|---|
+| 远端有新版本 | 下到 `/tmp/ct-new.sh`，校验通过后覆盖 `/tmp/container-autoupdate.sh`，再执行 |
+| 远端还是同版本 | 照样下载（不到 50KB、一两秒），校验通过后覆盖，行为不变 |
+| 下载失败（源挂了、断网） | **沿用上一轮的副本继续跑**，日志里有 `curl` 的报错 |
+| 下到的是坏包（HTML 跳转页、半截文件） | 三道校验拦住（字节数 > 1000、`sh -n`、含特征串），**不覆盖**，继续用旧副本 |
+| 一次都没成功过（首次安装就断网） | 明确报 `ERR 拿不到可用的更新脚本`，退出码 1，不会静默成功 |
 
-缓存放在 `/var/cache/container-autoupdate`（可用 `--ct-cache-dir` / `CT_CACHE_DIR` 改），按版本分文件，只保留最近 3 个（`--ct-cache-keep` / `CT_CACHE_KEEP`）。缓存文件会做语法 + 版本号 + 特征字符串校验，半截文件不会被当成脚本执行。引导器自己的开关一律用 `--ct-*` 前缀（也可用同名 `CT_*` 环境变量；命令行优先），其余参数原样交给主脚本。
+> 脚本版本号在日志第一行：`container-autoupdate v3.0.0 启动`；`--version` 也能看到。
 
 ## 常用命令
 
@@ -158,14 +161,23 @@ sh container-autoupdate.sh --version    # 例如 1.2.3
 
 发布新版本由仓库的 GitHub Actions 自动完成：只要脚本里的 `VERSION` 字段变成一个新值并推到 `main`，工作流就会自动打 tag 并发布 Release（详见 [进阶用法](docs/advanced-usage.md)）。
 
-想**锁定某个版本**（不让它跟着最新版走），给引导器加 `--ct-version`：
+想**锁定某个版本**（不让它跟着最新版走），把计划任务里的两个地址换成带 tag 的：
 
 ```sh
-/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
-# 旧写法仍可用：CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/download/v3.0.0/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/download/v3.0.0/container-autoupdate.sh'
 ```
 
-锁版本时引导器完全不联网，对生产环境最稳。tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)。
+tag 号见 [Releases](https://github.com/geekMus/container-autoupdate/releases)。
+
+### 升级到 v3.0.0 要注意什么
+
+v3.0.0 起**不再有引导器 `ct-bootstrap.sh`**：安装方式改为「计划任务里直接下载主脚本 → 校验 → 执行」，Release 只发布主脚本与只读排查脚本两个资产。
+
+- **计划任务要改一次**：原来那两行（`curl .../ct-bootstrap.sh` + `sh /tmp/ct-bootstrap.sh`）换成上面「快速开始」那一段。`releases/latest/download/ct-bootstrap.sh` 现在返回 404，不改任务的机器每轮都会失败。
+- **`--ct-*` 参数与 `CT_*` 环境变量全部作废**（`CT_VERSION`、`CT_SOURCE`、`CT_CACHE_DIR` 等 9 个）。任务里还留着的话，脚本会立刻停下（退出码 `3`）并给出迁移方式。
+- **锁版本**：改用带 tag 的下载地址，不再有 `--ct-version`。
+- `/var/cache/container-autoupdate` 里的旧缓存不会再被读取，可以直接删掉。
 
 ### 升级到 v2.x 要注意什么
 

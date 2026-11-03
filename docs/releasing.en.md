@@ -35,11 +35,13 @@ Change `VERSION` in the script → commit to `main` → everything else is autom
    | Find the previous release tag | Takes "the largest tag smaller than the current version", comparing the three numeric segments with awk (does not depend on `sort -V`) |
    | Generate the release notes | `scripts/gen-release-notes.sh` → positioning sentence + this release's breaking changes + commit list + download commands + sha256 |
    | Create the tag | Creates the tag `vx.y.z` if it does not exist (annotated, **the message is the release notes**) |
-   | Publish the Release | Creates it if it does not exist, uses the release notes as the body, and **uploads all three assets**: `container-autoupdate.sh`, `ct-bootstrap.sh` and `scripts/ct-stale-lock-check.sh` |
+   | Publish the Release | Creates it if it does not exist, uses the release notes as the body, and **uploads both assets**: `container-autoupdate.sh` and `scripts/ct-stale-lock-check.sh` |
 
-   Afterwards, `releases/latest/download/container-autoupdate.sh`, `.../ct-bootstrap.sh` and `.../ct-stale-lock-check.sh` all point to the new version.
+   Afterwards, `releases/latest/download/container-autoupdate.sh` and `.../ct-stale-lock-check.sh` both point to the new version.
 
-   > All three assets must be uploaded. Upload only one and the matching `releases/latest/download/...` is a 404.
+   > Both assets must be uploaded. Upload only one and the matching `releases/latest/download/...` is a 404.
+
+   > There is no bootstrapper (`ct-bootstrap.sh`) any more as of v3.0.0: the workflow keeps a `test ! -e ct-bootstrap.sh` guard, so the file reappearing in the repository fails the run.
 
    > The release notes are generated automatically; there is nothing to write by hand. `git show vx.y.z` also shows what changed (the tag message is the release notes).
 

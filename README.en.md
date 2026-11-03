@@ -35,59 +35,61 @@ One run = one check: the script does exactly three things — decide whether an 
 ## Prerequisites
 
 - **Container mode** requires **DPanel** on the target machine: the upgrade action relies on DPanel's own command line (the `container:upgrade` that ships with DPanel 1.11.x).
-- **Running inside the dpanel container is recommended**: DPanel's "scheduled task" executes inside the dpanel container by default, and the script calls `/app/server/dpanel` directly.
-- Container mode also works on the host, but the host needs the `docker` command: the script then calls into the container with `docker exec dpanel /app/server/dpanel ...`. When the DPanel container is not called `dpanel`, name it with `--dpanel-container <name>`.
-- **Compose mode does not depend on DPanel**: it needs `docker` and the **Compose v2 plugin** (`docker compose`, not `docker-compose`); when the plugin is unavailable it prints `ERR 无法执行 docker compose（缺 compose 插件？）` and exits `1`.
+- **Run it inside DPanel's dpanel container**: DPanel's "scheduled task" executes inside that container by default, so the script calls the `/app/server/dpanel` binary right there, and Docker operations reach the host daemon through the `/var/run/docker.sock` mounted into the container. This project is positioned as "one DPanel scheduled task" and **does not offer a host-side way to run it**.
+- **Compose mode additionally needs `docker` and the Compose v2 plugin** (`docker compose`, not `docker-compose`): the dpanel container ships the docker CLI; when the plugin is unavailable the script prints `ERR 无法执行 docker compose（缺 compose 插件？）` and exits `1`.
 - **A Compose project does not have to be registered in the DPanel web UI**: the script looks the project directory and the Compose file up from the container labels by project name; when that lookup fails, point at the directory with `--compose-dir <path>`, or run `docker compose up -d` by hand once so that the labels land on the containers.
-- Required commands: `timeout` `sed` `awk` `grep` (busybox or coreutils both work). Compose mode, and anything not running inside the dpanel container, needs `docker` as well. The main script **needs neither `curl` nor `flock`** (the bootstrapper still needs `curl` to download the script).
+- Required commands: `timeout` `sed` `awk` `grep` (busybox or coreutils both work); Compose mode additionally needs `docker`. The script itself **needs neither `curl` nor `flock`** — `curl` is only used by the download command inside the scheduled task.
 
 ## Quick start
 
 ### DPanel scheduled task
 
-Create a scheduled task and paste **two lines** into the script box:
+Create a scheduled task and paste the whole block below into the script box (**one script is enough** — there is no bootstrapper since v3.0.0):
 
 ```sh
-# The bootstrapper caches the script itself: the first run downloads it,
-# later runs reuse the cached copy of the same version without going online
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+T=/tmp/ct-new.sh
+curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
+if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
+   && grep -q container-autoupdate "$T"; then
+  mv -f "$T" /tmp/container-autoupdate.sh
+fi
+[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
-For a plain container, replace the last part with `--container mycontainer`.
+For a plain container, replace the last line with `--container mycontainer`.
 
-> The `https://github.mus.pp.ua/` prefix in the download URL is a self-hosted acceleration prefix; drop it to connect to GitHub directly. If that prefix is down, use `https://gh-proxy.com/` instead — the bootstrapper itself tries the sources in the order "self-hosted → gh-proxy → direct".
+> What this does: downloads to a temporary file → verifies it (not an empty file, syntax is fine, it really is this script) → only then overwrites `/tmp/container-autoupdate.sh` → runs it. **If the download fails, the previous copy is kept and still runs**, so a flaky network does not waste the round.
 >
 > Set the execution timeout to **≥ 600 seconds** (the script's own hard limit is 540 seconds).
 >
-> **Why `curl ... | sh` is not recommended**: with a pipe, a failed download **silently succeeds** (the task log gives no hint that the round did not run). The bootstrapper writes the download to a file, verifies it, and only then executes it; on failure it returns a non-zero exit code explicitly.
+> **Why not `curl ... | sh`**: a pipe swallows `curl`'s failure (the task log gives no hint that the round never ran). The block above downloads to disk, verifies, then executes, and returns non-zero explicitly on failure.
 >
-> **Pinning a version is recommended in production**: give the bootstrapper `--ct-version <version>` (or set `CT_VERSION`; version numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page). It then stops probing the remote and never goes online to fetch a new version. Using `latest` is fine too — when a breaking change actually breaks your invocation, the script stops by itself and writes the reason and the fix into the log.
+> **Pinning a version**: replace `latest/download` in both URLs with `download/v3.0.0` (tags are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page). Pinning is optional — a breaking change makes the script stop by itself and write the reason and the fix into the log.
 
 ### Run one round manually
 
-To check once in a while, just run it (it ends when it is done, nothing stays resident). The bootstrapper has to be written to disk once:
+To check once in a while, run it inside the dpanel container (it ends when it is done, nothing stays resident):
 
 ```sh
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+docker exec -it dpanel sh -c 'curl -fsSL --max-time 60 https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh -o /tmp/container-autoupdate.sh && sh /tmp/container-autoupdate.sh --compose myapp --dry-run'
 ```
 
 > It is not recommended to schedule this with cron or a systemd timer: two rounds for the same target running at the same time will step on each other. If you want scheduled updates, use a DPanel scheduled task — one scheduled task per target is enough.
 
-## How the bootstrapper works
+## How the script updates itself
 
-| Mode | Behaviour | Network cost |
-|---|---|---|
-| Pinned version (`--ct-version <version>` / `CT_VERSION`) | Runs the local copy if present | **Zero** (never goes online) |
-| `latest` (default), local copy is current | Only probes the remote version number, does not download | One Range request (fetches the head of the file, 16KB; about 1 second) |
-| `latest`, remote has a new version | Downloads the new version, caches it, then executes it | One probe + one full download (about 80KB) |
-| Probe failed but a local cache exists | Runs from the cache and prints a `WARN` | Zero |
-| Probe failed and no cache exists | **Fails loudly** (never a silent success) | Zero |
+| Situation | Behaviour |
+|---|---|
+| The remote has a new version | Downloads to `/tmp/ct-new.sh`, verifies it, overwrites `/tmp/container-autoupdate.sh`, then runs it |
+| The remote is still the same version | Downloads anyway (under 50KB, one or two seconds), verifies, overwrites, behaviour unchanged |
+| Download failed (source down, no network) | **Keeps the previous copy and runs it**; `curl`'s error shows in the log |
+| What arrived is garbage (HTML redirect page, truncated file) | Three checks stop it (size > 1000, `sh -n`, contains the signature string), **nothing is overwritten**, the old copy keeps running |
+| Nothing ever succeeded (first install while offline) | Fails loudly with `ERR 拿不到可用的更新脚本`, exit code 1 — never a silent success |
 
-The cache lives in `/var/cache/container-autoupdate` (change it with `--ct-cache-dir` / `CT_CACHE_DIR`), one file per version, keeping only the 3 most recent (`--ct-cache-keep` / `CT_CACHE_KEEP`). Cached files are checked for syntax, version number and signature string, so a half-downloaded file is never executed as a script. The bootstrapper's own switches always use the `--ct-*` prefix (the same `CT_*` environment variables also work; the command line wins); everything else is passed through to the main script unchanged.
+> The version is on the first log line: `container-autoupdate v3.0.0 启动`; `--version` prints it too.
 
 ## Common commands
 
@@ -169,14 +171,23 @@ sh container-autoupdate.sh --version    # e.g. 1.2.3
 
 Publishing a new release is done automatically by the repository's GitHub Actions: as soon as the `VERSION` field in the script changes to a new value and is pushed to `main`, the workflow tags the commit and publishes a Release (see [Advanced usage](docs/advanced-usage.en.md)).
 
-To **pin a specific version** (so it does not follow the latest), give the bootstrapper `--ct-version`:
+To **pin a specific version** (so it does not follow the latest), replace both download URLs in the scheduled task with tag-qualified ones:
 
 ```sh
-/usr/local/bin/ct-bootstrap.sh --ct-version 1.2.3 --compose myapp
-# The old spelling still works: CT_VERSION=1.2.3 /usr/local/bin/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/download/v3.0.0/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/download/v3.0.0/container-autoupdate.sh'
 ```
 
-A pinned bootstrapper never goes online at all, which is the most stable shape for production. Tag numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page.
+Tag numbers are listed on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page.
+
+### What to check when upgrading to v3.0.0
+
+There is **no bootstrapper (`ct-bootstrap.sh`) any more** as of v3.0.0: installation became "download the main script inside the scheduled task → verify → run", and a Release now publishes just two assets (the main script and the read-only investigation script).
+
+- **The scheduled task has to change once**: replace the old two lines (`curl .../ct-bootstrap.sh` + `sh /tmp/ct-bootstrap.sh`) with the block from "Quick start" above. `releases/latest/download/ct-bootstrap.sh` now returns 404, so machines that were not updated fail every round.
+- **Every `--ct-*` argument and `CT_*` environment variable is obsolete** (`CT_VERSION`, `CT_SOURCE`, `CT_CACHE_DIR` and six more). If one is still in the task, the script stops immediately (exit code `3`) and prints the migration path.
+- **Pinning**: use a tag-qualified download URL; `--ct-version` is gone.
+- The old cache under `/var/cache/container-autoupdate` is never read again and can be deleted.
 
 ### What to check when upgrading to v2.x
 

@@ -12,20 +12,25 @@
 
 ## 1. DPanel scheduled task
 
-### Two lines in the script box
+### One block in the script box
 
-Create a scheduled task and put **two lines** in the script box:
+Create a scheduled task and put the whole block below in the script box (there is no bootstrapper as of v3.0.0: download, verify and run all happen here):
 
 ```sh
-# Line 1: fetch the bootstrapper to a local file (it has its own cache, so the same version is not downloaded twice)
-curl -fsSL https://github.mus.pp.ua/https://github.com/geekMus/container-autoupdate/releases/latest/download/ct-bootstrap.sh \
-  -o /tmp/ct-bootstrap.sh
-# Line 2: run one round. Replace --compose with your project name; use --container <name> for a plain container
-sh /tmp/ct-bootstrap.sh --compose myapp
+U1='https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+U2='https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh'
+T=/tmp/ct-new.sh
+curl -fsSL --max-time 60 "$U1" -o "$T" || curl -fsSL --max-time 60 "$U2" -o "$T" || true
+if [ "$(wc -c <"$T" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$T" 2>/dev/null \
+   && grep -q container-autoupdate "$T"; then
+  mv -f "$T" /tmp/container-autoupdate.sh
+fi
+[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
-- Do not write `curl ... | sh`: with a pipe a failed download **silently succeeds** (the task log cannot show that this round did nothing). The bootstrapper writes the file first and executes it only after validation, so a failure returns non-zero explicitly.
-- To pin a version in production, add `--ct-version <version>` to the bootstrapper (or set `CT_VERSION`; the version numbers are on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page) — it then stops probing the remote and never goes online. See the [parameter reference](parameters.en.md) for every bootstrapper switch.
+- Do not write `curl ... | sh`: with a pipe a failed download **silently succeeds** (the task log cannot show that this round did nothing). The block above lands the download in a temporary file, overwrites only after three checks pass, returns non-zero explicitly on failure, and **falls back to the previous copy** when the download fails.
+- To pin a version in production, replace `latest/download` in both URLs with `download/v3.0.0` (version numbers are on the [Releases](https://github.com/geekMus/container-autoupdate/releases) page).
 - The two modes:
 
 | How your container was started | Which argument | What the script actually runs |
@@ -63,7 +68,7 @@ A DPanel scheduled task **keeps only stderr when the task fails** (and only stdo
 That is allowed, but it is only a **one-off run**:
 
 ```sh
-sh /tmp/ct-bootstrap.sh --compose myapp
+docker exec -it dpanel sh -c 'curl -fsSL --max-time 60 https://gh-proxy.com/https://github.com/geekMus/container-autoupdate/releases/latest/download/container-autoupdate.sh -o /tmp/container-autoupdate.sh && sh /tmp/container-autoupdate.sh --compose myapp'
 ```
 
 ### cron / systemd timer are not recommended
@@ -264,7 +269,7 @@ A scheduled task carried over from v1.x usually still holds some of the items ab
 Do this once before and once after the migration:
 
 1. **Before**: delete every obsolete item from the task's script / environment one by one (check them against the table above).
-2. **After**: run one manual round `sh /tmp/ct-bootstrap.sh --compose myapp --dry-run` to confirm the target and the project directory the script picked up are right, then drop `--dry-run`.
+2. **After**: run one manual round `docker exec -it dpanel sh -c 'sh /tmp/container-autoupdate.sh --compose myapp --dry-run'` to confirm the target and the project directory the script picked up are right, then drop `--dry-run`.
 
 ### `LOCK_PREFIX` still aborts
 
@@ -275,7 +280,7 @@ Do this once before and once after the migration:
 | Argument | Environment variable | Default | Notes |
 |---|---|---|---|
 | `--compose-dir <path>` | `COMPOSE_DIR` | empty | Compose project directory; the fallback when the label lookup fails (restored in v2.1.0) |
-| `--dpanel-container <name>` | `DPANEL_NAME` | `dpanel` | Name of the container DPanel runs in (used only when the script does not run inside the dpanel container) |
+| `--dpanel-container <name>` | `DPANEL_NAME` | `dpanel` | Name of the container DPanel runs in; used only when debugging (running outside the dpanel container) |
 | `--dpanel-bin <path>` | `DPANEL_BIN` | `/app/server/dpanel` | Path of the DPanel CLI |
 | `--dpanel-docker-env <name>` | `DPANEL_DOCKER_ENV` | `local` | `--docker-env` passed to the DPanel CLI |
 
