@@ -136,6 +136,7 @@ Bootstrapper behaviour at a glance:
 | `T_HARD` | 540 seconds | Hard limit for the whole script | Lower it when the scheduled task's timeout is shorter |
 | `T_INSPECT` | 30 seconds | Timeout for querying the remote digest | The registry responds slowly |
 | `T_STALL` | 60 seconds | **Stalled pull** detection: if no new bytes arrive within this window the pull is judged stalled and killed | Raise it when the network is very slow and even a healthy pull stays silent for a long time (e.g. `120`) |
+| `T_STALL_FINISH` | 180 seconds | Grace period **after all layers have been pulled**, waiting for the daemon to register the image. While Docker writes the image configuration it has to fetch the signature from the registry, and not a single byte comes out during that time — without this grace period a perfectly normal finishing pull gets judged as stalled and killed | Raise it when the image is large and the daemon is slow to write the configuration (e.g. `300`) |
 | `T_PULL_MAX` | 300 seconds | Absolute limit for a single pull | The image is very large |
 | `T_UP` | 60 seconds | Timeout for recreating / starting the container | The container starts slowly |
 | `T_HEALTH` | 120 seconds | **Wall-clock wait limit of the health gate** (the one that actually applies) | Raise it when the application starts slowly (common for Java services), and raise `T_HARD` and the scheduled task's "execution timeout" at the same time |
@@ -156,6 +157,7 @@ Bootstrapper behaviour at a glance:
 | The registry often hangs and does not return | `T_STALL=120` (do not make it too small; even a healthy pull can stay silent for a long time) |
 | The same new version keeps failing and you want to retry sooner | `--bad-ttl-days 1` |
 | Pulls often fail because of network jitter | `--pull-retries 2` (the default is 1; `0` = no retry) |
+| A pull keeps ending up at "all layers pulled but nothing happens" | `T_STALL_FINISH=180` already waits for the daemon to register the image; if it still times out, raise it (e.g. `300`) |
 | The remote digest often cannot be fetched (slow or jittery registry) | It is already retried twice by default; raise it to `DIGEST_RETRIES=4` and `DIGEST_RETRY_WAIT=10` if that is not enough |
 | The scheduled task only shows "exit status 1" and no reason | See [Where the failure reason is written](#where-the-failure-reason-is-written) |
 | The script has been upgraded but you want to keep the current behaviour first | `--compat <the version you have verified>`, e.g. `--compat 1.2.3` |

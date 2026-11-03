@@ -18,6 +18,11 @@
 3. Tag the current image as <repo>:rollback-pending as a placeholder (does not touch :prev)
 4. Pull the new version through the Docker Engine API, watching the byte counters
      no new bytes for 60 seconds → judged stalled, kill -9, abandon this round (the container stays untouched)
+     but after all layers are pulled there is a separate grace period (180 seconds by
+     default, T_STALL_FINISH) — that is the time Docker spends writing the image
+     configuration and fetching the signature, and it does not emit a single byte then
+     before giving up, the script first asks the daemon whether the image actually
+     landed → if it did, the round counts as successful
      the pull fails → retried once by default (--pull-retries is tunable; 0 = no retry)
 5. Verify: the digest that landed on disk must equal the digest reported by the pull stream itself
 6. Switch over (see the next two sections)
@@ -38,6 +43,15 @@ The original "never retry anything" was deliberate (back then the judgement was:
 
 **Querying the remote digest is retried too.** Asking the registry "what is the latest digest" is just as prone to transient faults, so it is retried twice by default with 5 seconds in between (`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT` are tunable, `DIGEST_RETRIES=0` = no retry).
 When the digest cannot be fetched the script does not guess "probably not updated" — it abandons the round and writes how many attempts it made into the log.
+
+**The "finishing phase" of a pull has its own grace period.** After Docker has pulled every layer it still has to write the image configuration
+(fetching the signature from the registry), and during that time the pull stream **does not emit a single byte**.
+Judging that with "60 seconds without bytes = stalled" kills a pull that was about to succeed,
+and the daemon then reports `context canceled`, so **all the layers that were already downloaded are thrown away**
+(this really happened in production: every layer was `Pull complete`, only the image configuration was missing, the script cut the stream off
+and the whole round was wasted). So the script does two things: once all layers are pulled it enters a separate finishing grace period
+(`T_STALL_FINISH`, 180 seconds by default); and when that grace period expires without a digest it **first asks the daemon whether the image actually landed** —
+if it really did (the tag points at the new image and RepoDigests has a value) the round ends as a success instead of wasting the work.
 
 **The failure reason is written to stderr as well.** A scheduled task keeps only stderr and discards stdout when the task fails;
 so the `ERR` / `CRITICAL` lines (and the indented follow-up lines right after them) are **also** written to stderr, on top of being part of the complete log.

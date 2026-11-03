@@ -18,6 +18,8 @@
 #   · AutoRemove、container:* 网络及其依赖、VolumesFrom、非常规挂载/网络、
 #     Compose 管理的容器等不能安全处理的形态，跳过并说明原因。
 #   · 拉取只 kill 本轮 curl PID（curl 自带 --max-time，不会活得比脚本久）；
+#     层拉完后等 daemon 登记镜像有专门宽限（T_STALL_FINISH），不会把正常收尾
+#     当成卡死掐掉；放弃之前会先问 daemon 镜像是不是其实已经落盘了；
 #     并发由 DPanel 计划任务保证（同一目标不要同时挂两个计划任务）；
 #     坏版本按钉住时间计算 TTL。
 #
@@ -65,10 +67,11 @@ COMPAT_UNTIL="${COMPAT_UNTIL:-}"   # --compat：用户声明「我只验证到�
 PULL_RETRIES="${PULL_RETRIES:-1}"  # 拉取失败后的重试次数（0 = 不重试）
 
 START=$(date +%s)
-VERSION="1.1.3"
+VERSION="1.1.4"
 T_HARD="${T_HARD:-540}"
 T_INSPECT="${T_INSPECT:-30}"
 T_STALL="${T_STALL:-60}"
+T_STALL_FINISH="${T_STALL_FINISH:-180}"  # 「已报 Pull complete」之后的收尾宽限（秒）
 T_PULL_MAX="${T_PULL_MAX:-300}"
 T_UP="${T_UP:-60}"
 T_HEALTH="${T_HEALTH:-120}"
@@ -367,6 +370,7 @@ UPD_COMPOSE / UPD_CONTAINER 指定。优先级：命令行 > 环境变量 > 配�
   COMPAT_UNTIL                  同 --compat
   T_HARD / T_INSPECT / T_STALL / T_PULL_MAX / T_UP / T_HEALTH / T_ROLLBACK
                                 各阶段超时（秒），一般不用改
+  T_STALL_FINISH                层拉完后等 daemon 登记镜像的宽限秒数（默认 180）
   HEALTH_TRIES                  健康门禁最多轮询几次；默认 0 = 只受 T_HEALTH 秒数约束
   PLAIN_BOOT                    无 healthcheck 的容器启动后观察多少秒（默认 30）
 
@@ -681,12 +685,35 @@ api_negotiate() {
   return 0
 }
 
+# 问 daemon：镜像是不是其实已经落盘了？
+# 用途：拉取流在「最后几行」没写完时，daemon 侧可能已经把镜像做好并登记好了
+# （生产上真实发生过：层都 Pull complete 了，只差镜像配置，流就断了）。
+# 这时再把它当卡死掐掉，等于把一次快要成功的拉取判成失败。
+# $1=repo $2=tag $3=拉取前的本地镜像 id（用来区分「tag 还指着旧镜像」）
+# 返回：daemon 侧登记好的 repo digest（sha256:...）；没落盘则什么都不输出、返回 1。
+pull_landed_digest() {
+  _lr="$1"; _lt="$2"; _loid="$3"
+  _lid=$(docker image inspect -f '{{.Id}}' "$_lr:$_lt" 2>/dev/null)
+  [ -n "$_lid" ] || return 1
+  # 没有「拉取前的本地 id」就没法区分新旧：拿不准就不认它落盘了。
+  # tag 还指着拉取前的旧镜像 → 说明新镜像没落盘，别把旧的当成新的。
+  [ -n "$_loid" ] || return 1
+  [ "$_lid" = "$_loid" ] && return 1
+  # RepoDigests 有值 = manifest 已经登记（配置也就有了），这才是「真的做完了」。
+  _ldg=$(docker image inspect "$_lr:$_lt" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+    | grep -F "${_lr}@" | sed 's/^[^@]*@//' | head -n1)
+  [ -n "$_ldg" ] || return 1
+  echo "$_ldg"
+  return 0
+}
+
 # ---------- 拉取：只管理本轮 PID ----------
 # $4 可选：本次拉取的绝对截止时刻。compose 多镜像项目要按剩余镜像数分摊全局预算，
 # 否则第一个镜像能把整份预算吃光，后面的镜像一上来就「达到拉取上限」——
 # 那是必然失败，不是偶发。
+# $5 可选：拉取前的本地镜像 id。用来判断「daemon 那边其实已经把新镜像落盘了」。
 pull_stream() {
-  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"
+  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"; _old="${5:-}"
   PULL_DIGEST=""; PULL_MSG=""; PULL_KIND=""
   _enc=$(printf '%s' "$_repo" | sed 's|/|%2F|g')
   : > "$_log"
@@ -700,7 +727,12 @@ pull_stream() {
   # 预算要先算出来再起 curl：curl 必须自带 --max-time，
   # 否则脚本被 kill 时它还活着（后台函数的 $! 只是那个子 shell 的 PID，
   # kill -9 杀不到它真正 fork 出来的 curl），残留进程会一直占着资源。
-  _mt=$(( _cap - $(now) ))
+  #
+  # curl 自己的 --max-time 要给「收尾宽限」留出余量：真正的闸门是下面循环里的
+  # 上限检查，这里放宽只是为了让 curl 能活到收尾阶段（层都拉完了、只差镜像配置）。
+  _cap_ext=$(( _cap + T_STALL_FINISH ))
+  [ "$_cap_ext" -gt "$_hard" ] && _cap_ext=$_hard
+  _mt=$(( _cap_ext - $(now) ))
   [ "$_mt" -lt 1 ] && _mt=1
   if [ -n "$SOCK" ]; then
     curl --unix-socket "$SOCK" -sN --max-time "$_mt" -X POST \
@@ -710,19 +742,66 @@ pull_stream() {
       "$API/images/create?fromImage=${_enc}&tag=${_tag}" >> "$_log" 2>&1 &
   fi
   _pid=$!
+  _fin=0
   while kill -0 "$_pid" 2>/dev/null; do
     sleep 5
     _t=$(now); _sz=$(wc -c < "$_log" 2>/dev/null | tr -d ' ')
     case "$_sz" in ''|*[!0-9]*) _sz=0 ;; esac
     if [ "$_sz" -gt "$_seen" ]; then _seen=$_sz; _seen_at=$_t; fi
     _idle=$((_t - _seen_at))
-    if [ "$_idle" -ge "$T_STALL" ]; then
+    # 收尾阶段判定：所有层都 Pull complete 之后，dockerd 还要做「提交镜像」
+    # （写镜像配置、登记 manifest），这一步可能几十秒都不吐一个字节。
+    # 那不是卡死，是正常收尾 —— 生产上真实发生过：层都拉完了，只差镜像配置，
+    # 脚本却按「60 秒没新字节」把拉取掐了，daemon 报 context canceled，
+    # 已经下好的层全部作废。
+    if [ "$_fin" = "0" ]; then
+      _pulling=$(grep -c 'Pulling fs layer' "$_log" 2>/dev/null | tr -d ' ')
+      _done=$(grep -c 'Pull complete' "$_log" 2>/dev/null | tr -d ' ')
+      case "$_pulling" in ''|*[!0-9]*) _pulling=0 ;; esac
+      case "$_done" in ''|*[!0-9]*) _done=0 ;; esac
+      if [ "$_pulling" -gt 0 ] && [ "$_done" -ge "$_pulling" ]; then
+        _fin=1
+        log "   拉取层已全部完成（${_done}/${_pulling}），进入收尾阶段，最多再等 ${T_STALL_FINISH}s"
+      elif [ "$_pulling" -eq 0 ] && [ "$_done" -gt 0 ]; then
+        # 层本来就在本地（全是 Already exists），剩下的是登记镜像，同样算收尾阶段。
+        _fin=1
+        log "   拉取层已全部就绪，进入收尾阶段，最多再等 ${T_STALL_FINISH}s"
+      fi
+    fi
+    # 收尾阶段的停滞阈值更长；其它阶段仍用 T_STALL。
+    _thr=$T_STALL
+    [ "$_fin" = "1" ] && _thr=$T_STALL_FINISH
+    if [ "$_idle" -ge "$_thr" ]; then
+      # 判「卡死」之前，先问 daemon：镜像是不是其实已经落盘了。
+      # 落盘了就按成功收场——把那一次快要成功的拉取判成失败是最亏的。
+      _landed=$(pull_landed_digest "$_repo" "$_tag" "$_old")
+      if [ -n "$_landed" ]; then
+        kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
+        PULL_DIGEST="$_landed"
+        PULL_MSG="已完成（daemon 侧已落盘，共收 ${_seen} 字节）"
+        PULL_KIND="ok"
+        return 0
+      fi
       kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
-      PULL_MSG="进度停滞 ${_idle}s（共收 ${_seen} 字节后无新增）"
+      if [ "$_fin" = "1" ]; then
+        PULL_MSG="收尾阶段停滞 ${_idle}s（层已全部完成，但 daemon 侧没有登记新镜像，共收 ${_seen} 字节）"
+      else
+        PULL_MSG="进度停滞 ${_idle}s（共收 ${_seen} 字节后无新增）"
+      fi
       PULL_KIND="stall"
       return 1
     fi
-    if [ "$_t" -ge "$_cap" ]; then
+    _cap_now=$_cap
+    [ "$_fin" = "1" ] && _cap_now=$(( _cap + T_STALL_FINISH ))
+    if [ "$_t" -ge "$_cap_now" ]; then
+      _landed=$(pull_landed_digest "$_repo" "$_tag" "$_old")
+      if [ -n "$_landed" ]; then
+        kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
+        PULL_DIGEST="$_landed"
+        PULL_MSG="已完成（daemon 侧已落盘，共收 ${_seen} 字节）"
+        PULL_KIND="ok"
+        return 0
+      fi
       kill -9 "$_pid" 2>/dev/null || true; wait "$_pid" 2>/dev/null || true
       PULL_MSG="达到拉取上限（共收 ${_seen} 字节）"
       PULL_KIND="cap"
@@ -756,6 +835,15 @@ pull_stream() {
   if [ "$_rc" -ne 0 ]; then PULL_MSG="拉取流退出 rc=$_rc"; PULL_KIND="transient"; return 1; fi
   PULL_DIGEST=$(sed -n 's/.*"status":"Digest: \(sha256:[0-9a-f]\{64\}\)".*/\1/p' "$_log" | tail -n1)
   if [ -z "$PULL_DIGEST" ]; then
+    # 流里没有 digest 行，但 daemon 侧可能已经把镜像登记好了
+    # （流在最后一行之前断了）。这种情况要按成功算，不能当失败。
+    _landed=$(pull_landed_digest "$_repo" "$_tag" "$_old")
+    if [ -n "$_landed" ]; then
+      PULL_DIGEST="$_landed"
+      PULL_MSG="已完成（daemon 侧已落盘，共收 ${_seen} 字节）"
+      PULL_KIND="ok"
+      return 0
+    fi
     PULL_MSG="拉取流结束但没有报告 digest（共收 ${_seen} 字节）"
     PULL_KIND="transient"
     return 1
@@ -784,7 +872,7 @@ pull_stream() {
 #   5. 重试要有自己的时间份额 —— 首次尝试的截止时刻是「这个镜像分到的份额」，
 #      第一次拉取很可能已经把它用光了；直接拿同一时刻做第二次尝试会秒失败。
 pull_with_retry() {
-  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"; _retry_dl="${5:-}"
+  _repo="$1"; _tag="$2"; _log="$3"; _dl="${4:-}"; _retry_dl="${5:-}"; _old="${6:-}"
   # 全局硬截止：留给 T_UP / T_HEALTH / T_ROLLBACK 的部分不能被拉取吃掉。
   _hard_dl=$(( START + T_HARD - (T_UP + T_HEALTH + T_ROLLBACK + 15) ))
   [ -n "$_retry_dl" ] || _retry_dl="$_hard_dl"
@@ -793,7 +881,7 @@ pull_with_retry() {
   while :; do
     _try=$((_try + 1))
     if [ "$_try" -gt 1 ]; then _dl="$_retry_dl"; fi
-    if pull_stream "$_repo" "$_tag" "$_log" "$_dl"; then
+    if pull_stream "$_repo" "$_tag" "$_log" "$_dl" "$_old"; then
       [ "$_try" -gt 1 ] && log "   拉取第 $_try 次尝试成功"
       return 0
     fi
@@ -1215,7 +1303,7 @@ plain_update() {
   ACTIVE_KIND="plain"; P_STARTED=0
   save_plain_state
   docker tag "$P_OLDID" "$P_STAGE" 2>/dev/null || { plain_fail "无法暂存旧镜像" || return; return; }
-  if ! pull_with_retry "$P_REPO" "$P_TAG" "$P_DIR/pull.log"; then
+  if ! pull_with_retry "$P_REPO" "$P_TAG" "$P_DIR/pull.log" "" "" "$P_OLDID"; then
     plain_fail "拉取失败：$PULL_MSG" || return
     return
   fi
@@ -1579,8 +1667,10 @@ EOF
     _retry_pool=$(( _pool - _share - _reserve ))
     [ "$_retry_pool" -lt 20 ] && _retry_pool=20
     _retry_dl=$(( $(now) + _retry_pool ))
-    if ! pull_with_retry "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log" "$_dl" "$_retry_dl"; then
-      log "ERR 拉取失败 $_img：$PULL_MSG"; _fail=1; break
+    if ! pull_with_retry "$_repo" "$_tag" "$C_WORK/pull-$(safe_key "$_repo").log" "$_dl" "$_retry_dl" "$_old"; then
+      # 失败原因 pull_with_retry 内部已经打印过一次了（ERR 行 + 说明行），
+      # 这里不要再打一遍 —— 同一句话出现两遍会让人以为是两个不同的错误。
+      _fail=1; break
     fi
     if [ -n "$PULL_DIGEST" ]; then
       _got=$(docker image inspect "$_img" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \

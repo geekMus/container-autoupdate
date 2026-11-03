@@ -104,6 +104,11 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 - **查远端 digest 必须允许重试**：digest 查询是瞬时故障高发点，取不到就整轮放弃太脆。默认重试 2 次、间隔 5 秒（`DIGEST_RETRIES` / `DIGEST_RETRY_WAIT`）。
   - 重试结果用**全局变量**回传（`DIGEST_RESULT`），不许 `echo` 返回 —— 该函数在 `$( )` 里被调用，而 `log()` 写 stdout，`echo` 会把重试提示一起收进 digest 里。
   - 取不到时日志里要写明「已尝试 N 次」，别只写「取不到」。
+- **拉取的「收尾阶段」必须给专门宽限**：Docker 把所有层拉完之后还要写镜像配置（回源查签名），那段时间拉取流**一个字节都不吐**。按「`T_STALL` 秒无字节 = 卡死」去判，会把一次快要成功的拉取掐掉；daemon 侧随即报 `context canceled`，**已经下载好的层全部作废**，整轮白跑（生产上真实发生过：层都 `Pull complete` 了，只差镜像配置）。
+  - 层拉完之后（拉取流里 `Pull complete` 的数量追平 `Pulling fs layer` 的数量）必须进入**单独的收尾宽限**（`T_STALL_FINISH`，默认 180 秒），此期间不按 `T_STALL` 判卡死。
+  - 收尾宽限用尽仍没拿到 digest 时，**先问 daemon 镜像是不是其实已经落盘了**，再决定是否 kill：真落盘了（tag 已指向新镜像、且 `RepoDigests` 有值）就按成功收场，不许白跑。
+  - 判断「落盘」必须把**拉取前的本地镜像 id** 传进去做对比：tag 还指着旧镜像 ⇒ 没落盘；拿不到 id 就当作没落盘（宁可保守）。
+- **失败原因只打印一次**：失败原因由 `pull_with_retry()` 统一打印（`ERR` 行 + 说明行），调用点只负责流程控制，**不许再打一遍同一条原因**。同一句话出现两遍会让人以为是两个不同的错误（生产上真实出现过：日志里「拉取失败 … 进度停滞」连着两行）。
 - **坏版本 TTL 按「钉住时间」计算**（`date -d` 转 epoch），不许用镜像 `Created` 时间当锚点。
 - **容器分支按容器 ID 操作**（不是名字），失败可恢复。
 - **容器分支不把运行态 `NetworkSettings` 整包回投**；按声明式字段重建网络。
@@ -396,6 +401,7 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 引导器探测失败却 rc=0 | 把「探测失败」当成「没有新版本」 | 只能回退到合格缓存或 `die` |
 | 引导器 Range 探测很慢 | 用了直连或 `api.github.com` | 自建站 `github.mus.pp.ua` 优先、公共站 `gh-proxy.com` 兜底；API 会限流 |
 | 引导器「探测远端版本失败（网络问题）」但网络其实正常 | 探测窗口没盖住 `VERSION=` 那行（它会随脚本变长下移） | 窗口放大到 16KB；Range 成功却没解析出版本号时，把整文件取下来再解析一次 |
+| 拉取最后卡在「层都拉完了」被判卡死，daemon 报 `context canceled` | Docker 写镜像配置期间不吐字节，被当成停滞掐掉，已下载的层全作废 | 层拉完后进收尾宽限（`T_STALL_FINISH`）；放弃前先问 daemon 镜像是否已落盘 |
 | `releases/latest/download/ct-bootstrap.sh` 404 | Release 只传了主脚本 | 两个资产都要传 |
 
 ---
@@ -424,3 +430,5 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 - [ ] 英文文档里除脚本日志原文/代码标识符/「中文」二字外没有残留中文
 - [ ] 改过 `log()` 或错误输出路径 → 跑过 stdout/stderr 分流实测（`sh 脚本 >out 2>err`），确认 ERR/CRITICAL 行与缩进补充行都在 stderr 里
 - [ ] 新增的「会失败的关键查询」（如查远端 digest）→ 有重试，且重试次数在日志里写明
+- [ ] 改过拉取的停滞/收尾判定 → 复跑「层拉完后长时间静默」场景（不进普通卡死判定），且**放弃之前**问过 daemon 镜像是否已落盘
+- [ ] 改过失败原因的打印位置 → 同一句失败原因在 stdout 与 stderr 里**各只出现一次**（stdout 完整日志 + stderr 给计划任务看是两回事，不许当成重复）

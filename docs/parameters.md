@@ -136,6 +136,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | `T_HARD` | 540 秒 | 全脚本硬上限 | 计划任务超时更短时，调小 |
 | `T_INSPECT` | 30 秒 | 查远端 digest 的超时 | 镜像仓库响应慢 |
 | `T_STALL` | 60 秒 | 拉取**进度停滞**判定：这么久没有新字节就判卡死并 kill | 网络特别慢、健康拉取也会长时间无输出时调大（如 `120`） |
+| `T_STALL_FINISH` | 180 秒 | **层全部拉完之后**，等 daemon 登记镜像的宽限。Docker 在写镜像配置时要回源查签名，那段时间一个字节都不吐 —— 没有这段宽限就会把正常收尾当成卡死掐掉 | 镜像很大、daemon 写配置慢时调大（如 `300`） |
 | `T_PULL_MAX` | 300 秒 | 单次拉取的绝对上限 | 镜像很大 |
 | `T_UP` | 60 秒 | 重建 / 启动容器的超时 | 容器启动慢 |
 | `T_HEALTH` | 120 秒 | 健康门禁**墙钟等待上限**（真正生效的那个） | 应用启动慢（Java 服务常见）时调大，同时加大 `T_HARD` 与计划任务「执行超时」 |
@@ -156,6 +157,7 @@ CT_SOURCE=auto ct-bootstrap.sh --ct-source direct --ct-version 1.2.3 -- --compos
 | 镜像仓库经常卡住不返回 | `T_STALL=120`（别调太小，健康拉取也可能长时间静默） |
 | 同一个新版本反复失败，想快点重试 | `--bad-ttl-days 1` |
 | 拉取经常因为网络抖动失败 | `--pull-retries 2`（默认就是 1；`0` = 不重试） |
+| 拉取到最后卡在「层都拉完了但不报错」 | 默认 `T_STALL_FINISH=180` 已经在等 daemon 登记镜像；还超时就把 `T_STALL_FINISH` 调大（`300`） |
 | 查远端 digest 经常取不到（镜像仓库慢或抖动） | 默认已经重试 2 次；还不够就 `DIGEST_RETRIES=4`、`DIGEST_RETRY_WAIT=10` |
 | 计划任务里只看到「exit status 1」，看不到原因 | 看 [失败原因写到哪里](#失败原因写到哪里) |
 | 脚本升到新版、但你想先稳住现有行为 | `--compat <你验证过的版本>`，例如 `--compat 1.2.3` |
