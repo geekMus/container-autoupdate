@@ -28,9 +28,20 @@
 #     清理逻辑误删」这类问题。
 #   · 脚本从 1700 多行降到几百行，剩下的每一条都能一眼看懂、一眼验证。
 #
+# 旧镜像回收（v4.1.0 加回的，只作用于 Compose 分支）：
+#   `docker compose pull` 会把 <仓库>:<标签>「搬家」到刚拉下来的新镜像上，旧镜像
+#   因此丢掉最后一个标签，但层还完整留在磁盘上；紧接着 `up -d` 重建容器，旧镜像
+#   连最后的引用也没了。v2.0.0 删掉 clean_orphans 之后没人回收，**每成功更新一次
+#   就永久沉淀一个完整镜像**（N1 实测：magpie 每小时更新，两条 <none> 各占 64MB
+#   独有层）。现在在 compose_update 末尾做一次「只删本项目、已无标签、无引用、
+#   且不是回滚点」的回收，四条约束见 compose_reclaim 的注释。
+#   容器分支**不做**回收：那边 DPanel 的 <容器名>-bak-<时间戳> 备份容器就是回滚点，
+#   它持有旧镜像的引用，旧镜像本来就不会变成 <none>；而且容器分支不许脚本写 Docker。
+#
 # 安全原则：
 #   · 容器分支不写 Docker：变更动作只有 DPanel 一个执行者。
-#     Compose 分支只用 compose 自己的 pull / up -d，不手工 tag、不手工 create、不删任何东西。
+#     Compose 分支只用 compose 自己的 pull / up -d，不手工 tag、不手工 create。
+#     唯一一处脚本亲手删的东西是「本项目自己淘汰下来的、已无标签无引用的旧镜像」。
 #   · 失败原因同时落到真正的 stderr（计划任务失败时只收 stderr、丢弃 stdout）。
 #   · 只检查不动手：--dry-run。
 #   · 不做版本兼容层：不认识的参数就报错退出（rc=1），不猜、不静默忽略。
@@ -79,7 +90,7 @@ DPANEL_BIN="${DPANEL_BIN:-/app/server/dpanel}"  # DPanel CLI 在容器里的路�
 DPANEL_DOCKER_ENV="${DPANEL_DOCKER_ENV:-local}" # DPanel 里的 docker 环境名（对应它的「Docker 服务器」）
 
 START=$(date +%s)
-VERSION="4.0.3"
+VERSION="4.1.0"
 T_HARD="${T_HARD:-540}"            # 整轮时间硬上限（秒）
 # 单次「检查」调用超时。T_INSPECT 是旧名字，继续认，方便老任务不改配置。
 DP_T_CHECK="${DP_T_CHECK:-${T_INSPECT:-120}}"
@@ -161,6 +172,9 @@ DPanel 定时任务自动更新脚本
                   升级失败 DPanel 会自行回滚，并留下 <容器名>-bak-<时间戳> 备份容器）
   Compose 项目  → 用 `docker compose pull` + `docker compose up -d` 就地重新部署
                   （compose 自己知道这个项目有哪些容器、用哪个文件，不需要额外登记）
+                  Compose 分支在部署成功后会顺手回收「本项目淘汰下来的、已无标签、
+                  无容器引用的旧镜像」，但会保留更新前用的那个作为回滚点；
+                  容器分支不做回收（那边有 DPanel 的备份容器做回滚点）。
 
 用法：
   container-autoupdate.sh --compose <项目名>     更新一个 Compose 项目
@@ -510,8 +524,13 @@ compose_out() {
     timeout -s KILL "$_t" docker compose "$@" 2>/dev/null )
 }
 
-# 镜像 id 取短一点，日志里好读
-_short_id() { printf '%s' "$1" | sed 's/^sha256://' | awk '{print substr($0,1,12)}'; }
+# 镜像 id 取短一点，日志里好读。
+# 先把首尾空白剪掉再截断：传进来的可能是「 2754f35171f5」这种带前导空格的列表元素，
+# 不剪的话 substr 会把空格也算进去，印出来的短 id 少一位（实测踩到过）。
+_short_id() {
+  printf '%s' "$1" | sed 's/^sha256://' \
+    | awk '{ gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print substr($0, 1, 12) }'
+}
 
 # 认清这个项目：工作目录 + compose 文件 + env 文件。
 # 优先用 compose 自己写在容器上的标签（那是最准的：就是当初用的那个文件），
@@ -576,6 +595,112 @@ compose_running_stat() {
     esac
   done
   echo "$_run $_tot"
+}
+
+# ---------- 旧镜像回收（只用于 Compose 分支）----------
+# 从形如 `registry:5000/a/b:tag`、`a/b`、`a/b@sha256:...` 的引用里取出仓库名。
+# 冒号只有在最后一个斜杠之后才算标签分隔符 —— 前面的冒号是 registry 端口。
+_img_repo() {
+  printf '%s' "$1" | sed 's/@.*$//' | awk '{
+    n = split($0, a, "/"); last = a[n]
+    if (index(last, ":") > 0) sub(/:[^:]*$/, "", $0)
+    print
+  }'
+}
+
+# 回收本项目本轮淘汰下来的旧镜像。
+#   $1 = 本项目涉及的镜像引用（多行，来自 `docker compose config --images`）
+#   $2 = 更新前的「容器名 镜像id」快照（用来认出真正的回滚点）
+#
+# 只删同时满足这四条的镜像，缺一条都不动：
+#   1) 属于本项目：镜像的 RepoDigests 能对上本项目的镜像仓库。`RepoDigests` 形如
+#      `仓库@sha256:...`，标签被搬走之后它仍然在 —— 这正是能认出「已变 <none> 的旧镜像」
+#      的唯一依据（N-2 变成 <none> 后 `Repository` 字段是 `<none>`，不是仓库名，
+#      按标签前缀匹配永远看不到它）。**不许**用「凡是 <none> 就删」这种宽判据：
+#      别的 compose 项目、用户自己 build 的东西都可能挂在同一台机器上。
+#      本地 build / import 出来的镜像没有 RepoDigests，认不出归属，一律留着不动。
+#   2) 不带任何 tag（`<none>:<none>`）：还有标签说明它是当前版本，或是用户自己
+#      打的 `<仓库>:prev` / `:bad` / `:rollback-pending`，那三种一律不能碰。
+#   3) 没有任何容器引用（含已停止的、含 DPanel 的 `<容器名>-bak-<时间戳>` 备份容器）。
+#      删除用不带 -f 的 `docker rmi`，真有引用时它自己会拒绝，这是最后一道保险。
+#   4) 至少留一个回滚点：本轮更新前还在被容器使用的旧镜像全部保留。
+#      README 里 Compose 的回滚方式就是 `docker tag <旧镜像ID> <仓库>:最新标签`，
+#      而那个「旧镜像ID」正是已经变成 <none> 的那一条 —— 删光 <none> 等于删光回滚点
+#      （生产 magpie 的 :prev 就是这么没的）。没有「更新前快照」时（例如首次部署、
+#      或这一轮没有任何变化）退化为「保留最新的一个」，同样不会删空。
+compose_reclaim() {
+  _imgs="$1"; _before="$2"
+  _rec=0
+  [ "$DRY_RUN" = "1" ] && return 0
+
+  # 本项目的仓库名清单。读不出来（`config` 失败等）就什么都不删，宁可留着。
+  _repos=$(printf '%s\n' "$_imgs" | while IFS= read -r _x; do
+    [ -n "$_x" ] && _img_repo "$_x"
+  done | awk 'NF' | sort -u)
+  [ -n "$_repos" ] || return 0
+
+  # 更新前还在用的镜像（短 id），它们就是候选回滚点
+  _was=$(_was_short_list "$_before")
+
+  # 第一遍：挑出「本项目的、无标签的、无引用的」镜像
+  # 比对一律走 _short_id 归一化：`docker images -q` 给的是 12 位短 id，而容器
+  # inspect 出来的 `.Image` 是 `sha256:<64位>`，两种写法不能直接比字符串。
+  _cands=""
+  for _id in $(docker images -a --filter dangling=true -q 2>/dev/null | sort -u); do
+    [ -n "$_id" ] || continue
+    _sid=$(_short_id "$_id")
+    [ -n "$_sid" ] || continue
+    # 条件 2：确认真的一个标签都没有（`dangling=true` 的语义在不同 docker 版本上
+    # 有出入，这里实测一遍，不能只信 filter）
+    _tags=$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$_id" 2>/dev/null | awk 'NF')
+    [ -z "$_tags" ] || continue
+    # 条件 1：归属 —— 只认 RepoDigests
+    _mine=0
+    for _r in $(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$_id" 2>/dev/null | awk 'NF'); do
+      if printf '%s\n' "$_repos" | grep -Fxq "$(_img_repo "$_r")"; then _mine=1; break; fi
+    done
+    [ "$_mine" = "1" ] || continue
+    # 条件 3：没有容器引用
+    [ -n "$(docker ps -a -q --filter ancestor="$_id" 2>/dev/null)" ] && continue
+    _cands="$_cands $_sid"
+  done
+  [ -n "$_cands" ] || return 0
+
+  # 条件 4：定回滚点
+  _keep=""
+  for _id in $_cands; do
+    case " $_was " in *" $_id "*) _keep="$_keep $_id" ;; esac
+  done
+  if [ -z "$_keep" ]; then
+    # 没有「更新前还在用」的候选（首次部署 / 本轮无变化）→ 保留最新的一个，
+    # 免得把上一轮留下的回滚点也一起清掉。
+    _keep=$(for _id in $_cands; do
+              _ct=$(docker image inspect -f '{{.Created}}' "$_id" 2>/dev/null)
+              [ -n "$_ct" ] && echo "$_ct $_id"
+            done | sort | tail -n1 | awk '{print $2}')
+  fi
+  # 一个都定不出来（inspect 失败等）就什么都不删 —— 宁可白留，也不许删空回滚点。
+  [ -n "$_keep" ] || return 0
+
+  for _id in $_cands; do
+    case " $_keep " in *" $_id "*) continue ;; esac
+    docker rmi "$_id" >/dev/null 2>&1 && _rec=$(( _rec + 1 ))
+  done
+
+  if [ "$_rec" -gt 0 ]; then
+    _ks=""
+    for _id in $_keep; do _ks="$_ks$(_short_id "$_id") "; done
+    _ks=$(printf '%s' "$_ks" | awk '{ gsub(/[[:space:]]+$/, ""); print }')
+    log "    回收旧镜像 $_rec 个（保留回滚点 $_ks，可用 docker tag 回滚）"
+  fi
+  return 0
+}
+
+# 从「容器名 镜像id」快照里取出短 id 列表（去重）。
+_was_short_list() {
+  printf '%s\n' "$1" | awk 'NF { print $2 }' | while IFS= read -r _w; do
+    [ -n "$_w" ] && _short_id "$_w"
+  done | sort -u | tr '\n' ' '
 }
 
 compose_update() {
@@ -685,6 +810,16 @@ compose_update() {
     EXIT_CODE=1
     return 1
   fi
+
+  # 4) 回收本项目这一轮淘汰下来的旧镜像（pull 把标签搬走后它们变成 <none>，没有这一步就会一直沉淀）。
+  # 只在项目健康时做：部署没成功的话，那个「旧镜像」还是当前正在用的回滚点，不能动。
+  # 预算不足就跳过 —— 回收只是省磁盘，不值得为它冒被 SIGKILL 的风险（那时计划任务里什么都看不到）。
+  if [ "$(left)" -ge 20 ]; then
+    compose_reclaim "$_imgs" "$_before"
+  else
+    log "    剩余时间不足，跳过旧镜像回收（不影响本次部署结果）"
+  fi
+
   log "    运行状态：$_run/$_tot"
   return 0
 }

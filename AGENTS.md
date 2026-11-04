@@ -87,10 +87,11 @@ git fetch origin; git rev-parse HEAD; git rev-parse origin/main    # 两个 sha 
 
 v2.1.0 起，脚本分两条路：**容器模式**把「拉镜像、重建容器、判健康、留回滚点」交给 DPanel 的命令行（`container:upgrade`）；**Compose 模式**用 docker 自己的 `docker compose pull` + `docker compose up -d` 就地重新部署。所以本节分成两半：**上面是当前必须守住的**，**下面标着「历史」的是 v1.x 时代自己拉取/重建、以及 v2.0.0 短暂把 Compose 交给 `compose:deploy` 时期的教训**——那些代码已经删掉，但你要是重写同类逻辑，不许重犯。
 
-### MUST（v2.1.0 现行）
+### MUST（v2.1.0 现行；镜像回收见 v4.1.0 补的那条）
 
 - **容器模式的更新动作只许交给 DPanel**（`container:upgrade`），**不许在脚本里重新实现**「拉镜像 / 重建容器 / 复刻网络与挂载 / 健康门禁 / `:prev` 回滚点」——v1.x 为此写了一千多行，实测反复出事（拉取被误判卡死、失败原因打两遍、回滚点被清理逻辑误删）。要重建容器，先用**一次实验**证明你会比 DPanel 做得更对。
 - **Compose 模式只用 compose 自己的命令**：`docker compose pull` 然后 `docker compose up -d`。**不许加 `--remove-orphans`**；不许手工 `tag` / `create` / `rm`；compose 参数（`COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` / `COMPOSE_PATH_SEPARATOR` / `COMPOSE_ENV_FILES`）必须走环境变量（拼成命令行时，路径含空格会让 compose 打印 Usage 却返回 `rc=0`）。
+- **（v4.1.0）Compose 部署成功后回收旧镜像，但四条约束缺一不可**：① 归属本项目——**只认 `.RepoDigests`**（N-2 变 `<none>` 后 `Repository` 字段是 `<none>`，标签前缀永远匹配不到），本地 build/import 出来的没有 RepoDigests，认不出就留着；② 一个 tag 都没有（`RepoTags` 实测为空，不能只信 `dangling=true` filter）；③ 没有任何容器引用（`docker ps -a -q --filter ancestor=<id>` 为空——它同时覆盖已停止容器与 DPanel 的 `<容器名>-bak-<时间戳>` 备份容器）；④ **至少留一个回滚点**：本轮更新前在用的镜像全部保留，没有快照时退化为「按 `.Created` 保留最新一个」，一个都定不出来就什么都不删。**不许用 `docker image prune` / `docker rmi -f`**：prune 会把唯一回滚点删掉，`-f` 会绕过 daemon 的引用保护。回收只在项目健康（`up -d` 成功、容器都在跑）且剩余预算 ≥ 20 秒时做；失败路径不回收。
 - **Compose 的拉取失败了就不许部署**：`pull` 非 0 就报错退出（退出码 1），项目必须原样不动；`up -d` 失败同样报错退出码 1，脚本不许改 compose 文件或容器定义，要能让用户「直接再跑一轮」。
 - **报告必须如实区分三种情况**：容器换了镜像（`已重建：<名>（旧12位 → 新12位）`）、这一轮新建的容器（`新建：<名>`）、真的什么都没变（`已是最新（拉取后没有容器需要重建）`）。把「新建」写成「已是最新」、或把「部署成功」写成「已更新到最新版」，都是不许的。
 - **Compose 项目目录优先从容器标签反查**（`com.docker.compose.project.working_dir` / `.config_files` / `.environment_file`），反查不到才用 `--compose-dir` / `COMPOSE_DIR` 兜底；两者都没有就退出码 1 并给出二选一指引。不许靠「猜常见目录」。
@@ -437,6 +438,10 @@ curl -fsSL -L <releases/latest/download/...> | sha256sum # 线上实际下载
 | 每轮都重建容器 | 跳过了「先检查后升级」 | 先不带 `--upgrade` 调一次，`upgrade` 为 true 才真升级 |
 | 升级后没有回滚点 | 传了 `--disable-bak` | 不许传它：`<容器名>-bak-<时间戳>` 就是回滚点 |
 | `releases/latest/download/ct-stale-lock-check.sh` 404 | Release 只传了主脚本 | 两个资产都要传（v3.0.0 起没有引导器） |
+| 每成功更新一次就留下一个完整 `<none>` 镜像 | `docker compose pull` 把标签搬到新镜像，`up -d` 去掉最后引用，而 v2.0.0 删掉 `clean_orphans` 后没有人回收（N1 实测两条各占 64MB 独有层） | Compose 分支部署成功后回收，四条约束见 §3 MUST（v4.1.0） |
+| 想清 `<none>` 一跑 `docker image prune` 就把回滚点也删了 | Compose 的回滚点正是那条 `<none>`（标签已被搬走）；prune 不带 `-a` 就是「专删 dangling」 | 先按 `.RepoDigests` 认归属，再排除「更新前在用的那个」，用不带 `-f` 的 `docker rmi` |
+| 回收把别的项目的镜像删了 | 按 `repo:tag` 前缀判归属 —— 变 `<none>` 后 `Repository` 字段是 `<none>`，只能靠 `.RepoDigests` | 归属只认 `.RepoDigests` 与本站项目仓库名精确比对（`grep -Fxq`） |
+| 日志里保留的回滚点短 id 少一位、前面多一个空格 | `_keep` 是空格分隔的列表，直接喂给 `_short_id` 时 `substr` 把前导空格也算进去了 | `_short_id` 先 `gsub` 剪首尾空白再截断；列表多元素时逐个转再拼 |
 
 ---
 
@@ -488,3 +493,12 @@ v3.0.0 起另外还要过这几条：
 - [ ] `--ct-*` 任何形态都 `rc=1` 并点名；`CT_*` 环境变量会被忽略、不报错（v4.0.0 没有兼容层）
 - [ ] 文档里锁版本的写法是**带 tag 的下载地址**（`releases/download/vX.Y.Z/…`），不是 `--ct-version`
 - [ ] 文档里没有残留「引导器 / ct-bootstrap / 缓存目录 / `--ct-*` 表」的现行说法（只允许出现在「v3.0.0 迁移」段与 AGENTS.md 的§8.5 历史节）
+
+v4.1.0 起另外还要过这几条：
+
+- [ ] 回收只发生在**项目健康**（`up -d` 成功且容器都在跑）且剩余预算 ≥ 20 秒时；`pull` 失败 / `up -d` 失败 / `--dry-run` / 预算不足四条路径都**没有**碰过镜像
+- [ ] 归属只认 `.RepoDigests`（`repo:tag` 前缀不足以认出已经变 `<none>` 的旧镜像；本地 build/import 的没有 RepoDigests，必须留着）
+- [ ] 保留回滚点：`_before` 快照里在用的镜像一个都不许删；快照为空时退化保留最新一个；`_keep` 为空时**什么都不删**
+- [ ] 删除用不带 `-f` 的 `docker rmi`（有引用时 daemon 自己拒绝），**没有** `docker image prune`
+- [ ] N1 真机跑过靠容器回收的端到端场景（`dpanel` 容器内执行），并贴出真实输出：`回收旧镜像 N 个（保留回滚点 <12位ID>，可用 docker tag 回滚）`、回滚点仍在、别的项目的 dangling 未被动过、生产容器未被重建
+- [ ] 回收后的短 id 是 12 位且没有前导空格（`_short_id` 剪过首尾空白）
