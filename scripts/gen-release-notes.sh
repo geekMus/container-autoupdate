@@ -110,14 +110,18 @@ echo "SRC='https://gh-proxy.com"
 echo "https://ghfast.top"
 echo "https://github.com'"
 echo "T=/tmp/ct-new.sh"
-echo 'okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }'
+echo 'okfile() { [ -f "$1" ] || return 1; [ "$(wc -c <"$1")" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }'
 echo 'for u in $SRC; do'
 echo '  case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac'
 echo '  curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue'
 echo '  okfile "$T" && break'
 echo 'done'
-echo 'okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh'
-echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }'
+echo 'if okfile "$T"; then'
+echo '  mv -f "$T" /tmp/container-autoupdate.sh'
+echo 'else'
+echo '  echo "WARN 三个源都没拿到可用的脚本，沿用上一轮的副本"'
+echo 'fi'
+echo '[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本，也没有上一轮的副本" >&2; exit 1; }'
 echo 'sh /tmp/container-autoupdate.sh --compose myapp'
 echo '```'
 echo ""

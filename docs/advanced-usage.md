@@ -10,19 +10,24 @@ SRC='https://gh-proxy.com
 https://ghfast.top
 https://github.com'
 T=/tmp/ct-new.sh
-okfile() { [ "$(wc -c <"$1" 2>/dev/null || echo 0)" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
+okfile() { [ -f "$1" ] || return 1; [ "$(wc -c <"$1")" -gt 1000 ] && sh -n "$1" 2>/dev/null && grep -q container-autoupdate "$1"; }
 for u in $SRC; do
   case "$u" in "https://github.com") url=$G ;; *) url="$u/$G" ;; esac
   curl -fsSL --max-time 30 "$url" -o "$T" 2>/dev/null || continue
   okfile "$T" && break
 done
-okfile "$T" && mv -f "$T" /tmp/container-autoupdate.sh
-[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本"; exit 1; }
+if okfile "$T"; then
+  mv -f "$T" /tmp/container-autoupdate.sh
+else
+  echo "WARN 三个源都没拿到可用的脚本，沿用上一轮的副本"
+fi
+[ -s /tmp/container-autoupdate.sh ] || { echo "ERR 拿不到可用的更新脚本，也没有上一轮的副本" >&2; exit 1; }
 sh /tmp/container-autoupdate.sh --compose myapp
 ```
 
 - 不要写 `curl … | sh`：管道的退出码是 `sh` 的，下载失败会被吞掉。
 - `SRC` 只写站点域名；镜像站那条会拼成「站点/原始 GitHub 地址」，`https://github.com` 那条是直连。
+- 三个源全失败时沿用上一轮的副本，并打一行 `WARN 三个源都没拿到可用的脚本，沿用上一轮的副本`；连副本都没有才 `ERR` 退出（rc=1）。
 - 想锁版本：把 `G` 里的 `latest/download` 换成 `download/v4.0.1`。
 - 同一目标只挂一个计划任务；脚本内部没有锁。
 
