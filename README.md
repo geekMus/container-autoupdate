@@ -2,14 +2,14 @@
 
 一个给 **DPanel 计划任务** 用的容器自动更新脚本，单文件，放在 dpanel 容器里跑（只用 `sh`；依赖 `timeout`、`sed`、`awk`、`grep`，Compose 模式另需 `docker` + Compose v2 插件）。
 
-它自己不做危险动作：容器交给 DPanel 升级，Compose 交给 `docker compose` 重新部署；Compose 部署成功后会回收本项目淘汰下来的旧镜像（保留回滚点）。
+它自己不做危险动作：容器交给 DPanel 升级，Compose 交给 `docker compose` 重新部署；Compose 部署成功后会回收本项目淘汰下来的旧镜像（不留回滚点，见下）。
 
 ## 这是什么
 
 跑一次 = 检查一次。**频率、启停、超时全交给 DPanel 的「计划任务」**，脚本里没有任何定时逻辑。
 
 - **容器模式**：问 DPanel「这个容器有新版吗」，有就让 DPanel 升级（它会留一个 `<容器名>-bak-<时间戳>` 备份容器，那就是回滚点）。
-- **Compose 模式**：`docker compose pull` 拉一次，有变化才 `up -d` 就地重建。项目目录从容器标签自动认，认不到再用 `--compose-dir` 指定。部署成功后会回收本项目这一轮淘汰下来的旧镜像（详见[它怎么工作](docs/how-it-works.md)）；更新前在用的那份会留着当回滚点。
+- **Compose 模式**：`docker compose pull` 拉一次，有变化才 `up -d` 就地重建。项目目录从容器标签自动认，认不到再用 `--compose-dir` 指定。部署成功后会回收本项目这一轮淘汰下来的旧镜像（详见[它怎么工作](docs/how-it-works.md)）；**不留回滚点**，旧镜像整批删掉。
 
 ## 安装（DPanel 计划任务）
 
@@ -40,10 +40,10 @@ sh /tmp/container-autoupdate.sh --compose myapp
 
 ## 两种模式
 
-| 目标 | 更新动作 | 回滚点 |
+| 目标 | 更新动作 | 回滚 |
 |---|---|---|
 | 容器（`--container`） | `dpanel container:upgrade`（先检查，有新版才升级） | DPanel 生成的 `<容器名>-bak-<时间戳>` 备份容器 |
-| Compose（`--compose`） | `docker compose pull` + `docker compose up -d`，然后回收旧镜像 | 更新前那份旧镜像被刻意保留（是个 `<none>`）：`docker tag <旧镜像ID> <repo>:latest && docker compose up -d --force-recreate` |
+| Compose（`--compose`） | `docker compose pull` + `docker compose up -d`，然后回收旧镜像 | 旧镜像**不保留**（回收会删掉）。要回退就把 compose 文件里的 tag 钉回旧版本，再跑一轮 |
 
 ## 常用参数
 
@@ -84,7 +84,7 @@ docker exec -it dpanel sh -c 'sh /tmp/container-autoupdate.sh --compose myapp --
 
 容器回滚：DPanel 网页里用 `<容器名>-bak-<时间戳>` 恢复，或 `docker stop/rm <名>` 后 `docker rename <名>-bak-<ts> <名>` 再 `docker start <名>`。
 
-Compose 回滚：更新前那份旧镜像被刻意保留（它已经没有标签，是 `<none>` 那一条），`docker tag <旧镜像ID> <repo>:latest` 再 `up -d` 即可。日志里那行「回收旧镜像 N 个（保留回滚点 xxxxxxxx，可用 docker tag 回滚）」写的就是保留下来那份的 12 位 ID。脚本不维护 `:prev`，也不做数据回滚。
+Compose 回滚：脚本**不留旧镜像**（部署成功后它们被整批回收），所以不能再用 `docker tag <旧镜像ID>` 这一招。要回退就把 compose 文件里的 `image:` 改成旧的 tag（或 digest），再跑一轮脚本，或手动 `docker compose up -d`。脚本不维护 `:prev`，也不做数据回滚。
 
 ## 退出码
 

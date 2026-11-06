@@ -61,4 +61,4 @@ sh /tmp/container-autoupdate.sh --compose web
 | `ERR DPanel 返回了错误` | DPanel 那边拉镜像/重建失败，看后面的原始报错 |
 | 一直报「已是最新」但其实有新版本 | 镜像源没更新，或 tag 没变（`:latest` 没推新的） |
 | 计划任务显示失败但日志里只有 `exit status 1` | 失败原因在 stderr；v1.1.2 起会带上原文（若还只看到一句，说明跑的是更早的版本） |
-| 想回滚 | 容器：用 DPanel 的 `<容器名>-bak-<时间戳>` 备份容器；Compose：把旧镜像 tag 回 `:latest` 再 `up -d` |
+| 想回滚 | 容器：用 DPanel 的 `<容器名>-bak-<时间戳>` 备份容器；Compose：旧镜像已被回收，把 compose 文件里的 `image:` 钉回旧 tag（或 digest）再跑一轮 |
